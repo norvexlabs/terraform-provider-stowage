@@ -1,0 +1,195 @@
+# terraform-provider-stowage
+
+The OpenTofu provider for [Stowage](https://github.com/norvexlabs/stowage): it declares a Stowage
+product's install beside the VM, cloud or cluster it runs on, in one OpenTofu root. It reads only
+the installer's machine interface (`describe --json`, `status --json`, the verbs' `--json` result
+and exit status): it decides nothing the installer does not decide, orders no version and keeps no
+copy of a rule.
+
+**Status: pre-release (0.1.0, unreleased).** What works: the Docker target's create, read and
+delete. Not yet: changing an install (inputs or release), rollback, import, the Kubernetes and VM
+targets, `stowage_vm_seed` — see [TODO.md](TODO.md).
+
+- Provider address: `registry.opentofu.org/norvexlabs/stowage`, plugin protocol 6.
+- Needs **OpenTofu ≥ 1.11** (write-only attributes), and for a remote target the system `ssh`
+  binary, OpenSSH ≥ 8.5 (`KnownHostsCommand`), on the machine running OpenTofu. The target needs
+  a POSIX `sh`, `tar`, `mktemp` and Docker.
+- Reads installers made by **Stowage 0.34.0 or later** (machine interface format 1).
+
+## Example
+
+```hcl
+terraform {
+  required_version = ">= 1.11.0"
+  required_providers {
+    stowage = { source = "registry.opentofu.org/norvexlabs/stowage" }
+  }
+}
+
+provider "stowage" {}
+
+resource "stowage_install" "notes" {
+  installer = "registry.example.com/notes/notes-installer@sha256:<64 hex>"
+  inputs    = { ADMIN_EMAIL = "ops@example.com" }
+  secret_inputs_wo         = { SMTP_PASSWORD = var.smtp_password }
+  secret_inputs_wo_version = 1
+  docker {
+    host             = "app.example.com"
+    user             = "ops"
+    known_hosts_line = "app.example.com ssh-ed25519 AAAA…"
+    work_dir         = "/srv"
+  }
+}
+```
+
+More in [examples/](examples/).
+
+## Provider configuration
+
+| Attribute | | |
+|---|---|---|
+| `username` | optional | The registry's pull account, with `password`. The target logs in with it to fetch the installer image, in a Docker configuration of its own (`DOCKER_CONFIG` in a private temporary directory) that is removed afterwards: the credential is not left on the host. Left out, the target's own `docker login` (or none) fetches it. The login goes to the installer reference's registry host (`docker.io` for a reference without one). |
+| `password` | optional, sensitive | The pull account's password or token, with `username`; sent on the target's standard input only. One without the other is refused. |
+| `registry` | optional | A mirror's prefix (the installer's `--registry`), given at the install. First-install only: the resource records it (`registry`), and a plan whose provider `registry` differs is an error. |
+| `registry_ca` | optional | PEM of the mirror's certificate authority (the installer's `--registry-ca`), sent on standard input. Refused unless it holds `-----BEGIN CERTIFICATE-----`. The target's Docker daemon must already trust the mirror to fetch the installer image itself. |
+
+## Resource `stowage_install`
+
+One install on one target: exactly one of the `docker`, `kubernetes` and `vm` blocks (none, or
+two, is an error).
+
+### Arguments
+
+| Attribute | | |
+|---|---|---|
+| `installer` | required with `docker` / `kubernetes`; refused with `vm` | The installer image by digest, `<prefix>/<name>-installer@sha256:<64 hex>` (lower-case hex, no tag beside the digest), as `stowage ship` prints it. An installer carries one release, so the digest is the release. `<name>` is the project's name: `describe` must report the same, or the create is refused. |
+| `inputs` | optional map | Non-secret inputs, each given as `--set KEY=VALUE`. They are on the target's command line and in state. A key is a letter or `_`, then letters, digits or `_`; `tls` is refused (the answers file's reserved section). An input `describe` marks `secret` is refused here. |
+| `secret_inputs_wo` | optional map, **write-only** | Secret inputs, never in plan or state, sent on standard input as an answers file (`--answers`). A key in both maps is refused. |
+| `secret_inputs_wo_version` | optional number | Bump it to apply a change of `secret_inputs_wo` (a write-only value is never compared). Leaving it out with `secret_inputs_wo` set is a warning. |
+| `given_wo` | optional, **write-only** | What another install gives (the installer's `--given` YAML), used at create, on standard input. |
+| `secrets_wo` | optional, **write-only** | A decrypted `secrets export` of a machine made again (`--secrets`), used at create, on standard input. |
+| `tls` | optional | The front's TLS mode, `--tls`: `acme`, `dns-cloudflare`, `byo` or `internal`. Left out, loopback mode. |
+| `domains` | optional map | Route → domain, `--domains route=host,…` (sorted). A route name is a letter or digit, then letters, digits, `_ . -`; a value holding `,`, `=` or a space is refused. |
+| `ports` | optional map of numbers | Route → port (1–65535), `--ports route=port,…`. |
+| `address` | optional | The loopback address the routes bind, `--address`. First-install only. |
+| `allow_rollback` | default `false` | Lets a change of the desired release to `previous` run `rollback`. Recorded, not yet used. |
+| `deletion_protection` | default `true` | While true, a destroy is refused (`deletion_protection is on`). Set it `false` and apply first. |
+| `delete_data` | default `false` | A destroy runs `uninstall --data` (the volumes deleted) instead of `uninstall` (kept). |
+| `timeouts` | block | `create` (default 30m), `read` (5m), `update`, `delete` (15m). |
+
+**`docker` block** — the Docker shape.
+
+| Attribute | | |
+|---|---|---|
+| `host` | optional | The Docker host, reached by the system `ssh`. Left out, the install is on the machine running OpenTofu, and `user`, `port`, `private_key_file` and `known_hosts_line` are refused. |
+| `port` | optional | SSH port (1–65535); left out, 22. |
+| `user` | required with `host` | SSH user. A host or user starting with `-` or holding a space is refused. |
+| `private_key_file` | optional | The private key's path; left out, ssh's agent and default keys. |
+| `known_hosts_line` | required with `host` | The host's `known_hosts` line, `host keytype base64` (the host field may be left out, hashed or a pattern: it is replaced). That key alone is accepted. A marker (`@cert-authority`, `@revoked`), an unknown key type, a key that is not base64 or more than one line is refused. |
+| `work_dir` | optional | The directory on the target holding `<name>.sh` and the install directory `<name>/`. Left out, the SSH user's home (`.`; locally, OpenTofu's working directory). First-install only; empty is refused. |
+
+**`kubernetes` block** — schema only (`kubeconfig`, `context`, `namespace` required, `release`):
+a create is refused, `The Kubernetes target is not implemented yet`.
+
+**`vm` block** — schema only (`host` required, `port`, `user` and `known_hosts_line` required,
+`private_key_file`, `version` required, `channel` first-install only): a create is refused, `The VM
+target is not implemented yet`. A destroy (with `deletion_protection` off) forgets the resource:
+removing the VM is its hypervisor resource's job.
+
+### Attributes read from the target
+
+| Attribute | |
+|---|---|
+| `id` | `<work_dir>/<name>`. |
+| `version`, `revision` | The release installed (`status --json` `installed`). |
+| `channel` | The channel the install follows. |
+| `status` | `installed`, `installing` (the first install has not finished), `failed: <why>` (`install_failed`), or `not installed`. |
+| `previous` | `{version, revision, installer}`, the release `rollback` returns to; null before an upgrade. |
+| `registry` | The provider's `registry` at the install. |
+
+### What each operation runs on a Docker target
+
+Every remote command is one `sh -c` script with its values as positional arguments, quoted for
+the remote shell; nothing secret is ever an argument.
+
+- **Create**: `docker run --rm <installer> > <work_dir>/<name>.sh` (written through a temporary
+  file, so a failed fetch leaves no half script), the bootstrap script's `describe --json` (its
+  `format` checked, its `name` compared, its shapes must include `docker` when it lists any), then
+  `sh <name>.sh --no-input --json --dir ./<name> [--set K=V]… [--tls] [--domains] [--ports]
+  [--address] [--registry]`, with `--answers`, `--given`, `--secrets` and `--registry-ca` files
+  sent on standard input as a tar into a private (0700) temporary directory removed afterwards;
+  then `status --json`. A failed or refused create saves no state.
+- **Read**: `<work_dir>/<name>/<short>-stow status --json --dir ./<name>` — the one `*-stow`
+  executable in the install directory (none or two is an error). A missing install directory
+  removes the resource from state (the script exits 100 with `stowage-provider: no install
+  directory` alone on stderr; any other exit 100 is a failure). A release other than the configured one (`installed.installer`)
+  replaces `installer` in state, so the next plan shows the change back.
+- **Update**: a change of the provider's own settings (the connection, `deletion_protection`,
+  `delete_data`, `allow_rollback`, `timeouts`) is saved without touching the target. A change of
+  `installer`, `inputs`, `secret_inputs_wo_version`, `tls`, `domains`, `ports` (or `vm.version`)
+  is refused at apply: `Changing … of an install is not implemented yet`.
+- **Delete**: refused while `deletion_protection`; else `<short>-stow uninstall --yes --no-input
+  --json [--data] --dir ./<name>`. An install directory already gone is success.
+
+### Plan-time errors
+
+A change of a first-install-only setting — `docker.work_dir`, `address`, `vm.channel`, the
+provider's `registry`, the target block's kind, or the project an `installer` names — is a plan
+error naming the old value, never a replacement: replacing an install deletes its data.
+
+### The machine interface, as read
+
+- The installer's exit status: **0** done or nothing to do; **3** refused, reported as `<verb>
+  refused: <reason>` and `Fix: <refused.fix>`; anything else failed, with the end of its error
+  output (4 KiB). Exit 255 is noted as possibly ssh's own failure.
+- A verb's result is the JSON object its output ends with; `result` must be `done` or `nothing`.
+- **Unknown fields are tolerated** (an installer adds fields without moving `format`); a known
+  field of the wrong type, data after the object and a missing `name` or `version` are errors.
+- **An unknown `format` is refused**: missing from `describe` or a verb's result (an installer
+  older than Stowage 0.34.0), newer than 1 (upgrade the provider), or any other. `status --json`
+  is checked when it carries one.
+
+### SSH
+
+The system `ssh` runs with `BatchMode=yes`, `StrictHostKeyChecking=yes`, a private 0600
+`known_hosts` file (in a 0700 temporary directory, removed after the run) holding the given key
+under `HostKeyAlias=stowage-target`, `GlobalKnownHostsFile=/dev/null`, `KnownHostsCommand=none`,
+`CheckHostIP=no`, `UpdateHostKeys=no`, `ConnectTimeout=30`, and with a key file
+`IdentitiesOnly=yes`. The user's `~/.ssh/config` still applies to everything else (a `ProxyJump`,
+for one). Output is kept up to 16 MiB per stream.
+
+## Build
+
+Docker is the only requirement.
+
+```bash
+make check   # GATE: gofmt, go vet, staticcheck, govulncheck, go test -race (Dockerfile target checks)
+make build   # ./bin/terraform-provider-stowage, only after green checks
+make test    # fast loop, never the gate
+make docs    # regenerate docs/ with tfplugindocs (needs network)
+make tidy    # go.mod / go.sum
+make fmt     # gofmt -w
+make shell   # toolchain container
+make hooks   # commit identity + .githooks
+```
+
+An acceptance test, `TestAccDockerLocal`, installs a real installer on this machine's Docker
+through OpenTofu: `TF_ACC=1 TF_ACC_TERRAFORM_PATH=<tofu> TF_ACC_PROVIDER_NAMESPACE=norvexlabs
+TF_ACC_PROVIDER_HOST=registry.opentofu.org STOWAGE_ACC_INSTALLER=<ref@digest>
+STOWAGE_ACC_WORK_DIR=<dir> go test ./internal/provider -run TestAcc`.
+
+Releases: GoReleaser (`.goreleaser.yml`): zips `terraform-provider-stowage_<version>_<os>_<arch>`,
+`…_SHA256SUMS` with its detached GPG signature (`GPG_FINGERPRINT`), and the registry manifest
+(protocol 6.0).
+
+## Repository
+
+| Path | |
+|---|---|
+| `main.go` | the plugin server |
+| `internal/provider` | provider configuration and `stowage_install` |
+| `internal/installer` | the machine interface's documents, exit mapping, the Docker target's scripts |
+| `internal/target` | `Runner`: this machine, or the system `ssh` with a pinned host key |
+| `examples/` | provider and resource examples (read by tfplugindocs) |
+
+Licence: Apache-2.0.
