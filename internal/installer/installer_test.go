@@ -20,22 +20,26 @@ const digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef012345678
 
 func TestParseDescribe(t *testing.T) {
 	t.Parallel()
-	d, err := ParseDescribe([]byte(`{"format":1,"name":"notes","release":{"version":"1.2.0","revision":2},"channel":"stable",
-		"shapes":["docker"],"inputs":[{"key":"ADMIN_EMAIL","required":true,"default":"a@b"}],"a_later_field":{"x":1}}`))
+	d, err := ParseDescribe([]byte(`{"format":1,"name":"notes","short_name":"notes","release":{"version":"1.2.0","revision":2},"channel":"stable",
+		"shapes":["docker"],"inputs":[{"key":"ADMIN_EMAIL","required":true,"default":"a@b"}],"first_install_only":["address"],"a_later_field":{"x":1}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.Name != "notes" || d.Release.Version != "1.2.0" || d.Release.Revision != 2 || d.Inputs[0].Key != "ADMIN_EMAIL" {
+	if d.Name != "notes" || d.ShortName != "notes" || d.Release.Version != "1.2.0" || d.Release.Revision != 2 || d.Inputs[0].Key != "ADMIN_EMAIL" ||
+		!slices.Equal(d.FirstInstallOnly, []string{"address"}) || !d.Declares("ADMIN_EMAIL") || d.Declares("OTHER") {
 		t.Fatalf("got %+v", d)
 	}
 	for doc, want := range map[string]string{
-		`{"name":"notes","release":{"version":"1"}}`:               "predates the machine interface; use an installer made by Stowage " + MinStowage,
-		`{"format":2,"name":"notes","release":{"version":"1"}}`:    "format 2 is newer than this provider reads (format 1): upgrade terraform-provider-stowage",
-		`{"format":0,"name":"notes","release":{"version":"1"}}`:    "format 0 is unknown",
-		`{"format":1,"name":"notes","release":{"version":"1"}} {}`: "data after",
-		`{"format":"1","name":"notes"}`:                            "cannot unmarshal",
-		`{"format":1,"release":{"version":"1"}}`:                   "no name",
-		`{"format":1,"name":"notes","release":{}}`:                 "release has no version",
+		`{"name":"notes","release":{"version":"1"}}`:                                   "predates the machine interface; use an installer made by Stowage " + MinStowage,
+		`{"format":2,"name":"notes","release":{"version":"1"}}`:                        "format 2 is newer than this provider reads (format 1): upgrade terraform-provider-stowage",
+		`{"format":0,"name":"notes","release":{"version":"1"}}`:                        "format 0 is unknown",
+		`{"format":1,"name":"notes","short_name":"n","release":{"version":"1"}} {}`:    "data after",
+		`{"format":"1","name":"notes"}`:                                                "cannot unmarshal",
+		`{"format":1,"release":{"version":"1"}}`:                                       "no name",
+		`{"format":1,"name":"notes","short_name":"n","release":{}}`:                    "release has no version",
+		`{"format":1,"name":"notes","release":{"version":"1"}}`:                        `short_name "" is not`,
+		`{"format":1,"name":"notes","short_name":"../x","release":{"version":"1"}}`:    `short_name "../x" is not`,
+		`{"format":1,"name":"notes","short_name":".hidden","release":{"version":"1"}}`: `short_name ".hidden" is not`,
 	} {
 		_, err := ParseDescribe([]byte(doc))
 		if err == nil || !strings.Contains(err.Error(), want) {
@@ -46,24 +50,32 @@ func TestParseDescribe(t *testing.T) {
 
 func TestParseStatus(t *testing.T) {
 	t.Parallel()
-	s, err := ParseStatus([]byte(`{"name":"notes","installed":{"version":"1.2.0","revision":1,"installer":"r/notes-installer@` + digest + `"},
-		"channel":"stable","previous":null,"inputs":["B","A","A"],"services":[]}`))
+	s, err := ParseStatus([]byte(`{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1,"installer":"r/notes-installer@` + digest + `"},
+		"channel":"stable","previous":null,"inputs":["B","A","A"],"restore_awaited":true,"volumes_split":true,"services":[]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.Installed.Installer == "" || s.Previous != nil || !slices.Equal(s.Inputs, []string{"A", "B"}) {
+	if s.Installed.Installer == "" || s.Previous != nil || s.Inputs == nil || !slices.Equal(*s.Inputs, []string{"A", "B"}) || !s.RestoreAwaited || !s.VolumesSplit {
 		t.Fatalf("got %+v", s)
 	}
 	s, err = ParseStatus([]byte(`{"format":1,"name":"notes","installed":null,"installing":true,"inputs":{"Z":{},"Y":true}}`))
-	if err != nil || s.Installed != nil || !s.Installing || !slices.Equal(s.Inputs, []string{"Y", "Z"}) {
+	if err != nil || s.Installed != nil || !s.Installing || !slices.Equal(*s.Inputs, []string{"Y", "Z"}) {
 		t.Fatalf("got %+v %v", s, err)
 	}
+	// inputs absent is unknown, never none; [] is none.
+	if s, err = ParseStatus([]byte(`{"format":1,"name":"notes"}`)); err != nil || s.Inputs != nil {
+		t.Fatalf("absent inputs: %+v %v", s, err)
+	}
+	if s, err = ParseStatus([]byte(`{"format":1,"name":"notes","inputs":[]}`)); err != nil || s.Inputs == nil || len(*s.Inputs) != 0 {
+		t.Fatalf("no inputs: %+v %v", s, err)
+	}
 	for doc, want := range map[string]string{
-		`{"format":2,"name":"notes"}`:                "format 2 is newer",
-		`{"name":"notes","previous":{"revision":1}}`: "previous has no version",
-		`{"name":"notes","inputs":"A"}`:              "inputs: want an array",
-		`{"name":"notes","installing":"yes"}`:        "cannot unmarshal",
-		`{"installed":{"version":"1"}}`:              "no name",
+		`{"format":2,"name":"notes"}`:                           "format 2 is newer",
+		`{"name":"notes"}`:                                      "status --json: the output has no format",
+		`{"format":1,"name":"notes","previous":{"revision":1}}`: "previous has no version",
+		`{"format":1,"name":"notes","inputs":"A"}`:              "inputs: want an array",
+		`{"format":1,"name":"notes","installing":"yes"}`:        "cannot unmarshal",
+		`{"format":1,"installed":{"version":"1"}}`:              "no name",
 	} {
 		_, err := ParseStatus([]byte(doc))
 		if err == nil || !strings.Contains(err.Error(), want) {
@@ -282,22 +294,112 @@ esac
 		t.Fatalf("the files' directory is left: %v", err)
 	}
 
-	// StowScript: no install directory is NotInstalled; one installer is run with --dir.
+	// StowScript: no install directory is NotInstalled; the kept installer is run with --dir.
+	d.Short = "nt"
 	if s, err := d.Status(ctx); s != nil || err != nil {
 		t.Fatalf("not installed: %+v %v", s, err)
 	}
-	writeExe(t, filepath.Join(work, "notes", "notes-stow"), `echo '{"name":"notes","installed":{"version":"1.0","revision":1},"args":"'"$*"'"}'
+	d.Short = "nt"
+	if err := os.Mkdir(filepath.Join(work, "notes"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Status(ctx); err == nil || !strings.Contains(err.Error(), "./notes/nt-stow: no installer kept there") {
+		t.Fatalf("no kept installer: %v", err)
+	}
+	writeExe(t, filepath.Join(work, "notes", "other-stow"), "echo '{}'\n")
+	writeExe(t, filepath.Join(work, "notes", "nt-stow"), `printf '{"format":1,"name":"notes","installed":{"version":"1.0","revision":1},"args":"%s"' "$*"
+for a; do case $a in /*) printf ',"file":"%s"' "$(cat "$a")";; esac; done
+echo '}'
 `)
 	s, err := d.Status(ctx)
 	if err != nil || s.Installed.Version != "1.0" {
 		t.Fatalf("status: %+v %v", s, err)
 	}
-	out, _, _, _ = d.Runner.Run(ctx, []string{"sh", "-c", StowScript, "sh", work, "notes", "status", "--json"}, nil)
+	out, _, _, _ = d.stow(ctx, nil, true, "status", "--json")
 	if !strings.Contains(string(out), `"args":"status --json --dir ./notes"`) {
 		t.Fatalf("stow args: %s", out)
 	}
+	out, _, _, _ = d.stow(ctx, nil, false, "describe", "--json")
+	if !strings.Contains(string(out), `"args":"describe --json"`) {
+		t.Fatalf("describe takes no --dir: %s", out)
+	}
+	// A re-run's answers arrive as a file, after --dir.
+	out, _, _, _ = d.stow(ctx, map[string]string{"answers": "K: v-SECRET"}, true, "--no-input")
+	if !strings.Contains(string(out), `"args":"--no-input --dir ./notes --answers /`) || !strings.Contains(string(out), `"file":"K: v-SECRET"`) {
+		t.Fatalf("stow files: %s", out)
+	}
+	d.Short = "../x"
+	if _, err := d.Status(ctx); err == nil || !strings.Contains(err.Error(), "import the install again") {
+		t.Fatalf("a short name out of the directory: %v", err)
+	}
+	// A short name changed since: the one *-stow kept runs; two are an error.
+	d.Short = "renamed"
+	if err := os.Remove(filepath.Join(work, "notes", "other-stow")); err != nil {
+		t.Fatal(err)
+	}
+	if s, err := d.Status(ctx); err != nil || s.Installed.Version != "1.0" {
+		t.Fatalf("the one kept installer: %+v %v", s, err)
+	}
 	writeExe(t, filepath.Join(work, "notes", "other-stow"), "true\n")
 	if _, err := d.Status(ctx); err == nil || !strings.Contains(err.Error(), "more than one *-stow") {
-		t.Fatalf("two installers: %v", err)
+		t.Fatalf("two kept installers: %v", err)
 	}
+}
+
+func contains(list []string, s string) bool { return slices.Contains(list, s) }
+
+func TestVerbArgv(t *testing.T) {
+	t.Parallel()
+	f := &recorder{}
+	d := Docker{Runner: f, WorkDir: "/srv", Name: "notes", Short: "nt"}
+	ctx := context.Background()
+	c := Change{Inputs: map[string]string{"B": "", "A": "1"}, SecretInputs: map[string]string{"S": "x-SECRET"}, TLS: "acme",
+		Domains: map[string]string{"web": "n.lan"}, Ports: map[string]string{"web": "8443"}}
+	f.out = `{"format":1,"result":"done"}`
+	if _, err := d.Rerun(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"sh", "-c", StowScript, "sh", "/srv", "notes", "nt", "answers", "dir",
+		"--no-input", "--json", "--set", "A=1", "--set", "B=", "--tls", "acme", "--domains", "web=n.lan", "--ports", "web=8443"}
+	if !slices.Equal(f.argv, want) || untar(t, f.stdin)["answers"] != "S: \"x-SECRET\"\n" {
+		t.Fatalf("re-run\n got %q\nwant %q", f.argv, want)
+	}
+	if _, err := d.Upgrade(ctx, Change{Inputs: map[string]string{"N": "v"}, Ports: map[string]string{"api": "9000"}}); err != nil {
+		t.Fatal(err)
+	}
+	want = []string{"sh", "-c", RunScript, "sh", "/srv", "", "sh", "./notes.sh", "upgrade", "--no-input", "--json", "--dir", "./notes", "--set", "N=v", "--ports", "api=9000"}
+	if !slices.Equal(f.argv, want) || f.stdin != nil {
+		t.Fatalf("upgrade\n got %q\nwant %q", f.argv, want)
+	}
+	// --tls and --domains are a re-run's: an upgrade never passes them.
+	if _, err := d.Upgrade(ctx, Change{TLS: "acme", Domains: map[string]string{"web": "n.lan"}}); err != nil || contains(f.argv, "--tls") || contains(f.argv, "--domains") {
+		t.Fatalf("upgrade %q %v", f.argv, err)
+	}
+	if _, err := d.Rollback(ctx); err != nil || !slices.Equal(f.argv[9:], []string{"rollback", "--json"}) || f.argv[8] != "dir" {
+		t.Fatalf("rollback %q %v", f.argv, err)
+	}
+	f.out = `{"format":1,"name":"notes","short_name":"nt","release":{"version":"1"}}`
+	if desc, err := d.KeptDescribe(ctx); err != nil || desc.ShortName != "nt" || f.argv[8] != "" || !slices.Equal(f.argv[9:], []string{"describe", "--json"}) {
+		t.Fatalf("kept describe %q %v", f.argv, err)
+	}
+	f.out, f.exit = "", 1
+	if _, err := d.KeptDescribe(ctx); err == nil || !strings.Contains(err.Error(), "the installer the install keeps") {
+		t.Fatalf("a failed describe: %v", err)
+	}
+	if (Change{}).Empty() != true || (Change{TLS: "acme"}).Empty() || (Change{Inputs: map[string]string{"A": ""}}).Empty() {
+		t.Fatal("Empty")
+	}
+}
+
+// recorder is a Runner keeping the last call and answering out with exit.
+type recorder struct {
+	argv  []string
+	stdin []byte
+	out   string
+	exit  int
+}
+
+func (r *recorder) Run(_ context.Context, argv []string, stdin []byte) ([]byte, []byte, int, error) {
+	r.argv, r.stdin = argv, stdin
+	return []byte(r.out), nil, r.exit, nil
 }

@@ -241,7 +241,7 @@ func TestUnknownFormatIsRefused(t *testing.T) {
 func TestInstallerOfAnotherProject(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t, nil)
-	h.fake.replies["describe"] = reply{stdout: `{"format":1,"name":"other","release":{"version":"1"}}`}
+	h.fake.replies["describe"] = reply{stdout: `{"format":1,"name":"other","short_name":"other","release":{"version":"1"}}`}
 	config := h.dockerConfig(nil)
 	p := h.plan(nil, config)
 	if got := errorsOf(h.apply(nil, p.PlannedState, config).Diagnostics); !strings.Contains(got, `describes the project "other"`) {
@@ -266,7 +266,7 @@ func TestDeletionProtection(t *testing.T) {
 		t.Fatal(got)
 	}
 	last := h2.fake.calls[len(h2.fake.calls)-1]
-	if last.op() != "uninstall" || !slices.Equal(last.argv[6:], []string{"uninstall", "--yes", "--no-input", "--json", "--data"}) {
+	if last.op() != "uninstall" || !slices.Equal(last.argv[9:], []string{"uninstall", "--yes", "--no-input", "--json", "--data"}) || last.argv[6] != "notes" {
 		t.Fatalf("uninstall %q", last.argv)
 	}
 
@@ -286,7 +286,7 @@ func TestReadFollowsTheTarget(t *testing.T) {
 	h := newHarness(t, nil)
 	state := h.create(h.dockerConfig(nil))
 	other := "registry.example.com/notes/notes-installer@" + digest2
-	h.fake.replies["status"] = reply{stdout: `{"name":"notes","installed":{"version":"1.1.0","revision":3,"installer":"` + other + `"},
+	h.fake.replies["status"] = reply{stdout: `{"format":1,"name":"notes","installed":{"version":"1.1.0","revision":3,"installer":"` + other + `"},
 		"channel":"stable","install_failed":"provision hook exited 1","previous":{"version":"1.2.0","revision":1,"installer":"` + image + `"},"inputs":[]}`}
 	r := h.read(state)
 	if d := errorsOf(r.Diagnostics); d != "" {
@@ -364,12 +364,6 @@ func TestUpdate(t *testing.T) {
 		t.Fatal("the computed values were lost")
 	}
 
-	// A change the target must apply is not implemented yet.
-	config = h.dockerConfig(map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "new@example.com"})})
-	p = h.plan(state, config)
-	if got := errorsOf(h.apply(state, p.PlannedState, config).Diagnostics); !strings.Contains(got, "Changing inputs of an install is not implemented yet") {
-		t.Fatalf("got %q", got)
-	}
 	// A new release plans its version unknown.
 	config = h.dockerConfig(map[string]tftypes.Value{"installer": str("registry.example.com/notes/notes-installer@" + digest2)})
 	p = h.plan(state, config)

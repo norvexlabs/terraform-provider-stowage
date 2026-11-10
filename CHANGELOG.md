@@ -16,4 +16,19 @@ follow [SemVer](https://semver.org/).
 - The installer's refusals as diagnostics naming the fix; an installer of an unknown machine
   interface format refused.
 - First-install-only settings changed: a plan-time error, never a replacement.
+- Changing a Docker install: changed inputs, secret inputs (on a new `secret_inputs_wo_version`),
+  TLS mode, domains and ports reconfigure the running release first; then a new `installer`
+  upgrades it, the inputs and ports the new release adds given with the upgrade. A failed upgrade
+  keeps the reconfiguration in state, so the next plan shows the upgrade alone.
+- Rollback: `installer` set back to `previous.installer` with `allow_rollback` runs the kept
+  installer's rollback, alone; without `allow_rollback`, or with another change beside it, it is
+  a plan error.
+- An `installer` naming the release installed under another digest is refused, naming the
+  digest the install records.
+- An input taken out of `inputs` is given empty to the installer; taking out the TLS mode, a
+  domain or a port is a plan error.
+- Import of a Docker install by the installer it keeps: `[<host>:]<work_dir>/<name>/<short>-stow`.
+- A create waits, within its timeout, for a first install still in progress.
+- Read removes from state an input the install does not record, so the next plan gives it again.
+- `short_name` attribute; `status --json` must carry its `format`; `update` timeout (default 30m).
 - The Kubernetes and VM targets' schema (not yet installed).

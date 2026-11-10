@@ -6,9 +6,11 @@ the installer's machine interface (`describe --json`, `status --json`, the verbs
 and exit status): it decides nothing the installer does not decide, orders no version and keeps no
 copy of a rule.
 
-**Status: pre-release (0.1.0, unreleased).** What works: the Docker target's create, read and
-delete. Not yet: changing an install (inputs or release), rollback, import, the Kubernetes and VM
-targets, `stowage_vm_seed` — see [TODO.md](TODO.md).
+**Status: pre-release (0.1.0, unreleased).** What works: the Docker target — create, read,
+update (inputs, then the release: upgrade or rollback), import and delete. Not yet: the plan-time
+dry run, the Kubernetes and VM targets, `stowage_vm_seed` — see [TODO.md](TODO.md). The verbs'
+`--json` result is not yet printed by Stowage's installers: until it is, a verb that exits 0
+without one is reported as failed.
 
 - Provider address: `registry.opentofu.org/norvexlabs/stowage`, plugin protocol 6.
 - Needs **OpenTofu ≥ 1.11** (write-only attributes), and for a remote target the system `ssh`
@@ -63,19 +65,19 @@ two, is an error).
 | Attribute | | |
 |---|---|---|
 | `installer` | required with `docker` / `kubernetes`; refused with `vm` | The installer image by digest, `<prefix>/<name>-installer@sha256:<64 hex>` (lower-case hex, no tag beside the digest), as `stowage ship` prints it. An installer carries one release, so the digest is the release. `<name>` is the project's name: `describe` must report the same, or the create is refused. |
-| `inputs` | optional map | Non-secret inputs, each given as `--set KEY=VALUE`. They are on the target's command line and in state. A key is a letter or `_`, then letters, digits or `_`; `tls` is refused (the answers file's reserved section). An input `describe` marks `secret` is refused here. |
+| `inputs` | optional map | Non-secret inputs, each given as `--set KEY=VALUE`. They are on the target's command line and in state. A key is a letter or `_`, then letters, digits or `_`; `tls` is refused (the answers file's reserved section). An input `describe` marks `secret` is refused here (at create). A key taken out of the map is given empty (`--set KEY=`) to the re-run: the installer's rule for an empty value decides (a required input is refused, an advanced one goes back to its default). |
 | `secret_inputs_wo` | optional map, **write-only** | Secret inputs, never in plan or state, sent on standard input as an answers file (`--answers`). A key in both maps is refused. |
-| `secret_inputs_wo_version` | optional number | Bump it to apply a change of `secret_inputs_wo` (a write-only value is never compared). Leaving it out with `secret_inputs_wo` set is a warning. |
+| `secret_inputs_wo_version` | optional number | Change it to apply a change of `secret_inputs_wo` (a write-only value is never compared): the update re-sends every secret input the running release declares. Leaving it out with `secret_inputs_wo` set is a warning. |
 | `given_wo` | optional, **write-only** | What another install gives (the installer's `--given` YAML), used at create, on standard input. |
 | `secrets_wo` | optional, **write-only** | A decrypted `secrets export` of a machine made again (`--secrets`), used at create, on standard input. |
-| `tls` | optional | The front's TLS mode, `--tls`: `acme`, `dns-cloudflare`, `byo` or `internal`. Left out, loopback mode. |
-| `domains` | optional map | Route → domain, `--domains route=host,…` (sorted). A route name is a letter or digit, then letters, digits, `_ . -`; a value holding `,`, `=` or a space is refused. |
-| `ports` | optional map of numbers | Route → port (1–65535), `--ports route=port,…`. |
+| `tls` | optional | The front's TLS mode, `--tls`: `acme`, `dns-cloudflare`, `byo` or `internal`. Left out, loopback mode. A change is given to the re-run (`--tls`); taking it out is a plan error. |
+| `domains` | optional map | Route → domain, `--domains route=host,…` (sorted). A route name is a letter or digit, then letters, digits, `_ . -`; a value holding `,`, `=` or a space is refused. A changed or added route is given to the re-run; taking one out, or adding one while `installer` changes, is a plan error. |
+| `ports` | optional map of numbers | Route → port (1–65535), `--ports route=port,…`. A changed port is given to the re-run; a route state does not record goes to the upgrade's `--ports` when the release changes (taken as a route the release adds: set the port of a route the running release has in an apply of its own), else to the re-run; taking one out is a plan error. |
 | `address` | optional | The loopback address the routes bind, `--address`. First-install only. |
-| `allow_rollback` | default `false` | Lets a change of the desired release to `previous` run `rollback`. Recorded, not yet used. |
+| `allow_rollback` | default `false` | Lets a change of `installer` to `previous.installer` run the kept installer's `rollback`. Without it, that change is a plan error (and an apply error when `status --json` names it `previous` only at apply). |
 | `deletion_protection` | default `true` | While true, a destroy is refused (`deletion_protection is on`). Set it `false` and apply first. |
 | `delete_data` | default `false` | A destroy runs `uninstall --data` (the volumes deleted) instead of `uninstall` (kept). |
-| `timeouts` | block | `create` (default 30m), `read` (5m), `update`, `delete` (15m). |
+| `timeouts` | block | `create` (default 30m; it bounds the wait for a first install still `installing`), `read` (5m), `update` (30m), `delete` (15m). A run cut by its timeout is a failure. |
 
 **`docker` block** — the Docker shape.
 
@@ -101,11 +103,12 @@ removing the VM is its hypervisor resource's job.
 | Attribute | |
 |---|---|
 | `id` | `<work_dir>/<name>`. |
+| `short_name` | The installer's short name (`describe` `short_name`): the install keeps its installer as `<id>/<short_name>-stow`. |
 | `version`, `revision` | The release installed (`status --json` `installed`). |
 | `channel` | The channel the install follows. |
 | `status` | `installed`, `installing` (the first install has not finished), `failed: <why>` (`install_failed`), or `not installed`. |
 | `previous` | `{version, revision, installer}`, the release `rollback` returns to; null before an upgrade. |
-| `registry` | The provider's `registry` at the install. |
+| `registry` | The provider's `registry` at the install; null in an imported state until its first apply. |
 
 ### What each operation runs on a Docker target
 
@@ -114,28 +117,89 @@ the remote shell; nothing secret is ever an argument.
 
 - **Create**: `docker run --rm <installer> > <work_dir>/<name>.sh` (written through a temporary
   file, so a failed fetch leaves no half script), the bootstrap script's `describe --json` (its
-  `format` checked, its `name` compared, its shapes must include `docker` when it lists any), then
+  `format` checked, its `name` compared, its shapes must include `docker` when it lists any, its
+  `short_name` recorded), then
   `sh <name>.sh --no-input --json --dir ./<name> [--set K=V]… [--tls] [--domains] [--ports]
   [--address] [--registry]`, with `--answers`, `--given`, `--secrets` and `--registry-ca` files
   sent on standard input as a tar into a private (0700) temporary directory removed afterwards;
-  then `status --json`. A failed or refused create saves no state.
-- **Read**: `<work_dir>/<name>/<short>-stow status --json --dir ./<name>` — the one `*-stow`
-  executable in the install directory (none or two is an error). A missing install directory
-  removes the resource from state (the script exits 100 with `stowage-provider: no install
-  directory` alone on stderr; any other exit 100 is a failure). A release other than the configured one (`installed.installer`)
-  replaces `installer` in state, so the next plan shows the change back.
-- **Update**: a change of the provider's own settings (the connection, `deletion_protection`,
-  `delete_data`, `allow_rollback`, `timeouts`) is saved without touching the target. A change of
-  `installer`, `inputs`, `secret_inputs_wo_version`, `tls`, `domains`, `ports` (or `vm.version`)
-  is refused at apply: `Changing … of an install is not implemented yet`.
+  then `status --json`, read again every 10 seconds while it reports `installing` (the first
+  install not finished) until it no longer does, within the create timeout. A failed or refused
+  create, an `install_failed` and a timeout save no state: applying again runs the install again,
+  which finishes the one left (a destroy cannot clean what state does not hold).
+- **The kept installer** is `<work_dir>/<name>/<short_name>-stow` (`short_name` from `describe`),
+  else, when that file is missing or not executable (a release that renamed its installer), the
+  one `*-stow` executable there; none or two is an error. A `short_name` in state that is not one
+  path element is an error naming the re-import. It runs with `--dir ./<name>` after its arguments
+  (not `describe`), and with files on standard input as the install does.
+- **Read**: the kept installer's `status --json`. A missing install directory removes the
+  resource from state (the script exits 100 with `stowage-provider: no install directory` alone
+  on stderr; any other exit 100 is a failure). A release other than the configured one
+  (`installed.installer`) replaces `installer` in state, so the next plan shows the change back.
+  When `status` lists the recorded input keys, a key of `inputs` with a non-empty value it does not
+  record is removed from state, so the next plan gives it again; `inputs` absent (the kept
+  installer does not carry the installed release) is unknown and removes nothing. An imported
+  remote state (no `known_hosts_line` yet) is not read: the configuration's connection reads it at
+  the first apply.
+- **Update**: a change of the provider's own settings alone (the connection,
+  `deletion_protection`, `delete_data`, `allow_rollback`, `timeouts`) is saved without touching
+  the target. Any other change, in this order:
+  1. `status --json` and the kept installer's `describe --json` (the running release's inputs).
+     No install directory is an error; a kept installer of another project too.
+  2. The release to reach: none when `installed.installer` is the desired `installer`; `rollback`
+     when it is `previous.installer` (with `allow_rollback`); else the new installer is fetched
+     (`<name>.sh` written again, as at create) and described — another project, or no `docker`
+     shape, is an error — and when it carries the release installed (the same `version` and
+     `revision`) there is nothing to upgrade — an error when the install records another digest of
+     its installer (`installer is another digest of the release installed`, naming the one to set:
+     Read would put it back at every refresh) — else its `upgrade` runs (the installer refuses an
+     older release: exit 3, the diagnostic).
+  3. The **re-run** of the running release, when there is anything to give it: `<short>-stow
+     --no-input --json [--set K=V]… [--tls] [--domains] [--ports] --dir ./<name>`, the secret
+     inputs as `--answers` on standard input. It takes each input of `inputs` changed or added
+     that the running release declares (every one without an upgrade), each input taken out that
+     the running release declares (`--set KEY=`; with an upgrade, only one the new release still
+     declares: the upgrade drops the others), the secret
+     inputs the running release declares when `secret_inputs_wo_version` changed, the changed
+     `tls`, the changed and added `domains`, and the changed `ports` (and added ones without an
+     upgrade). When a release change follows, state is saved here: the release still the old one,
+     `inputs` and `ports` as the re-run applied them. A failed or refused re-run changes no state.
+  4. The **upgrade**: `sh <name>.sh upgrade --no-input --json --dir ./<name> [--set K=V]…
+     [--ports]`, given the inputs the running release does not declare (those the new release
+     adds; the installer refuses any other), the secret inputs it does not declare (`--answers`,
+     sent with every upgrade), and the ports of routes state does not record (an imported state's go to the re-run). Or the
+     **rollback**, which goes alone: a change of inputs, secret inputs, TLS mode, domains or ports
+     with it is an error before anything runs (`a rollback goes alone`), and so is a rollback of an
+     imported install never applied (`a rollback of an imported install`: apply first with the
+     release it runs): `<short>-stow rollback --json --dir ./<name>`. A failure leaves step 3's state,
+     so the next plan shows the release change alone.
+  5. `status --json` fills the computed attributes; one that cannot be read keeps state's, with
+     the error.
+- **Import**: `tofu import stowage_install.x '[<host>:]<work_dir>/<name>/<short>-stow'`, the
+  installer the install keeps (`ls <work_dir>/<name>/*-stow`); a host is what comes before the
+  first colon when no slash does (an `@` is refused: the user comes from the configuration).
+  State records the target, the directory and `short_name`, `deletion_protection = true`; the
+  first apply, with the configuration's connection, runs the update above with every configured
+  input, secret input (when `secret_inputs_wo_version` is set), `tls`, domain and port given to
+  the re-run (the installer counts a value given as recorded as no change), and records the
+  provider's `registry`. Its `address` is not compared until then.
 - **Delete**: refused while `deletion_protection`; else `<short>-stow uninstall --yes --no-input
   --json [--data] --dir ./<name>`. An install directory already gone is success.
 
 ### Plan-time errors
 
 A change of a first-install-only setting — `docker.work_dir`, `address`, `vm.channel`, the
-provider's `registry`, the target block's kind, or the project an `installer` names — is a plan
-error naming the old value, never a replacement: replacing an install deletes its data.
+provider's `registry`, the target block's kind, or the project an `installer` names (an imported
+state: its install directory's name) — is a plan error naming the old value, never a replacement:
+replacing an install deletes its data.
+
+Also plan errors: `installer` changed to `previous.installer` without `allow_rollback` (`a
+rollback needs allow_rollback`); `tls` taken out (`tls cannot be removed`: a re-run has no flag
+for loopback mode); a route taken out of `domains` or `ports` (`domains.<route> cannot be
+removed`); a rollback with any other change of what the target applies (`a rollback goes
+alone`); a route added to `domains` while `installer` changes (known at plan time) (`a domain added with a release
+change`: a route the new release adds takes its domain from its domain input, in `inputs`; one
+the running release has takes it in an apply of its own). A plan changing anything the target applies plans `status` unknown; one changing
+`installer` also `version`, `revision`, `channel`, `previous` and `short_name`.
 
 ### The machine interface, as read
 
@@ -144,10 +208,10 @@ error naming the old value, never a replacement: replacing an install deletes it
   output (4 KiB). Exit 255 is noted as possibly ssh's own failure.
 - A verb's result is the JSON object its output ends with; `result` must be `done` or `nothing`.
 - **Unknown fields are tolerated** (an installer adds fields without moving `format`); a known
-  field of the wrong type, data after the object and a missing `name` or `version` are errors.
-- **An unknown `format` is refused**: missing from `describe` or a verb's result (an installer
-  older than Stowage 0.34.0), newer than 1 (upgrade the provider), or any other. `status --json`
-  is checked when it carries one.
+  field of the wrong type, data after the object, a missing `name` or `version`, and a
+  `describe` `short_name` that is not one path element (`[a-z0-9][a-z0-9._-]*`) are errors.
+- **An unknown `format` is refused**: missing from `describe`, `status --json` or a verb's result
+  (an installer older than Stowage 0.34.0), newer than 1 (upgrade the provider), or any other.
 
 ### SSH
 

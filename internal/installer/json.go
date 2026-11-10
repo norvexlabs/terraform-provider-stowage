@@ -10,6 +10,10 @@ import (
 	"strings"
 )
 
+// ValidShortName says whether s can be the <short> of a kept <short>-stow: one path element, as
+// a project's name.
+func ValidShortName(s string) bool { return projectName.MatchString(s) }
+
 // Format is the machine interface's version this provider reads.
 const Format = 1
 
@@ -79,26 +83,41 @@ type Input struct {
 
 // Describe is `describe --json`: what the installer's release offers.
 type Describe struct {
-	Format  *int     `json:"format"`
-	Name    string   `json:"name"`
-	Release Release  `json:"release"`
-	Channel string   `json:"channel"`
-	Shapes  []string `json:"shapes"`
-	Inputs  []Input  `json:"inputs"`
+	Format *int   `json:"format"`
+	Name   string `json:"name"`
+	// ShortName is the <short> of <short>-stow, the installer an install keeps in its directory.
+	ShortName        string   `json:"short_name"`
+	Release          Release  `json:"release"`
+	Channel          string   `json:"channel"`
+	Shapes           []string `json:"shapes"`
+	Inputs           []Input  `json:"inputs"`
+	FirstInstallOnly []string `json:"first_install_only"`
 }
 
-// Status is `status --json`, the fields common to every shape.
+// Declares says whether the release declares the input key.
+func (d *Describe) Declares(key string) bool {
+	for _, i := range d.Inputs {
+		if i.Key == key {
+			return true
+		}
+	}
+	return false
+}
+
+// Status is `status --json`: the fields common to every shape, and Docker's restore flags.
 type Status struct {
-	// Format is checked when present; status on a VM before the machine interface carried none.
-	Format        *int     `json:"format"`
-	Name          string   `json:"name"`
-	Installed     *Release `json:"installed"`
-	Channel       string   `json:"channel"`
-	Installing    bool     `json:"installing"`
-	InstallFailed string   `json:"install_failed"`
-	Previous      *Release `json:"previous"`
-	// Inputs are the recorded keys, never a value; sorted.
-	Inputs Keys `json:"inputs"`
+	Format         *int     `json:"format"`
+	Name           string   `json:"name"`
+	Installed      *Release `json:"installed"`
+	Channel        string   `json:"channel"`
+	Installing     bool     `json:"installing"`
+	InstallFailed  string   `json:"install_failed"`
+	RestoreAwaited bool     `json:"restore_awaited"`
+	VolumesSplit   bool     `json:"volumes_split"`
+	Previous       *Release `json:"previous"`
+	// Inputs are the recorded keys, never a value; sorted. Nil (absent, or null) is unknown: the
+	// installer run does not carry the installed release, whose spec tells them — never "none".
+	Inputs *Keys `json:"inputs"`
 }
 
 // Keys reads a list of keys given as a JSON array of strings or as an object's keys.
@@ -163,6 +182,9 @@ func ParseDescribe(b []byte) (*Describe, error) {
 	if d.Name == "" {
 		return nil, fmt.Errorf("%s: no name", doc)
 	}
+	if !ValidShortName(d.ShortName) {
+		return nil, fmt.Errorf("%s: short_name %q is not an installer's short name", doc, d.ShortName)
+	}
 	if err := d.Release.check(doc, "release"); err != nil {
 		return nil, err
 	}
@@ -176,10 +198,8 @@ func ParseStatus(b []byte) (*Status, error) {
 	if err := decodeOne(doc, b, &s); err != nil {
 		return nil, err
 	}
-	if s.Format != nil {
-		if err := checkFormat(doc, s.Format); err != nil {
-			return nil, err
-		}
+	if err := checkFormat(doc, s.Format); err != nil {
+		return nil, err
 	}
 	if s.Name == "" {
 		return nil, fmt.Errorf("%s: no name", doc)

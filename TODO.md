@@ -6,48 +6,50 @@ installer's machine interface and decides nothing itself. A finished item is del
 
 ## Must — the first release
 
-1. **Update: inputs, then the release** (P1). Today `Update` refuses any change the target must
-   apply (`Changing … of an install is not implemented yet`). Implement DESIGN § 13's order: the
-   inputs first, with the running release's installer (`<short>-stow --set …`, the secret inputs
-   by answers file when `secret_inputs_wo_version` changed), state saved; then the release, with
-   the new installer fetched by digest and its `upgrade --no-input --json`. A failure between
-   leaves the reconfigured release in state, so the next plan shows the upgrade alone. Inputs a
-   new release adds go with its upgrade. Remove the input keys from `inputs` that the target no
-   longer records only through the installer (a key removed from config: decide `--set KEY=`
-   versus leaving it, from the installer's rule for an empty value).
-2. **Rollback** (P1): only when the desired `installer` is `previous.installer` and
-   `allow_rollback` is set, `rollback --json`; any other older release goes to the installer,
-   whose refusal (exit 3) is the diagnostic.
-3. **Import** (P1): `tofu import stowage_install.x <host>:<work_dir>/<name>` reads the install
-   (`status --json`), the connection given in config.
-4. **Plan-time dry run** (P1, opt-in): an upgrade's `--dry-run` over SSH, skipped while the target
+1. **The verbs' `--json` result in Stowage** (blocks every apply past `describe`): Stowage's
+   installers do not yet print `{format, result, release, refused}` nor exit 3 on a refusal
+   (DESIGN § 6, its next slice). Until then a verb exiting 0 without the object is reported as
+   failed. Once it lands, prove create, update (re-run, upgrade, rollback) and delete against a
+   real installer (item 6) — the partial state an update saves before a failed upgrade included,
+   which OpenTofu accepts with the error.
+2. **Plan-time dry run** (P1, opt-in): an upgrade's `--dry-run` over SSH, skipped while the target
    does not exist yet.
-5. **Kubernetes target** (P2): `k8s install|upgrade|uninstall --json` run locally (kubeconfig
+3. **Kubernetes target** (P2): `k8s install|upgrade|uninstall --json` run locally (kubeconfig
    and context, helm ≥ 3.14, kubectl, a linux/amd64 runner); the installer fetched locally by
    digest; `k8s upgrade --given -` for a recorded input; no `secrets_wo` (refuse it).
-6. **`stowage_vm_seed` and the VM target** (P3): the seed as a managed resource (`vm seed --json`,
+4. **`stowage_vm_seed` and the VM target** (P3): the seed as a managed resource (`vm seed --json`,
    the one-time host key's private key in state until the install), the VM's `install --set`,
    `upgrade --version V --yes` followed by the reboot (a new `boot_id`, the trial over,
    `installed` the target; a fallback or a failed boot an error saving the release that runs).
-7. **Docs** (P4): `make docs` (tfplugindocs) into `docs/` from the schema and `examples/`; needs a
+5. **Docs** (P4): `make docs` (tfplugindocs) into `docs/` from the schema and `examples/`; needs a
    way to give tfplugindocs OpenTofu's schema instead of downloading Terraform.
-8. **Acceptance scripts against `tofu`** (P4): sshd + Docker-in-Docker for the Docker target,
+6. **Acceptance scripts against `tofu`** (P4): sshd + Docker-in-Docker for the Docker target,
    kind for Kubernetes, one TrueNAS VM; run in Docker like the gates, with a memory cap.
-9. **First release** (P5): the public repository `norvexlabs/terraform-provider-stowage`, created
+7. **First release** (P5): the public repository `norvexlabs/terraform-provider-stowage`, created
    by the maintainer with the org's GitHub App and its ruleset (pushes as the app only, like
    Stowage); a GPG key for the release (`GPG_FINGERPRINT`); a release workflow (GoReleaser
    on a pushed tag); registry submission by hand.
 
 ## Should
 
-- **A failed create leaves no state**: an install that failed half-way (exit 1, `installing`) is
-  forgotten, so a destroy cannot clean it; the next apply re-runs the install, which finishes it.
-  Saving it tainted would make the next apply destroy it (refused by `deletion_protection`).
-  Decide with the Update slice.
-- **`describe` carries no `short_name`**: Read finds the kept installer as the one `*-stow` in the
-  install directory. Ask Stowage to add `short_name` to `describe --json` (DESIGN § 6) and use it.
-- **`status --json` `format`**: DESIGN gives `format` to `describe` and the verbs' results, not to
-  `status`; this provider checks it when present. Settle with Stowage whether status carries it.
+- **A short name changed across releases**: state's `short_name` is the running release's after
+  a rollback, and the kept `*-stow` fallback runs only when `<short>-stow` is missing; with both
+  files left the stale one runs. Re-derive the short name after a rollback (or ask Stowage to
+  report it in `status --json`).
+- **A rollback's values**: DESIGN § 13 says a rollback restores the previous values; Stowage's
+  README says every other value stays as it is now (only the values `.env` lacks come back).
+  State keeps the configured inputs after a rollback; settle with Stowage which holds, and what
+  `status` should report.
+- **A port for an existing route set in the same apply as an upgrade** goes to the upgrade's
+  `--ports` (taken as a route the release adds), which refuses a recorded route. `describe` does
+  not list routes: ask Stowage to, and decide by it.
+
+- **`registry_ca` is first-install only** (`describe` `first_install_only`), but state does not
+  record it: a changed provider `registry_ca` is silently not applied (a re-run is never given
+  it). Record its digest and make a change a plan error, as `registry`.
+- **An imported state's `address`** is never compared (status does not report it): one given
+  in config that differs from the install's is not caught, as the re-run is never given it.
+
 - **The minimum Stowage release** (`installer.MinStowage`, 0.34.0) is the release expected to ship
   the machine interface: confirm at that release.
 

@@ -43,6 +43,7 @@ type installModel struct {
 	DeletionProtection    types.Bool     `tfsdk:"deletion_protection"`
 	DeleteData            types.Bool     `tfsdk:"delete_data"`
 	Registry              types.String   `tfsdk:"registry"`
+	ShortName             types.String   `tfsdk:"short_name"`
 	Version               types.String   `tfsdk:"version"`
 	Revision              types.Int64    `tfsdk:"revision"`
 	Channel               types.String   `tfsdk:"channel"`
@@ -176,7 +177,7 @@ func installSchema(ctx context.Context) schema.Schema {
 			},
 			"allow_rollback": schema.BoolAttribute{
 				Optional: true, Computed: true, Default: booldefault.StaticBool(false),
-				MarkdownDescription: "Lets a change of the desired release to `previous` run `rollback`. Not yet used: release changes are not implemented in this release.",
+				MarkdownDescription: "Lets a change of `installer` to `previous.installer` run the kept installer's `rollback`. Without it, that change is a plan-time error: a rollback restores the previous values, so a variable edit never triggers one.",
 			},
 			"deletion_protection": schema.BoolAttribute{
 				Optional: true, Computed: true, Default: booldefault.StaticBool(true),
@@ -186,8 +187,9 @@ func installSchema(ctx context.Context) schema.Schema {
 				Optional: true, Computed: true, Default: booldefault.StaticBool(false),
 				MarkdownDescription: "A destroy runs `uninstall --data`, deleting the volumes, instead of `uninstall`, which keeps them.",
 			},
-			"registry": computedString("The provider's `registry` at the install, which a later plan compares."),
-			"version":  computedString("The release installed, from `status --json`."),
+			"registry":   computedString("The provider's `registry` at the install, which a later plan compares; null in an imported state until its first apply."),
+			"short_name": computedString("The installer's short name (`describe` `short_name`): the install keeps its installer as `<id>/<short_name>-stow`."),
+			"version":    computedString("The release installed, from `status --json`."),
 			"revision": schema.Int64Attribute{Computed: true, MarkdownDescription: "The installed release's package revision.",
 				PlanModifiers: []planmodifier.Int64{int64planmodifier.UseStateForUnknown()}},
 			"channel": computedString("The channel the install follows."),

@@ -5,6 +5,7 @@ package provider
 import (
 	"context"
 	"strings"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -50,11 +51,17 @@ type Data struct {
 	// on another resource): the plan-time comparison with the install's is then skipped.
 	RegistryKnown bool
 	NewRunner     RunnerFactory
+	// Poll is how often a create reads an install still installing.
+	Poll time.Duration
 }
+
+// defaultPoll is how often a create reads an install still installing.
+const defaultPoll = 10 * time.Second
 
 type stowageProvider struct {
 	version   string
 	newRunner RunnerFactory
+	poll      time.Duration
 }
 
 type providerModel struct {
@@ -71,7 +78,11 @@ func New(version string) func() provider.Provider {
 
 // NewWithRunner returns the provider's constructor, reaching targets with f.
 func NewWithRunner(version string, f RunnerFactory) func() provider.Provider {
-	return func() provider.Provider { return &stowageProvider{version: version, newRunner: f} }
+	return newWithPoll(version, f, defaultPoll)
+}
+
+func newWithPoll(version string, f RunnerFactory, poll time.Duration) func() provider.Provider {
+	return func() provider.Provider { return &stowageProvider{version: version, newRunner: f, poll: poll} }
 }
 
 func (p *stowageProvider) Metadata(_ context.Context, _ provider.MetadataRequest, resp *provider.MetadataResponse) {
@@ -127,6 +138,7 @@ func (p *stowageProvider) Configure(ctx context.Context, req provider.ConfigureR
 		RegistryCA:    m.RegistryCA.ValueString(),
 		RegistryKnown: !m.Registry.IsUnknown(),
 		NewRunner:     p.newRunner,
+		Poll:          p.poll,
 	}
 	resp.ResourceData = d
 	resp.DataSourceData = d

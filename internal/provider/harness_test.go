@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/providerserver"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
@@ -38,12 +39,22 @@ func (c call) op() string {
 	case installer.FetchScript:
 		return "fetch"
 	case installer.RunScript:
-		if contains(c.argv, "describe") {
+		switch {
+		case contains(c.argv, "describe"):
 			return "describe"
+		case contains(c.argv, "upgrade"):
+			return "upgrade"
 		}
 		return "install"
 	case installer.StowScript:
-		return c.argv[6]
+		switch verb := c.argv[9]; {
+		case strings.HasPrefix(verb, "-"):
+			return "rerun"
+		case verb == "describe":
+			return "kept-describe"
+		default:
+			return verb
+		}
 	}
 	return "?"
 }
@@ -63,23 +74,65 @@ type reply struct {
 	exit   int
 }
 
-// fake is a Runner answering each operation with a set reply, recording every call and the
-// connection it was made for.
+// fake is a Runner answering each operation with its next queued reply, else its set reply,
+// recording every call and the connection it was made for. A call whose context is done fails
+// as a real run would.
 type fake struct {
 	mu      sync.Mutex
 	calls   []call
 	conns   []Connection
 	replies map[string]reply
+	queue   map[string][]reply
 }
 
+const describe1 = `{"format":1,"name":"notes","short_name":"notes","release":{"version":"1.2.0","revision":1},"channel":"stable","shapes":["docker"],"inputs":[{"key":"ADMIN_EMAIL"},{"key":"SMTP_PASSWORD","secret":true},{"key":"LEGACY"}]}`
+
 func newFake() *fake {
-	return &fake{replies: map[string]reply{
-		"fetch":     {},
-		"describe":  {stdout: `{"format":1,"name":"notes","release":{"version":"1.2.0","revision":1},"channel":"stable","shapes":["docker"],"inputs":[{"key":"ADMIN_EMAIL"},{"key":"SMTP_PASSWORD","secret":true}]}`},
-		"install":   {stdout: `{"format":1,"result":"done","release":{"version":"1.2.0","revision":1}}`},
-		"status":    {stdout: `{"name":"notes","installed":{"version":"1.2.0","revision":1,"installer":"` + image + `"},"channel":"stable","previous":null,"inputs":["ADMIN_EMAIL","SMTP_PASSWORD"]}`},
-		"uninstall": {stdout: `{"format":1,"result":"done"}`},
+	return &fake{queue: map[string][]reply{}, replies: map[string]reply{
+		"fetch":         {},
+		"describe":      {stdout: describe1},
+		"kept-describe": {stdout: describe1},
+		"install":       {stdout: `{"format":1,"result":"done","release":{"version":"1.2.0","revision":1}}`},
+		"rerun":         {stdout: `{"format":1,"result":"done","release":{"version":"1.2.0","revision":1}}`},
+		"upgrade":       {stdout: `{"format":1,"result":"done","release":{"version":"2.0.0","revision":1}}`},
+		"rollback":      {stdout: `{"format":1,"result":"done","release":{"version":"1.1.0","revision":1}}`},
+		"status":        {stdout: `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1,"installer":"` + image + `"},"channel":"stable","previous":null,"inputs":["ADMIN_EMAIL","SMTP_PASSWORD"]}`},
+		"uninstall":     {stdout: `{"format":1,"result":"done"}`},
 	}}
+}
+
+// then queues replies to op, given before its set reply.
+func (f *fake) then(op string, rs ...reply) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.queue[op] = append(f.queue[op], rs...)
+}
+
+// set replaces op's set reply.
+func (f *fake) set(op string, r reply) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.replies[op] = r
+}
+
+// callsOf is the calls made to op.
+func (f *fake) callsOf(op string) []call {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []call
+	for _, c := range f.calls {
+		if c.op() == op {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// reset forgets the calls made.
+func (f *fake) reset() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls, f.conns = nil, nil
 }
 
 func (f *fake) factory(c Connection) (target.Runner, error) {
@@ -89,12 +142,18 @@ func (f *fake) factory(c Connection) (target.Runner, error) {
 	return f, nil
 }
 
-func (f *fake) Run(_ context.Context, argv []string, stdin []byte) ([]byte, []byte, int, error) {
+func (f *fake) Run(ctx context.Context, argv []string, stdin []byte) ([]byte, []byte, int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	c := call{argv: append([]string(nil), argv...), stdin: append([]byte(nil), stdin...)}
 	f.calls = append(f.calls, c)
+	if err := ctx.Err(); err != nil {
+		return nil, nil, -1, err
+	}
 	r, ok := f.replies[c.op()]
+	if q := f.queue[c.op()]; len(q) > 0 {
+		r, ok, f.queue[c.op()] = q[0], true, q[1:]
+	}
 	if !ok {
 		return nil, []byte("unexpected call"), 99, nil
 	}
@@ -124,7 +183,7 @@ type harness struct {
 func newHarness(t *testing.T, providerConfig map[string]tftypes.Value) *harness {
 	t.Helper()
 	f := newFake()
-	srv, err := providerserver.NewProtocol6WithError(NewWithRunner("test", f.factory)())()
+	srv, err := providerserver.NewProtocol6WithError(newWithPoll("test", f.factory, time.Millisecond)())()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,6 +364,16 @@ func (h *harness) destroy(state *tfprotov6.DynamicValue) *tfprotov6.ApplyResourc
 		h.t.Fatal(err)
 	}
 	return resp
+}
+
+// update plans config against state and applies it, failing the test on a plan error.
+func (h *harness) update(state *tfprotov6.DynamicValue, config tftypes.Value) *tfprotov6.ApplyResourceChangeResponse {
+	h.t.Helper()
+	p := h.plan(state, config)
+	if d := errorsOf(p.Diagnostics); d != "" {
+		h.t.Fatalf("plan: %s", d)
+	}
+	return h.apply(state, p.PlannedState, config)
 }
 
 func (h *harness) read(state *tfprotov6.DynamicValue) *tfprotov6.ReadResourceResponse {
