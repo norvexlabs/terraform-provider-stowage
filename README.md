@@ -1,3 +1,19 @@
+<p align="center">
+  <img src="docs/img/logo.svg" alt="Stowage" width="300">
+</p>
+
+<p align="center">
+  <b>The OpenTofu provider for Stowage: declare a product's install beside the VM, cloud or
+  cluster it runs on, in one OpenTofu root.</b>
+</p>
+
+<p align="center">
+  <a href="LICENSE"><img alt="Licence: Apache 2.0" src="https://img.shields.io/badge/licence-Apache%202.0-7571F9"></a>
+  <a href="CHANGELOG.md"><img alt="Status: pre-1.0" src="https://img.shields.io/badge/status-pre--1.0-F780E2"></a>
+  <img alt="OpenTofu ≥ 1.11" src="https://img.shields.io/badge/OpenTofu-%E2%89%A5%201.11-02BF87">
+  <a href="https://github.com/norvexlabs/stowage"><img alt="Stowage ≥ 0.34.0" src="https://img.shields.io/badge/Stowage-%E2%89%A5%200.34.0-02BF87"></a>
+</p>
+
 # terraform-provider-stowage
 
 The OpenTofu provider for [Stowage](https://github.com/norvexlabs/stowage): it declares a Stowage
@@ -275,9 +291,48 @@ through OpenTofu: `TF_ACC=1 TF_ACC_TERRAFORM_PATH=<tofu> TF_ACC_PROVIDER_NAMESPA
 TF_ACC_PROVIDER_HOST=registry.opentofu.org STOWAGE_ACC_INSTALLER=<ref@digest>
 STOWAGE_ACC_WORK_DIR=<dir> go test ./internal/provider -run TestAcc`.
 
-Releases: GoReleaser (`.goreleaser.yml`): zips `terraform-provider-stowage_<version>_<os>_<arch>`,
-`…_SHA256SUMS` with its detached GPG signature (`GPG_FINGERPRINT`), and the registry manifest
-(protocol 6.0).
+CI (`.github/workflows/ci.yml`) runs `make check` and `make build` on every push to `main` and
+every pull request.
+
+## Release
+
+For maintainers. Only a pushed `v*` tag releases (`.github/workflows/release.yml`); a push to
+`main` never does.
+
+1. A commit dates the top CHANGELOG.md entry: `## [x.y.z]` → `## [x.y.z] - YYYY-MM-DD`. The
+   Makefile's `VERSION` is that entry's version.
+2. `git tag vx.y.z` on that commit of `main`, pushed with `main`.
+3. The **build** job (read-only token) refuses a tag that is not on `main`, that does not name the
+   top entry's version, or whose entry is undated, then runs `make check`.
+4. The **publish** job (`contents: write`) refuses a tag whose release is already published (a
+   draft left by a failed run is replaced), imports the release key from the `GPG_PRIVATE_KEY`
+   secret (refused unless it is the key below, and unless `keys/norvexlabs-gpg-public.asc` is its
+   public half), and runs GoReleaser (`.goreleaser.yml`, GoReleaser v2.19.0) with the Go of
+   `GO_VERSION`. GoReleaser makes a draft release, its notes the tag's CHANGELOG.md entry, holding
+   what the OpenTofu and Terraform registries read:
+   - `terraform-provider-stowage_<version>_<os>_<arch>.zip` for freebsd, windows, linux and
+     darwin on amd64, 386, arm and arm64 (no darwin/386), each holding
+     `terraform-provider-stowage_v<version>`;
+   - `terraform-provider-stowage_<version>_manifest.json`, from `terraform-registry-manifest.json`
+     (plugin protocol 6.0);
+   - `terraform-provider-stowage_<version>_SHA256SUMS` over the zips and the manifest, and
+     `terraform-provider-stowage_<version>_SHA256SUMS.sig`, its binary detached GPG signature by
+     the release key, its passphrase from the `PASSPHRASE` secret.
+
+   The job then verifies the signature with `keys/norvexlabs-gpg-public.asc`, the manifest's and
+   every zip's checksum, and publishes the draft. The release is made by `github-actions` with
+   the workflow's `GITHUB_TOKEN`; nothing is published as a person.
+
+The release key: fingerprint `686D3351040F9F4463D9D3AC0C705E9BAA4F4981`, RSA 4096, `Norvex Labs
+<norvexlabs@gmail.com>`. Its public key is in this repository,
+[`keys/norvexlabs-gpg-public.asc`](keys/norvexlabs-gpg-public.asc), and is the one the registries
+are given. To check a release by hand:
+
+```bash
+gpg --import keys/norvexlabs-gpg-public.asc
+gpg --verify terraform-provider-stowage_<version>_SHA256SUMS.sig terraform-provider-stowage_<version>_SHA256SUMS
+sha256sum --check --ignore-missing terraform-provider-stowage_<version>_SHA256SUMS
+```
 
 ## Repository
 
@@ -288,5 +343,10 @@ Releases: GoReleaser (`.goreleaser.yml`): zips `terraform-provider-stowage_<vers
 | `internal/installer` | the machine interface's documents, exit mapping, the Docker target's scripts |
 | `internal/target` | `Runner`: this machine, or the system `ssh` with a pinned host key |
 | `examples/` | provider and resource examples (read by tfplugindocs) |
+| `.goreleaser.yml`, `terraform-registry-manifest.json` | the release's zips, checksums, signature and registry manifest |
+| `.github/workflows/` | `ci.yml` (check and build), `release.yml` (a pushed tag's release) |
+| `.githooks/` | the commit identity and push guards (`make hooks`) |
+| `keys/` | the release key's public half |
+| `docs/img/` | the logo, mark, icons and the repository's social preview |
 
 Licence: Apache-2.0.

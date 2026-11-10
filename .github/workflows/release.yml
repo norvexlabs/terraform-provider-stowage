@@ -1,0 +1,117 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions: {}
+# One run per tag at a time: a run waits for the one before it (GitHub keeps one waiting run, the
+# latest).
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  # Tests with a read-only token: no test runs where a release can be written or the key is.
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # The tag is a commit of main and names the top CHANGELOG.md entry, dated: the version the
+      # Makefile builds.
+      - name: tag matches main and CHANGELOG.md
+        run: |
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "tag $GITHUB_REF_NAME is not on main"; exit 1; }
+          # shellcheck disable=SC2016 # $(VERSION) is make's, in the makefile given on standard input
+          v="$(make -s -f Makefile -f - print-version <<<'print-version: ; @echo $(VERSION)')"
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME, CHANGELOG.md's top entry $v"; exit 1; }
+          awk -v h="## [$v] - " 'index($0, h) == 1 && substr($0, length(h) + 1) ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/ {found = 1} END {exit !found}' CHANGELOG.md || { echo "CHANGELOG.md's $v entry has no date"; exit 1; }
+      - run: make check
+
+  # Builds the zips with GoReleaser, signs the checksums with the release key and publishes the
+  # release as github-actions (GITHUB_TOKEN). It runs no test and no script of the repository.
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write     # the release and its assets
+    env:
+      # The release key (README.md, Release); keys/norvexlabs-gpg-public.asc is its public half.
+      GPG_FINGERPRINT: 686D3351040F9F4463D9D3AC0C705E9BAA4F4981
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # The Go of the Makefile and the Dockerfile (GO_VERSION), which make check tested.
+      - name: go version
+        id: go
+        run: |
+          v="$(sed -n 's/^GO_VERSION ?= //p' Makefile)"
+          [ -n "$v" ] || { echo "no GO_VERSION in the Makefile"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ steps.go.outputs.version }}
+          cache: false
+      # A published release is never changed (the registries index a version once); a draft left by
+      # a failed run is replaced. A failed listing stops the run.
+      - name: no published release of the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          drafts="$(gh api --paginate "repos/$GH_REPO/releases" --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\") | .draft")"
+          case "$drafts" in
+            ""|true) ;;
+            *) echo "release $GITHUB_REF_NAME: already published, or more than one ($drafts)"; exit 1 ;;
+          esac
+      # The secret key is imported into the runner's own keyring; it must be the release key, whose
+      # public half is the one in keys/.
+      - name: import the release key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          [ -n "$GPG_PRIVATE_KEY" ] || { echo "the GPG_PRIVATE_KEY secret is not set"; exit 1; }
+          gpg --batch --import <<<"$GPG_PRIVATE_KEY"
+          gpg --batch --with-colons --list-secret-keys "$GPG_FINGERPRINT" | grep -qx "fpr:::::::::$GPG_FINGERPRINT:" ||
+            { echo "GPG_PRIVATE_KEY is not the key $GPG_FINGERPRINT"; exit 1; }
+          pub="$(gpg --batch --with-colons --show-keys keys/norvexlabs-gpg-public.asc | awk -F: '$1 == "fpr" {print $10; exit}')"
+          [ "$pub" = "$GPG_FINGERPRINT" ] || { echo "keys/norvexlabs-gpg-public.asc is $pub, not $GPG_FINGERPRINT"; exit 1; }
+      # The notes are the tag's own CHANGELOG.md entry, up to the next entry or a link definition.
+      - name: notes
+        run: |
+          awk -v h="## [${GITHUB_REF_NAME#v}] - " 'index($0, h) == 1 {on = 1; next} on && (/^## \[/ || /^\[[^]]+\]: /) {exit} on' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          grep -q . "$RUNNER_TEMP/notes.md" || { echo "no notes for $GITHUB_REF_NAME"; exit 1; }
+      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        with:
+          distribution: goreleaser
+          version: v2.19.0
+          args: release --clean --release-notes ${{ runner.temp }}/notes.md
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PASSPHRASE: ${{ secrets.PASSPHRASE }}
+      # The draft holds what the registries read: every zip in the checksums, the checksums signed
+      # by the key in keys/. Only then is it published.
+      - name: verify the signature and the checksums
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          sums="dist/terraform-provider-stowage_${v}_SHA256SUMS"
+          gpg --batch --dearmor < keys/norvexlabs-gpg-public.asc > "$RUNNER_TEMP/release.gpg"
+          gpgv --keyring "$RUNNER_TEMP/release.gpg" "$sums.sig" "$sums"
+          m="$(sha256sum terraform-registry-manifest.json | cut -d' ' -f1)"
+          grep -qx "$m  terraform-provider-stowage_${v}_manifest.json" "$sums" || { echo "the manifest is not in $sums"; exit 1; }
+          zips="$(grep -c "  terraform-provider-stowage_${v}_[a-z0-9]*_[a-z0-9]*\.zip\$" "$sums")" || true
+          set -- dist/terraform-provider-stowage_"${v}"_*.zip
+          [ "$zips" -gt 0 ] && [ "$zips" = "$#" ] || { echo "$sums lists $zips zips, dist holds others"; exit 1; }
+          (cd dist && sha256sum --check --strict --ignore-missing "${sums#dist/}")
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false

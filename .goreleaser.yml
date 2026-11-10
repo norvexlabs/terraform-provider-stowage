@@ -1,9 +1,11 @@
-# The release: zips per platform, SHA256SUMS signed with the release GPG key (GPG_FINGERPRINT),
-# and the registry manifest, as the OpenTofu and Terraform registries read them.
+# The release, in the layout the OpenTofu and Terraform registries read: a zip per platform
+# (terraform-provider-stowage_<version>_<os>_<arch>.zip), <name>_<version>_SHA256SUMS over them and
+# the manifest, its binary detached signature <name>_<version>_SHA256SUMS.sig by the release key
+# (GPG_FINGERPRINT; its passphrase PASSPHRASE on gpg's standard input), and
+# <name>_<version>_manifest.json (plugin protocol 6.0). The release is left a draft: the workflow
+# verifies the signature with the key in keys/ and publishes it.
 version: 2
-before:
-  hooks:
-    - go mod tidy
+project_name: terraform-provider-stowage
 builds:
   - env:
       - CGO_ENABLED=0
@@ -29,8 +31,13 @@ checksum:
   algorithm: sha256
 signs:
   - artifacts: checksum
+    stdin: "{{ .Env.PASSPHRASE }}"
     args:
       - "--batch"
+      - "--pinentry-mode"
+      - "loopback"
+      - "--passphrase-fd"
+      - "0"
       - "--local-user"
       - "{{ .Env.GPG_FINGERPRINT }}"
       - "--output"
@@ -42,5 +49,8 @@ release:
     - glob: terraform-registry-manifest.json
       name_template: "{{ .ProjectName }}_{{ .Version }}_manifest.json"
   draft: true
+  replace_existing_draft: true
+  replace_existing_artifacts: true
+  name_template: "terraform-provider-stowage {{ .Version }}"
 changelog:
   disable: true

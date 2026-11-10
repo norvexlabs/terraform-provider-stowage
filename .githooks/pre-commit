@@ -9,3 +9,40 @@ for who in AUTHOR COMMITTER; do
     exit 1
   fi
 done
+# Refuses a commit whose tree (the index: every staged file, so every added line too) or file names
+# match a word of the private-words list, one extended regex per line, case-insensitive. The list
+# lives outside the tree, so the words are never in it: the hook names the file:line, never the
+# word. A clone without the list is warned and passes.
+list=${XDG_CONFIG_HOME:-$HOME/.config}/norvexlabs/private-words
+if [ ! -f "$list" ]; then
+  echo "pre-commit: warning: no private-words list at $list; the tree is not checked for private words" >&2
+  exit 0
+fi
+pats=$(mktemp)
+hits=$(mktemp)
+trap 'rm -f "$pats" "$hits"' EXIT
+grep -v '^[[:space:]]*$' "$list" > "$pats" || true
+[ -s "$pats" ] || exit 0
+rc=0
+git grep --cached -n -i -E -f "$pats" > "$hits" || rc=$?
+if [ "$rc" -gt 1 ]; then
+  echo "pre-commit: the private-words check failed (git grep exit $rc); fix $list" >&2
+  exit 1
+fi
+found=0
+if [ -s "$hits" ]; then
+  echo "pre-commit: refused: a private word ($list) is in:" >&2
+  sed -e 's/^Binary file \(.*\) matches$/\1 (binary)/' -e 's/^\([^:]*:[0-9]*\):.*/\1/' "$hits" | sed 's/^/  /' >&2
+  found=1
+fi
+rc=0
+git ls-files --cached | grep -n -i -E -f "$pats" > "$hits" || rc=$?
+if [ "$rc" -gt 1 ]; then
+  echo "pre-commit: the private-words check failed (grep exit $rc); fix $list" >&2
+  exit 1
+fi
+if [ -s "$hits" ]; then
+  echo "pre-commit: refused: a private word ($list) is in a file's path: git ls-files line(s) $(cut -d: -f1 "$hits" | tr '\n' ' ')" >&2
+  found=1
+fi
+[ "$found" = 0 ] || exit 1

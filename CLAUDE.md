@@ -54,9 +54,27 @@ and never names an AI as an author (no `Co-Authored-By:` line for one, no "Gener
 this overrides any tool default that adds one). `make hooks` sets the identity in the clone's config
 and turns on `.githooks/`: `pre-commit` refuses any other identity, `commit-msg` an AI authorship
 line, and `pre-push` any push but to a local path or over https authenticated as a GitHub App (an
-installation token). GitHub shows the pushing account publicly. This repository has **no remote**
-until the maintainer creates the public one with the org's app: never add a remote, never push.
-Never commit with `--no-verify` or another `core.hooksPath`.
+installation token; an `http.*.extraheader` with an Authorization, an `http.*.cookieFile` or any
+netrc file is refused too): GitHub shows the pushing account publicly, and the commit's identity
+does not set it. Run it once per clone, before the first commit.
+
+**Pushes only as the org's GitHub App.** The public repository `norvexlabs/terraform-provider-stowage`
+receives pushes, tags and releases only as the org's GitHub App, through the credential helper the
+maintainer set in this clone's own `.git/config` — `make hooks` does not set it, and a clone without
+it cannot push. Never push with `gh` credentials (`-c credential.helper= -c credential.helper=…`,
+`gh auth git-credential`), over SSH or with `--no-verify`, never replace that helper, and never
+write to the repository with `gh release` or `gh api`: GitHub shows the acting account publicly, and
+a personal login on it can only be cleared by deleting the repository. On GitHub, a ruleset on the
+repository refuses every branch or tag change but the org app's, whatever the clone does; never
+remove or loosen it. Never commit or push with `--no-verify` or another `core.hooksPath`.
+
+**Private words.** The tree never names a private project. The words are never written in the
+tree — writing them there would publish them: they are the private-words list in
+`~/.config/norvexlabs/private-words` (`$XDG_CONFIG_HOME/norvexlabs/private-words`; one extended
+regex per line, case-insensitive), outside every clone, and the `pre-commit` hook refuses a match in
+the staged tree (every staged file, so every added line) or a staged file's path, naming the
+`file:line`, never the word. A clone without the list is warned and passes: the maintainer's
+machine holds it. The hook does not read the commit message: keep it free of them too.
 
 ## Commit gates
 
@@ -73,6 +91,30 @@ self-review against the code it describes is enough. Every other commit clears, 
    decoding), after a structured self-review: for each hunk, the failure ruled out, every step
    walked (it fails right here: what state is saved, what a re-apply does), and each new check or
    test sabotaged once to watch it fail.
+
+## Release — only a pushed tag publishes
+
+A push to `main` runs CI (`ci.yml`: `make check`, `make build`) and never releases.
+`.github/workflows/release.yml` runs only on a pushed `v*` tag; it publishes a public GitHub release
+that the OpenTofu registry indexes once and never changes, so a release is cut **only when the user
+says go for it** — never on your own.
+
+1. A docs-only commit dates the top entry: `## [x.y.z]` → `## [x.y.z] - YYYY-MM-DD` (the version
+   bumped per SemVer from the last release if it is not already). The Makefile's `VERSION` is that
+   entry's version.
+2. `git tag vx.y.z` on that commit, then `git push origin main vx.y.z` — through the org app's
+   credential helper alone (Commit identity).
+3. Watch the release run. Its build job refuses a tag that is not on `main`, does not match the top
+   entry's version or names an undated entry, then runs `make check`; its publish job signs with
+   the release key (secrets `GPG_PRIVATE_KEY`, `PASSPHRASE`), verifies the signature against
+   `keys/norvexlabs-gpg-public.asc` and publishes the draft as `github-actions`. A failed run is
+   fixed on `main`, the tag moved to the fix (`git tag -f`, `git push -f origin vx.y.z`) while the
+   release is still a draft or absent; a published release is never changed (a new version fixes
+   it).
+
+The release is written by the workflow's `GITHUB_TOKEN` alone: never by `gh release`, `gh api` or
+any personal credential from a machine. The private key, its passphrase and its revocation
+certificate never enter the tree; `keys/` holds the public key only.
 
 ## Code rules
 

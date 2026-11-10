@@ -47,3 +47,6 @@ follow [SemVer](https://semver.org/).
   upgrade goes to included; one moved to
   `secret_inputs_wo` is no longer given empty, and needs a new `secret_inputs_wo_version`.
 - A missing install directory is recognised behind an SSH banner.
+- Releases in the OpenTofu registry's layout: a zip per platform, the plugin protocol manifest, and
+  checksums signed with the Norvex Labs release key `686D3351040F9F4463D9D3AC0C705E9BAA4F4981`,
+  whose public key the repository publishes.
