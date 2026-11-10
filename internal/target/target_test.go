@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 const edKey = "AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
@@ -61,6 +62,9 @@ func TestSSHArgvIsStrict(t *testing.T) {
 		"KnownHostsCommand=none",
 		"HostKeyAlias=" + HostKeyAlias,
 		"UpdateHostKeys=no",
+		"VerifyHostKeyDNS=no",
+		"ControlMaster=no",
+		"ControlPath=none",
 		"IdentitiesOnly=yes",
 	} {
 		i := slices.Index(argv, opt)
@@ -129,6 +133,45 @@ func TestLocalRun(t *testing.T) {
 	}
 	if _, _, exit, err := (Local{}).Run(context.Background(), []string{"/nonexistent/prog"}, nil); err == nil || exit != -1 {
 		t.Fatalf("missing program: exit %d err %v", exit, err)
+	}
+}
+
+// A run cut by its context returns once the program is killed, even when a program it started
+// keeps the output open (it sets waitDelay: no t.Parallel).
+func TestRunCutByItsContextReturns(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no sh")
+	}
+	defer func(d time.Duration) { waitDelay = d }(waitDelay)
+	waitDelay = 50 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	// sh is killed; the sleep it started holds stdout for 3 seconds.
+	_, _, exit, err := Local{}.Run(ctx, []string{"sh", "-c", "sleep 3; true"}, nil)
+	if err == nil || exit != -1 {
+		t.Fatalf("a run cut by its context: exit %d err %v", exit, err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("the run returned after %v, held by the output its child kept open", d)
+	}
+}
+
+// A program that exits while one it started keeps the output open keeps its exit status (it
+// sets waitDelay: no t.Parallel).
+func TestRunExitedKeepsItsStatus(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no sh")
+	}
+	defer func(d time.Duration) { waitDelay = d }(waitDelay)
+	waitDelay = 50 * time.Millisecond
+	start := time.Now()
+	out, _, exit, err := Local{}.Run(context.Background(), []string{"sh", "-c", "echo done; sleep 3 & exit 0"}, nil)
+	if err != nil || exit != 0 || string(out) != "done\n" {
+		t.Fatalf("got %q exit %d err %v", out, exit, err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("the run returned after %v, held by the output its child kept open", d)
 	}
 }
 

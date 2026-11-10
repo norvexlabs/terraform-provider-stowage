@@ -17,7 +17,8 @@ import (
 )
 
 // NotInstalled is the exit status StowScript gives when the install directory does not exist,
-// with NotInstalledMark alone on stderr: both, so an installer's own exit 100 is not taken for it.
+// with NotInstalledMark as the last line of stderr (ssh may print a banner before it) and nothing
+// on stdout: all three, so an installer's own exit 100 is not taken for it.
 const (
 	NotInstalled     = 100
 	NotInstalledMark = "stowage-provider: no install directory"
@@ -211,25 +212,10 @@ type Install struct {
 // InstallArgv is the install's command line and standard input: nothing secret is on the
 // command line.
 func (d Docker) InstallArgv(in Install) ([]string, []byte, error) {
-	args := []string{"sh", "./" + d.Name + ".sh", "--no-input", "--json", "--dir", "./" + d.Name}
-	for _, k := range slices.Sorted(maps.Keys(in.Inputs)) {
-		if !ValidInputKey(k) {
-			return nil, nil, fmt.Errorf("inputs: %q is not an input key", k)
-		}
-		args = append(args, "--set", k+"="+in.Inputs[k])
-	}
-	if in.TLS != "" {
-		args = append(args, "--tls", in.TLS)
-	}
-	if v, err := routeList("domains", in.Domains); err != nil {
+	c := Change{Inputs: in.Inputs, SecretInputs: in.SecretInputs, TLS: in.TLS, Domains: in.Domains, Ports: in.Ports}
+	args, files, err := changeArgs(c, "sh", "./"+d.Name+".sh", "--no-input", "--json", "--dir", "./"+d.Name)
+	if err != nil {
 		return nil, nil, err
-	} else if v != "" {
-		args = append(args, "--domains", v)
-	}
-	if v, err := routeList("ports", in.Ports); err != nil {
-		return nil, nil, err
-	} else if v != "" {
-		args = append(args, "--ports", v)
 	}
 	if in.Address != "" {
 		args = append(args, "--address", in.Address)
@@ -237,9 +223,10 @@ func (d Docker) InstallArgv(in Install) ([]string, []byte, error) {
 	if in.Registry != "" {
 		args = append(args, "--registry", in.Registry)
 	}
-	files, err := withAnswers(in.SecretInputs, map[string]string{"given": in.Given, "secrets": in.Secrets, "registry-ca": in.RegistryCA})
-	if err != nil {
-		return nil, nil, err
+	for name, v := range map[string]string{"given": in.Given, "secrets": in.Secrets, "registry-ca": in.RegistryCA} {
+		if v != "" {
+			files[name] = v
+		}
 	}
 	names, stdin, err := filesInput(files)
 	if err != nil {
@@ -248,15 +235,9 @@ func (d Docker) InstallArgv(in Install) ([]string, []byte, error) {
 	return append([]string{"sh", "-c", RunScript, "sh", d.WorkDir, names}, args...), stdin, nil
 }
 
-// withAnswers is files, the empty ones left out, with an answers file of secrets when there are
-// any.
-func withAnswers(secrets, files map[string]string) (map[string]string, error) {
+// withAnswers is an answers file of the secrets, when there are any.
+func withAnswers(secrets map[string]string) (map[string]string, error) {
 	out := map[string]string{}
-	for name, v := range files {
-		if v != "" {
-			out[name] = v
-		}
-	}
 	if len(secrets) > 0 {
 		answers, err := answersFile(secrets)
 		if err != nil {
@@ -307,6 +288,23 @@ func (d Docker) stow(ctx context.Context, files map[string]string, withDir bool,
 // describe, so an installer without the machine interface stops there, before a verb is given
 // --json.
 var errOldInstaller = fmt.Errorf("if the installer was made by Stowage before %s, it has no describe --json nor --json on its verbs: use one made by Stowage %s or later", MinStowage, MinStowage)
+
+// FetchedStatus runs the fetched bootstrap script's `status --json` on the install directory,
+// before a create: nil when it holds no install, which the installer refuses (exit 3); the
+// install it holds otherwise, whose first install may not have finished.
+func (d Docker) FetchedStatus(ctx context.Context) (*Status, error) {
+	stdout, stderr, exit, err := d.run(ctx, nil, "sh", "./"+d.Name+".sh", "status", "--json", "--dir", "./"+d.Name)
+	if err != nil {
+		return nil, fmt.Errorf("status: %w", err)
+	}
+	switch exit {
+	case 0:
+		return ParseStatus(stdout)
+	case 3:
+		return nil, nil
+	}
+	return nil, &FailedError{Verb: "status", Exit: exit, Stderr: tail(stderr)}
+}
 
 // KeptDescribe runs `describe --json` of the installer the install keeps: the running release's
 // offer; nil without an install directory.
@@ -361,7 +359,7 @@ func changeArgs(c Change, verbArgs ...string) ([]string, map[string]string, erro
 	} else if v != "" {
 		args = append(args, "--ports", v)
 	}
-	files, err := withAnswers(c.SecretInputs, nil)
+	files, err := withAnswers(c.SecretInputs)
 	return args, files, err
 }
 
@@ -449,8 +447,14 @@ func (d Docker) Uninstall(ctx context.Context, data bool) (*Result, error) {
 	return Outcome("uninstall", stdout, stderr, exit)
 }
 
+// notInstalled says whether a StowScript run found no install directory: its exit and its mark,
+// the last line of stderr (ssh may print the server's banner before it), stdout empty.
 func notInstalled(stdout, stderr []byte, exit int) bool {
-	return exit == NotInstalled && len(stdout) == 0 && strings.TrimSpace(string(stderr)) == NotInstalledMark
+	if exit != NotInstalled || len(stdout) != 0 {
+		return false
+	}
+	lines := strings.Split(strings.TrimRight(string(stderr), "\r\n"), "\n")
+	return strings.TrimSpace(lines[len(lines)-1]) == NotInstalledMark
 }
 
 func routeList(field string, m map[string]string) (string, error) {

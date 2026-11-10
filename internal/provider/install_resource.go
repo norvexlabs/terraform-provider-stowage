@@ -232,7 +232,8 @@ func (r *installResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 		firstInstallOnly(&resp.Diagnostics, path.Root(b), "the target", a, b)
 		return
 	}
-	if plan.Docker != nil && known(plan.Docker.WorkDir) {
+	// Left out is the home directory (workDir): taking work_dir out is a change too.
+	if plan.Docker != nil && state.Docker != nil && !plan.Docker.WorkDir.IsUnknown() {
 		firstInstallOnly(&resp.Diagnostics, path.Root("docker").AtName("work_dir"), "docker.work_dir", workDir(state.Docker), workDir(plan.Docker))
 	}
 	// An imported state does not know the first install's address: the installer refuses a
@@ -462,14 +463,7 @@ func (r *installResource) Create(ctx context.Context, req resource.CreateRequest
 		Registry:     r.registry(),
 		RegistryCA:   r.registryCA(),
 	}
-	if known(m.Ports) {
-		ports := map[string]int64{}
-		resp.Diagnostics.Append(m.Ports.ElementsAs(ctx, &ports, false)...)
-		in.Ports = map[string]string{}
-		for k, p := range ports {
-			in.Ports[k] = strconv.FormatInt(p, 10)
-		}
-	}
+	in.Ports = portMap(ctx, m.Ports, &resp.Diagnostics)
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -483,16 +477,31 @@ func (r *installResource) Create(ctx context.Context, req resource.CreateRequest
 	if desc == nil {
 		return
 	}
-	for _, input := range desc.Inputs {
-		if _, ok := in.Inputs[input.Key]; ok && input.Secret {
-			resp.Diagnostics.AddAttributeError(path.Root("inputs").AtMapKey(input.Key), "secret input in inputs",
-				fmt.Sprintf("%s is a secret input: inputs land in state, so give it in secret_inputs_wo.", input.Key))
-		}
-	}
+	refuseSecretInputs(&resp.Diagnostics, in.Inputs, desc)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 	d.Short = desc.ShortName
+	// An install already in the directory (a create that failed or timed out after the install
+	// began, or one a destroy kept with its data) is run again, as the installer's re-run, which
+	// refuses the settings only a first install takes: they are the ones it recorded.
+	existing, err := d.FetchedStatus(ctx)
+	if err != nil {
+		addInstallerError(&resp.Diagnostics, "Reading the install directory", err)
+		return
+	}
+	if existing != nil {
+		if existing.Name != d.Name {
+			resp.Diagnostics.AddError("Another project's install",
+				fmt.Sprintf("%s/%s holds an install of %q, not %q: give another docker.work_dir.", d.WorkDir, d.Name, existing.Name, d.Name))
+			return
+		}
+		resp.Diagnostics.AddWarning("An install is already there",
+			fmt.Sprintf("%s/%s already holds an install of %s: the create runs the installer again on it (its re-run), which finishes a first install left unfinished; "+
+				"an install of another release there is refused by the installer: set installer to the one it runs (status --json installed.installer), apply, then change installer to upgrade it. "+
+				"The settings only a first install takes (describe's first_install_only: address, the provider's registry and registry_ca; and secrets_wo) are not given: the install keeps the ones it recorded, and they are not compared with the configuration.", d.WorkDir, d.Name, d.Name))
+		withoutFirstInstallOnly(&in, desc.FirstInstallOnly)
+	}
 	if _, err := d.Install(ctx, in); err != nil {
 		addInstallerError(&resp.Diagnostics, "Installing "+desc.Name, err)
 		return
@@ -512,6 +521,23 @@ func (r *installResource) Create(ctx context.Context, req resource.CreateRequest
 	m.ShortName = types.StringValue(desc.ShortName)
 	applyStatus(&m, st, false)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
+}
+
+// withoutFirstInstallOnly leaves out of in the settings a re-run refuses: those describe names
+// first-install only that the provider gives, and the secrets export (a re-run keeps the
+// install's secrets).
+func withoutFirstInstallOnly(in *installer.Install, names []string) {
+	in.Secrets = ""
+	for _, n := range names {
+		switch n {
+		case "address":
+			in.Address = ""
+		case "registry":
+			in.Registry = ""
+		case "registry_ca":
+			in.RegistryCA = ""
+		}
+	}
 }
 
 // fetchDescribe writes ref's bootstrap script on the target and reads its describe: it must be
@@ -791,13 +817,18 @@ func (u *update) run(ctx context.Context, save func(*installModel) bool) {
 		return
 	}
 	rerun, up := u.split(ctx, running, next)
+	refuseSecretInputs(u.diags, stringMap(ctx, plan.Inputs, u.diags), running, next)
 	if u.diags.HasError() {
 		return
 	}
 	switch {
 	case step == rollback && imported(state):
+		runs := "the installer of the release it runs (status --json installed.installer)"
+		if st.Installed != nil && st.Installed.Installer != "" {
+			runs = st.Installed.Installer + ", the release it runs"
+		}
 		u.diags.AddAttributeError(path.Root("installer"), "a rollback of an imported install",
-			fmt.Sprintf("An imported install is taken over first: apply with installer = %s, the release it runs, then set installer back to previous.installer.", st.Installed.Installer))
+			fmt.Sprintf("An imported install is taken over first: apply with installer = %s, then set installer back to previous.installer.", runs))
 		return
 	case step == rollback && !rerun.Empty():
 		rollbackAlone(u.diags, "inputs, secret inputs, tls, domains or ports")
@@ -844,6 +875,20 @@ func (u *update) run(ctx context.Context, save func(*installModel) bool) {
 	}
 	u.settled(ctx, d, &final, short)
 	save(&final)
+}
+
+// refuseSecretInputs refuses an input given a value that one of the releases declares secret:
+// inputs land in state, and a changed one on the target's command line.
+func refuseSecretInputs(diags *diag.Diagnostics, given map[string]string, releases ...*installer.Describe) {
+	for _, k := range slices.Sorted(maps.Keys(given)) {
+		for _, r := range releases {
+			if r != nil && given[k] != "" && r.Secret(k) {
+				diags.AddAttributeError(path.Root("inputs").AtMapKey(k), "secret input in inputs",
+					fmt.Sprintf("%s is a secret input of %s %s: inputs land in state and on the target's command line, so give it in secret_inputs_wo.", k, r.Name, r.Release.Version))
+				break
+			}
+		}
+	}
 }
 
 // releaseStep decides the release change: none when the install runs the desired release (its
@@ -906,12 +951,21 @@ func (u *update) split(ctx context.Context, running, next *installer.Describe) (
 			rerun.Inputs[k] = v
 		}
 	}
-	for k := range was {
+	bump := !plan.SecretInputsWOVersion.Equal(state.SecretInputsWOVersion)
+	for _, k := range slices.Sorted(maps.Keys(was)) {
+		// An input moved to secret_inputs_wo is not emptied: --set would win over its answer,
+		// which goes only with a new secret_inputs_wo_version.
+		if _, secret := u.secrets[k]; secret {
+			if _, ok := now[k]; !ok && !bump && u.secrets[k] != was[k] {
+				u.diags.AddAttributeError(path.Root("secret_inputs_wo_version"), "an input moved to secret_inputs_wo",
+					fmt.Sprintf("%s is taken out of inputs and given in secret_inputs_wo: change secret_inputs_wo_version in the same apply, so its value is sent (else the install keeps the one inputs gave).", k))
+			}
+			continue
+		}
 		if _, ok := now[k]; !ok && running.Declares(k) && (!upgrading || next.Declares(k)) {
 			rerun.Inputs[k] = ""
 		}
 	}
-	bump := !plan.SecretInputsWOVersion.Equal(state.SecretInputsWOVersion)
 	for k, v := range u.secrets {
 		switch {
 		case running.Declares(k) && bump:

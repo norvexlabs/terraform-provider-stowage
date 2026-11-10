@@ -55,7 +55,29 @@ installer's machine interface and decides nothing itself. A finished item is del
   Ask Stowage whether an old installer's failure can be told (it cannot be changed after the
   fact) — else this stays a hint in the diagnostic.
 
+- **A pull account's login drops the target's Docker context**: the private `DOCKER_CONFIG` holds
+  no `currentContext`, so with `username` the fetch talks to the default daemon (a rootless
+  context's user fetches into another one). Carry the context's endpoint over (`DOCKER_HOST`).
+
+- **A create over an existing install records the configuration's first-install-only settings**
+  (`address`, the provider's `registry`) though the install keeps its own: state may name values
+  never applied. Ask Stowage to report them in `status --json`, and compare.
+
 ## Could
+
+- **A re-run's plan keeps `version`, `revision`, `channel` and `previous` from state**: an install
+  changed outside OpenTofu after the last refresh (`-refresh=false`) makes the apply's result
+  inconsistent with the plan. Plan them unknown on every change of the target, at the cost of a
+  noisier plan.
+- **`status --json` exit 3 is taken as "no install" before a create**: a refusal for another
+  reason makes the create a fresh install's, which the installer then refuses.
+- **`docker.work_dir` is compared as spelled**: `/home/u` and `.` (the same home) differ.
+- **An input moved to `secret_inputs_wo` without a new version** is refused at apply, not at plan:
+  move the check to ModifyPlan (the configuration's write-only values are readable there).
+- **A run that outlives its program** (a child holding the output) returns what that child wrote
+  too, which a `--json` reader then refuses as data after the object.
+- **A run cut by its timeout leaves the program on the target running** (no tty, no SIGHUP over
+  ssh); stopping it would need the installer's own cancellation.
 
 - A registry CA for the installer image's own fetch (`/etc/docker/certs.d` on the target), today
   the target's Docker daemon's own configuration.

@@ -36,3 +36,14 @@ follow [SemVer](https://semver.org/).
 - Read removes from state an input the install does not record, so the next plan gives it again.
 - `short_name` attribute; `status --json` must carry its `format`; `update` timeout (default 30m).
 - The Kubernetes and VM targets' schema (not yet installed).
+- A create over an install already in its directory (a create that failed or timed out, or an
+  install a destroy kept with its data) runs the installer again on it, without the settings only
+  a first install takes, with a warning; another project's install there is refused.
+- SSH trusts no DNS record and reuses no shared connection: the pinned host key alone.
+- A run cut by its timeout returns, even when a program it started keeps its output open; a
+  program that exited keeps its exit status then.
+- Taking `docker.work_dir` out of the configuration is a plan error, as changing it is.
+- An input a release declares secret is refused in `inputs` on an update too, the release an
+  upgrade goes to included; one moved to
+  `secret_inputs_wo` is no longer given empty, and needs a new `secret_inputs_wo_version`.
+- A missing install directory is recognised behind an SSH banner.

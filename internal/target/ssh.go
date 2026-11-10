@@ -19,7 +19,8 @@ const HostKeyAlias = "stowage-target"
 // SSH runs argv on a host through the system ssh binary. The host's key is the one given, and
 // no other: StrictHostKeyChecking=yes against a private known_hosts file holding that key
 // alone, the user's and the system's known_hosts files and KnownHostsCommand out of the
-// lookup. Nothing is asked (BatchMode=yes). A secret reaches the remote program only on its
+// lookup, as are DNS (VerifyHostKeyDNS) and a shared connection (ControlPath). Nothing is asked
+// (BatchMode=yes). A secret reaches the remote program only on its
 // standard input: the command line is visible in the process table on both machines.
 type SSH struct {
 	Host string
@@ -109,6 +110,11 @@ func (s SSH) Argv(knownHosts, remote string) []string {
 		"-o", "HostKeyAlias=" + HostKeyAlias,
 		"-o", "CheckHostIP=no",
 		"-o", "UpdateHostKeys=no",
+		// No other source of trust: an SSHFP record in DNS, or a multiplexed connection another
+		// ssh opened (and checked against another known_hosts), would skip the pinned key.
+		"-o", "VerifyHostKeyDNS=no",
+		"-o", "ControlMaster=no",
+		"-o", "ControlPath=none",
 		"-o", "ConnectTimeout=" + strconv.Itoa(timeout),
 		"-p", strconv.Itoa(port),
 		"-l", s.User,

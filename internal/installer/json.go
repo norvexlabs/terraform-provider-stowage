@@ -104,6 +104,16 @@ func (d *Describe) Declares(key string) bool {
 	return false
 }
 
+// Secret says whether the release declares the input key secret.
+func (d *Describe) Secret(key string) bool {
+	for _, i := range d.Inputs {
+		if i.Key == key {
+			return i.Secret
+		}
+	}
+	return false
+}
+
 // Status is `status --json`: the fields common to every shape, and Docker's restore flags.
 type Status struct {
 	Format         *int     `json:"format"`
@@ -120,23 +130,14 @@ type Status struct {
 	Inputs *Keys `json:"inputs"`
 }
 
-// Keys reads a list of keys given as a JSON array of strings or as an object's keys.
+// Keys reads the recorded keys, a JSON array of strings; any other type is refused.
 type Keys []string
 
 // UnmarshalJSON implements json.Unmarshaler.
 func (k *Keys) UnmarshalJSON(b []byte) error {
 	var list []string
-	if err := json.Unmarshal(b, &list); err == nil {
-		*k = sortedUnique(list)
-		return nil
-	}
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(b, &obj); err != nil {
-		return errors.New("inputs: want an array of keys or an object")
-	}
-	list = make([]string, 0, len(obj))
-	for key := range obj {
-		list = append(list, key)
+	if err := json.Unmarshal(b, &list); err != nil {
+		return errors.New("inputs: want an array of keys")
 	}
 	*k = sortedUnique(list)
 	return nil

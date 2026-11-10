@@ -58,7 +58,7 @@ func TestParseStatus(t *testing.T) {
 	if s.Installed.Installer == "" || s.Previous != nil || s.Inputs == nil || !slices.Equal(*s.Inputs, []string{"A", "B"}) || !s.RestoreAwaited || !s.VolumesSplit {
 		t.Fatalf("got %+v", s)
 	}
-	s, err = ParseStatus([]byte(`{"format":1,"name":"notes","installed":null,"installing":true,"inputs":{"Z":{},"Y":true}}`))
+	s, err = ParseStatus([]byte(`{"format":1,"name":"notes","installed":null,"installing":true,"inputs":["Z","Y"]}`))
 	if err != nil || s.Installed != nil || !s.Installing || !slices.Equal(*s.Inputs, []string{"Y", "Z"}) {
 		t.Fatalf("got %+v %v", s, err)
 	}
@@ -74,6 +74,7 @@ func TestParseStatus(t *testing.T) {
 		`{"name":"notes"}`:                                      "status --json: the output has no format",
 		`{"format":1,"name":"notes","previous":{"revision":1}}`: "previous has no version",
 		`{"format":1,"name":"notes","inputs":"A"}`:              "inputs: want an array",
+		`{"format":1,"name":"notes","inputs":{"A":"v"}}`:        "inputs: want an array",
 		`{"format":1,"name":"notes","installing":"yes"}`:        "cannot unmarshal",
 		`{"format":1,"installed":{"version":"1"}}`:              "no name",
 	} {
@@ -454,13 +455,57 @@ func TestVerbArgv(t *testing.T) {
 
 // recorder is a Runner keeping the last call and answering out with exit.
 type recorder struct {
-	argv  []string
-	stdin []byte
-	out   string
-	exit  int
+	argv   []string
+	stdin  []byte
+	out    string
+	errOut string
+	exit   int
 }
 
 func (r *recorder) Run(_ context.Context, argv []string, stdin []byte) ([]byte, []byte, int, error) {
 	r.argv, r.stdin = argv, stdin
-	return []byte(r.out), nil, r.exit, nil
+	return []byte(r.out), []byte(r.errOut), r.exit, nil
+}
+
+// The mark of a missing install directory is the last line of stderr: ssh prints the server's
+// banner before it.
+func TestNotInstalledMark(t *testing.T) {
+	t.Parallel()
+	for stderr, want := range map[string]bool{
+		NotInstalledMark + "\n":                                    true,
+		"Authorized use only.\r\n\n" + NotInstalledMark + "\n":     true,
+		NotInstalledMark + "\nsomething after\n":                   false,
+		"stowage-provider: no install directory, said otherwise\n": false,
+		"": false,
+	} {
+		if got := notInstalled(nil, []byte(stderr), NotInstalled); got != want {
+			t.Errorf("%q: %v, want %v", stderr, got, want)
+		}
+	}
+	if notInstalled([]byte("{}"), []byte(NotInstalledMark), NotInstalled) || notInstalled(nil, []byte(NotInstalledMark), 1) {
+		t.Fatal("the mark with stdout, or another exit, taken for no install directory")
+	}
+}
+
+// A create reads the install directory with the fetched installer first: exit 3 is no install.
+func TestFetchedStatus(t *testing.T) {
+	t.Parallel()
+	f := &recorder{exit: 3, errOut: "error: /srv/notes holds no install\n"}
+	d := Docker{Runner: f, WorkDir: "/srv", Name: "notes"}
+	ctx := context.Background()
+	if s, err := d.FetchedStatus(ctx); s != nil || err != nil {
+		t.Fatalf("no install: %+v %v", s, err)
+	}
+	want := []string{"sh", "-c", RunScript, "sh", "/srv", "", "sh", "./notes.sh", "status", "--json", "--dir", "./notes"}
+	if !slices.Equal(f.argv, want) {
+		t.Fatalf("argv\n got %q\nwant %q", f.argv, want)
+	}
+	f.exit, f.out = 0, `{"format":1,"name":"notes","installed":{"version":"1.0","revision":1},"installing":true}`
+	if s, err := d.FetchedStatus(ctx); err != nil || s == nil || !s.Installing {
+		t.Fatalf("an install: %+v %v", s, err)
+	}
+	f.exit, f.out = 1, ""
+	if _, err := d.FetchedStatus(ctx); err == nil || !strings.Contains(err.Error(), "status failed (exit 1)") {
+		t.Fatalf("a failure: %v", err)
+	}
 }

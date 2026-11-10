@@ -98,7 +98,7 @@ func TestCreateOnDocker(t *testing.T) {
 		"tls":     str("internal"),
 		"domains": strMap(map[string]string{"web": "notes.lan"}),
 	}))
-	if got := h.fake.ops(); !slices.Equal(got, []string{"fetch", "describe", "install", "status"}) {
+	if got := h.fake.ops(); !slices.Equal(got, []string{"fetch", "describe", "new-status", "install", "status"}) {
 		t.Fatalf("calls %q", got)
 	}
 	c := h.fake.conns[0]
@@ -109,7 +109,7 @@ func TestCreateOnDocker(t *testing.T) {
 	if !slices.Equal(fetch[4:], []string{"/srv", image, "notes", "", ""}) || h.fake.calls[0].stdin != nil {
 		t.Fatalf("fetch %q, no login expected", fetch[4:])
 	}
-	install := h.fake.calls[2].argv
+	install := h.fake.callsOf("install")[0].argv
 	for _, want := range [][]string{{"--set", "ADMIN_EMAIL=ops@example.com"}, {"--tls", "internal"}, {"--domains", "web=notes.lan"}, {"--registry", "mirror.lan/notes"}, {"--no-input", "--json"}} {
 		if !slices.Contains(install, want[0]) || install[slices.Index(install, want[0])+1] != want[1] {
 			t.Errorf("install argv %q lacks %q", install, want)
@@ -181,7 +181,7 @@ func TestSecretsNeverInArgvOrState(t *testing.T) {
 	if login["password"] != "pw-"+secretVal || h.fake.calls[0].argv[7] != "registry.example.com" || h.fake.calls[0].argv[8] != "pull" {
 		t.Fatalf("login: %q %q", login, h.fake.calls[0].argv[4:])
 	}
-	files := untarAll(t, h.fake.calls[2].stdin)
+	files := untarAll(t, h.fake.callsOf("install")[0].stdin)
 	if files["answers"] != `SMTP_PASSWORD: "smtp-`+secretVal+`"`+"\n" || files["given"] != "given-"+secretVal || files["secrets"] != "export-"+secretVal {
 		t.Fatalf("install files %q", files)
 	}
@@ -340,7 +340,10 @@ func TestFirstInstallOnlyIsAPlanError(t *testing.T) {
 	}{
 		"work_dir": {h.dockerConfig(map[string]tftypes.Value{"address": str("127.0.0.2"), "docker": moved}), "docker.work_dir is first-install only"},
 		"address":  {h.dockerConfig(map[string]tftypes.Value{"address": str("127.0.0.3")}), "address is first-install only"},
-		"project":  {h.dockerConfig(map[string]tftypes.Value{"address": str("127.0.0.2"), "installer": str("registry.example.com/x/atlas-installer@" + digest)}), "the installer's project is first-install only"},
+		"work_dir taken out": {h.dockerConfig(map[string]tftypes.Value{"address": str("127.0.0.2"),
+			"docker": h.block("docker", map[string]tftypes.Value{"host": str("app.example"), "user": str("ops"), "known_hosts_line": str(hostLine)})}),
+			`docker.work_dir was "/srv" at the install and is now "."`},
+		"project": {h.dockerConfig(map[string]tftypes.Value{"address": str("127.0.0.2"), "installer": str("registry.example.com/x/atlas-installer@" + digest)}), "the installer's project is first-install only"},
 		"target": {fill(h.typ, map[string]tftypes.Value{"address": str("127.0.0.2"), "installer": str(image),
 			"kubernetes": h.block("kubernetes", map[string]tftypes.Value{"namespace": str("notes")})}), "the target is first-install only"},
 	} {

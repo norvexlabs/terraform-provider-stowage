@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // Runner runs one program on a target. argv[0] is the program; stdin is its whole standard
@@ -33,12 +34,23 @@ func (Local) Run(ctx context.Context, argv []string, stdin []byte) ([]byte, []by
 	return run(ctx, exec.CommandContext(ctx, argv[0], argv[1:]...), stdin)
 }
 
+// waitDelay is how long a run waits for its output to close once the program exited or was
+// killed by its context: a program it started that keeps the output open (a container, a shared
+// ssh connection) cannot hold the run past it. A program that exited keeps its exit status.
+var waitDelay = 10 * time.Second
+
 func run(ctx context.Context, cmd *exec.Cmd, stdin []byte) ([]byte, []byte, int, error) {
+	cmd.WaitDelay = waitDelay
 	var stdout, stderr capped
 	cmd.Stdin = bytes.NewReader(stdin)
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
+	// The program exited 0 (another exit is an ExitError); a program it started kept the output
+	// open past waitDelay. It ran to its exit, whatever the context did meanwhile.
+	if errors.Is(err, exec.ErrWaitDelay) {
+		return stdout.Bytes(), stderr.Bytes(), 0, nil
+	}
 	if ctx.Err() != nil {
 		return stdout.Bytes(), stderr.Bytes(), -1, fmt.Errorf("%s: %w", cmd.Args[0], ctx.Err())
 	}

@@ -64,7 +64,7 @@ two, is an error).
 | Attribute | | |
 |---|---|---|
 | `installer` | required with `docker` / `kubernetes`; refused with `vm` | The installer image by digest, `<prefix>/<name>-installer@sha256:<64 hex>` (lower-case hex, no tag beside the digest), as `stowage ship` prints it. An installer carries one release, so the digest is the release. `<name>` is the project's name: `describe` must report the same, or the create is refused. |
-| `inputs` | optional map | Non-secret inputs, each given as `--set KEY=VALUE`. They are on the target's command line and in state. A key is a letter or `_`, then letters, digits or `_`; `tls` is refused (the answers file's reserved section). An input `describe` marks `secret` is refused here (at create). A key taken out of the map is given empty (`--set KEY=`) to the re-run: the installer's rule for an empty value decides (a required input is refused, an advanced one goes back to its default). |
+| `inputs` | optional map | Non-secret inputs, each given as `--set KEY=VALUE`. They are on the target's command line and in state. A key is a letter or `_`, then letters, digits or `_`; `tls` is refused (the answers file's reserved section). An input given a non-empty value here that `describe` marks `secret` is refused: at create, and at an update (every key of the map, changed or not) for the running release and the one an upgrade goes to, before anything runs. A key taken out of the map is given empty (`--set KEY=`) to the re-run: the installer's rule for an empty value decides (a required input is refused, an advanced one goes back to its default); a key taken out that `secret_inputs_wo` now holds is not (`--set` would win over its answer), and, given another value than `inputs` gave, needs a new `secret_inputs_wo_version` in the same apply (else an error at apply, before anything runs: `an input moved to secret_inputs_wo`). |
 | `secret_inputs_wo` | optional map, **write-only** | Secret inputs, never in plan or state, sent on standard input as an answers file (`--answers`). A key in both maps is refused. |
 | `secret_inputs_wo_version` | optional number | Change it to apply a change of `secret_inputs_wo` (a write-only value is never compared): the update re-sends every secret input the running release declares. Leaving it out with `secret_inputs_wo` set is a warning. |
 | `given_wo` | optional, **write-only** | What another install gives (the installer's `--given` YAML), used at create, on standard input. |
@@ -87,7 +87,7 @@ two, is an error).
 | `user` | required with `host` | SSH user. A host or user starting with `-` or holding a space is refused. |
 | `private_key_file` | optional | The private key's path; left out, ssh's agent and default keys. |
 | `known_hosts_line` | required with `host` | The host's `known_hosts` line, `host keytype base64` (the host field may be left out, hashed or a pattern: it is replaced). That key alone is accepted. A marker (`@cert-authority`, `@revoked`), an unknown key type, a key that is not base64 or more than one line is refused. |
-| `work_dir` | optional | The directory on the target holding `<name>.sh` and the install directory `<name>/`. Left out, the SSH user's home (`.`; locally, OpenTofu's working directory). First-install only; empty is refused. |
+| `work_dir` | optional | The directory on the target holding `<name>.sh` and the install directory `<name>/`. Left out, the SSH user's home (`.`; locally, OpenTofu's working directory). First-install only (taking it out is a change too); empty is refused. |
 
 **`kubernetes` block** — schema only (`kubeconfig`, `context`, `namespace` required, `release`):
 a create is refused, `The Kubernetes target is not implemented yet`.
@@ -117,22 +117,33 @@ the remote shell; nothing secret is ever an argument.
 - **Create**: `docker run --rm <installer> > <work_dir>/<name>.sh` (written through a temporary
   file, so a failed fetch leaves no half script), the bootstrap script's `describe --json` (its
   `format` checked, its `name` compared, its shapes must include `docker` when it lists any, its
-  `short_name` recorded), then
+  `short_name` recorded), then its `status --json --dir ./<name>`: exit 3 (the installer refuses
+  a directory with no install) is a fresh install; an install of another project is an error;
+  an install of the project already
+  there (a create that failed or timed out after the install began, or an install a destroy
+  kept with its data) is a warning (`An install is already there`), and the install below runs
+  without `--secrets` and without those of `--address`, `--registry` and `--registry-ca` that
+  `describe` lists in `first_install_only`, which the installer's re-run refuses: the install
+  keeps the ones it recorded, which state does not know (it records the configuration's, never
+  compared with the install's); another release's install there is the installer's to refuse
+  (its re-run runs the release it carries alone, exit 3). Then
   `sh <name>.sh --no-input --json --dir ./<name> [--set K=V]… [--tls] [--domains] [--ports]
   [--address] [--registry]`, with `--answers`, `--given`, `--secrets` and `--registry-ca` files
   sent on standard input as a tar into a private (0700) temporary directory removed afterwards;
   then `status --json`, read again every 10 seconds while it reports `installing` (the first
   install not finished) until it no longer does, within the create timeout. A failed or refused
-  create, an `install_failed` and a timeout save no state: applying again runs the install again,
-  which finishes the one left (a destroy cannot clean what state does not hold).
+  create, an `install_failed` and a timeout save no state: applying again runs the installer
+  again on the install left, which finishes it (the installer refuses a run while another holds
+  the install; a destroy cannot clean what state does not hold).
 - **The kept installer** is `<work_dir>/<name>/<short_name>-stow` (`short_name` from `describe`),
   else, when that file is missing or not executable (a release that renamed its installer), the
   one `*-stow` executable there; none or two is an error. A `short_name` in state that is not one
   path element is an error naming the re-import. It runs with `--dir ./<name>` after its arguments
   (not `describe`), and with files on standard input as the install does.
 - **Read**: the kept installer's `status --json`. A missing install directory removes the
-  resource from state (the script exits 100 with `stowage-provider: no install directory` alone
-  on stderr; any other exit 100 is a failure). A release other than the configured one
+  resource from state (the script exits 100 with `stowage-provider: no install directory` as
+  the last line of stderr, after an SSH banner, and nothing on stdout; any other exit 100 is a
+  failure). A release other than the configured one
   (`installed.installer`) replaces `installer` in state, so the next plan shows the change back.
   When `status` lists the recorded input keys, a key of `inputs` with a non-empty value it does not
   record is removed from state, so the next plan gives it again; `inputs` absent (the kept
@@ -234,9 +245,15 @@ the running release has takes it in an apply of its own). A plan changing anythi
 The system `ssh` runs with `BatchMode=yes`, `StrictHostKeyChecking=yes`, a private 0600
 `known_hosts` file (in a 0700 temporary directory, removed after the run) holding the given key
 under `HostKeyAlias=stowage-target`, `GlobalKnownHostsFile=/dev/null`, `KnownHostsCommand=none`,
-`CheckHostIP=no`, `UpdateHostKeys=no`, `ConnectTimeout=30`, and with a key file
-`IdentitiesOnly=yes`. The user's `~/.ssh/config` still applies to everything else (a `ProxyJump`,
-for one). Output is kept up to 16 MiB per stream.
+`CheckHostIP=no`, `UpdateHostKeys=no`, `VerifyHostKeyDNS=no` (no SSHFP record trusted),
+`ControlMaster=no` and `ControlPath=none` (no connection another ssh opened is reused),
+`ConnectTimeout=30`, and with a key file `IdentitiesOnly=yes`. The user's `~/.ssh/config` still
+applies to everything else (a `ProxyJump`, for one). Output is kept up to 16 MiB per stream.
+
+A run cut by its timeout kills the local `ssh` (or, on this machine, the shell), then waits at most
+10 seconds for its output to close; so does a program that exited while one it started holds
+the output, which keeps its exit status. It does not stop the program on the target: an install or
+upgrade cut there goes on, and the installer refuses another run until it ends.
 
 ## Build
 

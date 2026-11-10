@@ -326,7 +326,7 @@ func TestCreateWaitsForTheFirstInstall(t *testing.T) {
 	h := newHarness(t, nil)
 	h.fake.then("status", installing, installing)
 	state := h.create(h.dockerConfig(nil))
-	if got := h.fake.ops(); !slices.Equal(got, []string{"fetch", "describe", "install", "status", "status", "status"}) || asString(t, h.attrs(state)["status"]) != "installed" {
+	if got := h.fake.ops(); !slices.Equal(got, []string{"fetch", "describe", "new-status", "install", "status", "status", "status"}) || asString(t, h.attrs(state)["status"]) != "installed" {
 		t.Fatalf("calls %q, status %s", got, asString(t, h.attrs(state)["status"]))
 	}
 
@@ -650,5 +650,130 @@ func TestUpdateUpgradeNothing(t *testing.T) {
 	}
 	if at := h.attrs(a.NewState); asString(t, at["version"]) != "2.0.0" {
 		t.Fatalf("state %v", at)
+	}
+}
+
+// An imported install whose status names no installed release: the rollback is refused all the
+// same, never a panic.
+func TestImportedRollbackWithNoInstalledRelease(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	state := h.importState("app.example:/srv/notes/notes-stow").ImportedResources[0].State
+	h.fake.set("status", reply{stdout: `{"format":1,"name":"notes","installed":null,"previous":{"version":"1.2.0","revision":1,"installer":"` + image + `"}}`})
+	got := errorsOf(h.update(state, h.dockerConfig(map[string]tftypes.Value{"allow_rollback": boolean(true)})).Diagnostics)
+	if !strings.Contains(got, "a rollback of an imported install") || !strings.Contains(got, "installed.installer") {
+		t.Fatalf("got %q", got)
+	}
+}
+
+// An input moved from inputs to secret_inputs_wo is not given empty: --set would win over its
+// answer and empty it.
+func TestInputMovedToSecretInputsIsNotEmptied(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	state := h.create(h.dockerConfig(map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})}))
+	h.fake.reset()
+	a := h.update(state, h.dockerConfig(map[string]tftypes.Value{
+		"secret_inputs_wo": strMap(map[string]string{"ADMIN_EMAIL": "b@example.com"}), "secret_inputs_wo_version": num(1)}))
+	if d := errorsOf(a.Diagnostics); d != "" {
+		t.Fatal(d)
+	}
+	rerun := h.fake.callsOf("rerun")
+	if len(rerun) != 1 || contains(rerun[0].argv, "--set") || untarAll(t, rerun[0].stdin)["answers"] != "ADMIN_EMAIL: \"b@example.com\"\n" {
+		t.Fatalf("re-run %q", rerun)
+	}
+	// Moved without a new version, its value would never be sent: refused before anything runs.
+	h.fake.reset()
+	got := errorsOf(h.update(state, h.dockerConfig(map[string]tftypes.Value{
+		"secret_inputs_wo": strMap(map[string]string{"ADMIN_EMAIL": "b@example.com"})})).Diagnostics)
+	if !strings.Contains(got, "an input moved to secret_inputs_wo") || slices.Contains(h.fake.ops(), "rerun") {
+		t.Fatalf("got %q, calls %q", got, h.fake.ops())
+	}
+	// Moved with the value the install records: nothing to send, not refused.
+	h.fake.reset()
+	if got := errorsOf(h.update(state, h.dockerConfig(map[string]tftypes.Value{
+		"secret_inputs_wo": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})})).Diagnostics); got != "" || slices.Contains(h.fake.ops(), "rerun") {
+		t.Fatalf("got %q, calls %q", got, h.fake.ops())
+	}
+}
+
+// An input a release declares secret is refused in inputs on an update too, before anything runs.
+func TestUpdateRefusesASecretInInputs(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	state := h.create(h.dockerConfig(nil))
+	h.fake.reset()
+	got := errorsOf(h.update(state, h.dockerConfig(map[string]tftypes.Value{"inputs": strMap(map[string]string{"SMTP_PASSWORD": "pw"})})).Diagnostics)
+	if !strings.Contains(got, "secret input in inputs") || slices.Contains(h.fake.ops(), "rerun") {
+		t.Fatalf("got %q, calls %q", got, h.fake.ops())
+	}
+	// The secret input the new release adds, given in inputs with the upgrade.
+	h.fake.reset()
+	h.fake.set("describe", reply{stdout: describe2})
+	got = errorsOf(h.update(state, h.dockerConfig(map[string]tftypes.Value{"installer": str(image2), "inputs": strMap(map[string]string{"NEW_TOKEN": "t"})})).Diagnostics)
+	if !strings.Contains(got, "NEW_TOKEN is a secret input of notes 2.0.0") || slices.Contains(h.fake.ops(), "upgrade") {
+		t.Fatalf("got %q, calls %q", got, h.fake.ops())
+	}
+	// An input kept as it is that the new release makes secret.
+	h.fake.set("describe", reply{stdout: describe1})
+	kept := h.create(h.dockerConfig(map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})}))
+	h.fake.reset()
+	h.fake.set("describe", reply{stdout: strings.Replace(describe2, `{"key":"ADMIN_EMAIL"}`, `{"key":"ADMIN_EMAIL","secret":true}`, 1)})
+	got = errorsOf(h.update(kept, h.dockerConfig(map[string]tftypes.Value{"installer": str(image2), "inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})})).Diagnostics)
+	if !strings.Contains(got, "ADMIN_EMAIL is a secret input of notes 2.0.0") || slices.Contains(h.fake.ops(), "upgrade") {
+		t.Fatalf("got %q, calls %q", got, h.fake.ops())
+	}
+	// Given empty (taken out) is no value on the command line: not refused.
+	h.fake.reset()
+	h.fake.set("describe", reply{stdout: describe1})
+	if got := errorsOf(h.update(state, h.dockerConfig(map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": ""})})).Diagnostics); got != "" {
+		t.Fatalf("an empty input: %q", got)
+	}
+}
+
+// A create over an install already in the directory runs the installer again on it without the
+// settings only a first install takes; another project's install is refused.
+func TestCreateOverAnExistingInstall(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, map[string]tftypes.Value{"registry": str("mirror.lan/notes"), "registry_ca": str("-----BEGIN CERTIFICATE-----\n")})
+	h.fake.set("new-status", reply{stdout: `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1},"installing":true,"install_failed":"provision hook exited 1"}`})
+	config := h.dockerConfig(map[string]tftypes.Value{"address": str("127.0.0.2"), "secrets_wo": str("export-" + secretVal),
+		"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})})
+	p := h.plan(nil, config)
+	a := h.apply(nil, p.PlannedState, config)
+	if d := errorsOf(a.Diagnostics); d != "" {
+		t.Fatal(d)
+	}
+	if !strings.Contains(diagText(a.Diagnostics), "already holds an install of notes") {
+		t.Fatalf("no warning: %s", diagText(a.Diagnostics))
+	}
+	install := h.fake.callsOf("install")[0]
+	f := flags(install.argv)
+	if f["--address"] != "" || f["--registry"] != "" || f["--set"] != "ADMIN_EMAIL=a@example.com" || install.argv[5] != "" || install.stdin != nil {
+		t.Fatalf("install %q", install.argv)
+	}
+	// A fresh directory gets them.
+	h.fake.reset()
+	h.fake.set("new-status", reply{exit: 3})
+	h.apply(nil, p.PlannedState, config)
+	install = h.fake.callsOf("install")[0]
+	if f := flags(install.argv); f["--address"] != "127.0.0.2" || f["--registry"] != "mirror.lan/notes" || install.argv[5] != "registry-ca secrets" {
+		t.Fatalf("fresh install %q", install.argv)
+	}
+	// Another project's install, and a status that fails.
+	for stdout, want := range map[string]string{
+		`{"format":1,"name":"atlas","installed":{"version":"1","revision":1}}`: `holds an install of "atlas"`,
+		``: "Reading the install directory",
+	} {
+		h.fake.reset()
+		r := reply{stdout: stdout}
+		if stdout == "" {
+			r.exit = 1
+		}
+		h.fake.set("new-status", r)
+		got := errorsOf(h.apply(nil, p.PlannedState, config).Diagnostics)
+		if !strings.Contains(got, want) || slices.Contains(h.fake.ops(), "install") {
+			t.Errorf("got %q, calls %q", got, h.fake.ops())
+		}
 	}
 }

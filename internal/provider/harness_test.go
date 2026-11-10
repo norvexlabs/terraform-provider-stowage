@@ -40,6 +40,8 @@ func (c call) op() string {
 		return "fetch"
 	case installer.RunScript:
 		switch {
+		case len(c.argv) > 8 && c.argv[8] == "status":
+			return "new-status" // the fetched installer's, before a create
 		case contains(c.argv, "describe"):
 			return "describe"
 		case contains(c.argv, "upgrade"):
@@ -85,7 +87,7 @@ type fake struct {
 	queue   map[string][]reply
 }
 
-const describe1 = `{"format":1,"name":"notes","short_name":"notes","release":{"version":"1.2.0","revision":1},"channel":"stable","shapes":["docker"],"inputs":[{"key":"ADMIN_EMAIL"},{"key":"SMTP_PASSWORD","secret":true},{"key":"LEGACY"}]}`
+const describe1 = `{"format":1,"name":"notes","short_name":"notes","release":{"version":"1.2.0","revision":1},"channel":"stable","shapes":["docker"],"inputs":[{"key":"ADMIN_EMAIL"},{"key":"SMTP_PASSWORD","secret":true},{"key":"LEGACY"}],"first_install_only":["address","registry","registry_ca","channel"]}`
 
 func newFake() *fake {
 	return &fake{queue: map[string][]reply{}, replies: map[string]reply{
@@ -96,6 +98,7 @@ func newFake() *fake {
 		"rerun":         {stdout: `{"format":1,"result":"done","release":{"version":"1.2.0","revision":1}}`},
 		"upgrade":       {stdout: `{"format":1,"result":"done","release":{"version":"2.0.0","revision":1}}`},
 		"rollback":      {stdout: `{"format":1,"result":"done","release":{"version":"1.1.0","revision":1}}`},
+		"new-status":    {exit: 3, stderr: "error: /srv/notes holds no install\n"},
 		"status":        {stdout: `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1,"installer":"` + image + `"},"channel":"stable","previous":null,"inputs":["ADMIN_EMAIL","SMTP_PASSWORD"]}`},
 		"uninstall":     {stdout: `{"format":1,"result":"done"}`},
 	}}
