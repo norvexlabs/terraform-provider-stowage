@@ -13,8 +13,12 @@ follow [SemVer](https://semver.org/).
   configured) and delete (refused while `deletion_protection`; `delete_data` deletes the volumes).
 - Secret inputs, a handoff's given values and a secrets export as write-only attributes, sent to
   the target on standard input, never on a command line or in state.
-- The installer's refusals as diagnostics naming the fix; an installer of an unknown machine
-  interface format refused.
+- The installer's refusals as diagnostics: the reason as the summary, the installer's fix as
+  advice in the detail (never run); an installer of an unknown machine interface format refused.
+- The installers' result of each verb read as Stowage 0.34.0 prints it: one object on standard
+  output, exit 0 done or nothing, 3 refused, any other failed; an exit 0 or 3 without that object
+  is a failure naming the breach. An installer without the machine interface stops at its
+  `describe`, before any verb, destroy included, naming Stowage 0.34.0.
 - First-install-only settings changed: a plan-time error, never a replacement.
 - Changing a Docker install: changed inputs, secret inputs (on a new `secret_inputs_wo_version`),
   TLS mode, domains and ports reconfigure the running release first; then a new `installer`

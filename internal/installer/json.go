@@ -213,22 +213,8 @@ func ParseStatus(b []byte) (*Status, error) {
 	return &s, nil
 }
 
-// lastObject is the JSON object stdout ends with: the whole output, else the last one starting
-// a line (a verb may print lines before it).
-func lastObject(stdout []byte) []byte {
-	b := bytes.TrimSpace(stdout)
-	if json.Valid(b) {
-		return b
-	}
-	for i := len(b) - 1; i >= 0; i-- {
-		if b[i] == '{' && (i == 0 || b[i-1] == '\n') && json.Valid(b[i:]) {
-			return b[i:]
-		}
-	}
-	return nil
-}
-
-// RefusedError is exit 3: a rule said no before anything changed.
+// RefusedError is exit 3: a rule said no before anything changed. Fix is advice for the
+// operator, shown in the diagnostic and never run.
 type RefusedError struct {
 	Verb string
 	Refusal
@@ -276,38 +262,50 @@ func tail(stderr []byte) string {
 	return s
 }
 
-// Outcome maps a verb's run to its result: exit 0 and a result of "done" or "nothing" is
-// success, exit 3 with a refusal is a *RefusedError, anything else a *FailedError (a format
-// error is returned as itself).
+// Outcome maps a verb's run to its result, by the machine interface: exit 0 and stdout the one
+// result object, done or nothing, is success; exit 3 and the object with its refusal is a
+// *RefusedError; any other exit is a *FailedError whatever stdout holds (a failure prints no
+// object). Exit 0 or 3 without that object is a *FailedError naming the breach of the interface;
+// an unknown format is a *FormatError.
 func Outcome(verb string, stdout, stderr []byte, exit int) (*Result, error) {
+	if exit != 0 && exit != 3 {
+		return nil, &FailedError{Verb: verb, Exit: exit, Stderr: tail(stderr)}
+	}
 	doc := verb + " --json"
-	obj := lastObject(stdout)
+	breach := func(why error) error {
+		cause := fmt.Errorf("%w: the installer breaks the machine interface, whose exit %d ends with one result object alone on standard output", why, exit)
+		return &FailedError{Verb: verb, Exit: exit, Stderr: tail(stderr), Cause: cause}
+	}
+	out := bytes.TrimSpace(stdout)
+	if len(out) == 0 {
+		return nil, breach(fmt.Errorf("%s: no result object", doc))
+	}
 	var r Result
-	var perr error
-	if obj == nil {
-		perr = fmt.Errorf("%s: no JSON object in the output", doc)
-	} else if perr = decodeOne(doc, obj, &r); perr == nil {
-		if ferr := checkFormat(doc, r.Format); ferr != nil {
-			return nil, ferr
+	if err := decodeOne(doc, out, &r); err != nil {
+		return nil, breach(err)
+	}
+	if err := checkFormat(doc, r.Format); err != nil {
+		return nil, err
+	}
+	if err := r.Release.check(doc, "release"); err != nil {
+		return nil, breach(err)
+	}
+	if exit == 3 {
+		switch {
+		case r.Refused == nil || r.Refused.Reason == "":
+			return nil, breach(fmt.Errorf("%s: exit 3 without a refusal", doc))
+		case r.Result != "nothing":
+			return nil, breach(fmt.Errorf("%s: a refusal whose result is %q, not nothing", doc, r.Result))
 		}
+		return nil, &RefusedError{Verb: verb, Refusal: *r.Refused}
 	}
 	switch {
-	case exit == 3 && perr == nil && r.Refused != nil && r.Refused.Reason != "":
-		return nil, &RefusedError{Verb: verb, Refusal: *r.Refused}
-	case exit == 3 && perr == nil:
-		perr = fmt.Errorf("%s: exit 3 without a refusal", doc)
-	case exit == 0 && perr == nil && r.Result != "done" && r.Result != "nothing":
-		perr = fmt.Errorf("%s: result %q is neither done nor nothing", doc, r.Result)
-	case exit == 0 && perr == nil:
-		if err := r.Release.check(doc, "release"); err != nil {
-			return nil, &FailedError{Verb: verb, Exit: exit, Stderr: tail(stderr), Cause: err}
-		}
-		return &r, nil
+	case r.Refused != nil:
+		return nil, breach(fmt.Errorf("%s: a refusal with exit 0", doc))
+	case r.Result != "done" && r.Result != "nothing":
+		return nil, breach(fmt.Errorf("%s: result %q is neither done nor nothing", doc, r.Result))
 	}
-	if exit != 0 && exit != 3 {
-		perr = nil // the exit says it all; a missing object is expected
-	}
-	return nil, &FailedError{Verb: verb, Exit: exit, Stderr: tail(stderr), Cause: perr}
+	return &r, nil
 }
 
 func sortedUnique(list []string) []string {

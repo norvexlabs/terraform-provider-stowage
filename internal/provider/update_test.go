@@ -216,9 +216,9 @@ func TestUpdateReRunFailureKeepsState(t *testing.T) {
 	h := newHarness(t, nil)
 	state := h.create(h.dockerConfig(map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})}))
 	h.fake.set("describe", reply{stdout: describe2})
-	h.fake.set("rerun", reply{stdout: `{"format":1,"refused":{"reason":"ADMIN_EMAIL is not an address","fix":"give one"}}`, exit: 3})
+	h.fake.set("rerun", reply{stdout: `{"format":1,"result":"nothing","release":{"version":"1.2.0","revision":1},"refused":{"reason":"ADMIN_EMAIL is not an address","fix":"give one"}}`, exit: 3})
 	a := h.update(state, h.dockerConfig(map[string]tftypes.Value{"installer": str(image2), "inputs": strMap(map[string]string{"ADMIN_EMAIL": "nope"})}))
-	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "re-run refused: ADMIN_EMAIL is not an address") || !strings.Contains(got, "Fix: give one") {
+	if got := errorsOf(a.Diagnostics); !strings.HasPrefix(got, "ADMIN_EMAIL is not an address: give one\n\nReconfiguring notes was refused by the installer (re-run, exit 3)") {
 		t.Fatalf("got %q", got)
 	}
 	if slices.Contains(h.fake.ops(), "upgrade") {
@@ -616,5 +616,39 @@ func TestDomainWithAnUnknownInstaller(t *testing.T) {
 		"tls": str("internal"), "domains": strMap(map[string]string{"web": "n.lan", "api": "api.n.lan"})})
 	if got := errorsOf(h.plan(state, config).Diagnostics); got != "" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+// A refused upgrade after the re-run: the refusal's reason and fix, and the re-run's state saved.
+func TestUpdateUpgradeRefusalSavesTheReRun(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	state := h.create(h.dockerConfig(map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})}))
+	h.fake.set("describe", reply{stdout: describe2})
+	h.fake.set("upgrade", reply{stdout: `{"format":1,"result":"nothing","release":{"version":"1.2.0","revision":1},"refused":{"reason":"no key the install trusts signed notes 2.0.0","fix":"add the publisher's key to the install's trusted keys"}}`, exit: 3})
+	a := h.update(state, h.dockerConfig(map[string]tftypes.Value{"installer": str(image2), "inputs": strMap(map[string]string{"ADMIN_EMAIL": "b@example.com"})}))
+	if got := errorsOf(a.Diagnostics); !strings.HasPrefix(got, "no key the install trusts signed notes 2.0.0: add the publisher's key to the install's trusted keys\n\nUpgrading notes to 2.0.0 was refused") {
+		t.Fatalf("got %q", got)
+	}
+	if got := inputsOf(t, h, a.NewState); got["ADMIN_EMAIL"] != "b@example.com" || asString(t, h.attrs(a.NewState)["installer"]) != image {
+		t.Fatalf("state %v: the re-run's, the release state's", h.attrs(a.NewState))
+	}
+}
+
+// An upgrade with nothing to do (the install already runs that release) succeeds: state is what
+// status reads after it.
+func TestUpdateUpgradeNothing(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	state := h.create(h.dockerConfig(nil))
+	h.fake.set("describe", reply{stdout: describe2})
+	h.fake.set("upgrade", reply{stdout: `{"format":1,"result":"nothing","release":{"version":"2.0.0","revision":1}}`})
+	h.fake.set("status", reply{stdout: status2})
+	a := h.update(state, h.dockerConfig(map[string]tftypes.Value{"installer": str(image2)}))
+	if d := errorsOf(a.Diagnostics); d != "" {
+		t.Fatal(d)
+	}
+	if at := h.attrs(a.NewState); asString(t, at["version"]) != "2.0.0" {
+		t.Fatalf("state %v", at)
 	}
 }

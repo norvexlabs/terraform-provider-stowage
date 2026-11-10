@@ -84,19 +84,68 @@ func TestParseStatus(t *testing.T) {
 	}
 }
 
+// The results as Stowage's installers print them (printResult: indented, one object, a newline).
+const (
+	resultDone = `{
+  "format": 1,
+  "result": "done",
+  "release": {
+    "version": "2.0.0",
+    "revision": 1
+  }
+}
+`
+	resultNothing = `{
+  "format": 1,
+  "result": "nothing",
+  "release": {
+    "version": "1.0.0",
+    "revision": 1
+  }
+}
+`
+	resultUninstalled = `{
+  "format": 1,
+  "result": "done"
+}
+`
+	resultRefused = `{
+  "format": 1,
+  "result": "nothing",
+  "release": {
+    "version": "1.0.0",
+    "revision": 1
+  },
+  "refused": {
+    "reason": "notes 1.0.0 (revision 1) is installed, after this installer's 0.9.0",
+    "fix": "nothing to do: the install runs a later release; upgrade with notes-stow or a later release's installer"
+  }
+}
+`
+)
+
 func TestOutcome(t *testing.T) {
 	t.Parallel()
-	r, err := Outcome("install", []byte("log line\n{\"format\":1,\"result\":\"done\",\"release\":{\"version\":\"1.0\",\"revision\":1}}\n"), nil, 0)
-	if err != nil || r.Result != "done" || r.Release.Version != "1.0" {
+	r, err := Outcome("upgrade", []byte(resultDone), []byte("pulling…\n"), 0)
+	if err != nil || r.Result != "done" || r.Release.Version != "2.0.0" || r.Release.Revision != 1 {
 		t.Fatalf("done: %+v %v", r, err)
 	}
-	if r, err := Outcome("upgrade", []byte(`{"format":1,"result":"nothing"}`), nil, 0); err != nil || r.Result != "nothing" {
+	if r, err := Outcome("upgrade", []byte(resultNothing), nil, 0); err != nil || r.Result != "nothing" || r.Release.Version != "1.0.0" {
 		t.Fatalf("nothing: %+v %v", r, err)
 	}
+	if r, err := Outcome("uninstall", []byte(resultUninstalled), nil, 0); err != nil || r.Result != "done" || r.Release != nil {
+		t.Fatalf("uninstalled: %+v %v", r, err)
+	}
+	// A field this provider does not read is ignored.
+	if _, err := Outcome("install", []byte(`{"format":1,"result":"done","later":true}`), nil, 0); err != nil {
+		t.Fatalf("unknown field: %v", err)
+	}
 
-	_, err = Outcome("install", []byte(`{"format":1,"refused":{"reason":"ADMIN_EMAIL is recorded","fix":"run upgrade"}}`), []byte("x"), 3)
+	_, err = Outcome("upgrade", []byte(resultRefused), []byte("error: …"), 3)
 	var refused *RefusedError
-	if !errors.As(err, &refused) || refused.Fix != "run upgrade" || !strings.Contains(err.Error(), "install refused: ADMIN_EMAIL is recorded\nFix: run upgrade") {
+	if !errors.As(err, &refused) || refused.Verb != "upgrade" ||
+		refused.Reason != "notes 1.0.0 (revision 1) is installed, after this installer's 0.9.0" ||
+		!strings.HasPrefix(refused.Fix, "nothing to do: the install runs a later release") {
 		t.Fatalf("refused: %v", err)
 	}
 
@@ -106,12 +155,21 @@ func TestOutcome(t *testing.T) {
 		exit int
 		want string
 	}{
-		"exit 1":           {"", 1, "install failed (exit 1)\nboom"},
-		"exit 3, no fix":   {`{"format":1,"result":"done"}`, 3, "exit 3 without a refusal"},
-		"exit 3, no json":  {"text", 3, "no JSON object"},
-		"exit 0, bad word": {`{"format":1,"result":"maybe"}`, 0, `result "maybe" is neither`},
-		"exit 0, no json":  {"", 0, "no JSON object"},
-		"exit 255":         {"", 255, "ssh's own failure"},
+		"exit 1":                  {"", 1, "install failed (exit 1)\nboom"},
+		"exit 1 with an object":   {resultDone, 1, "install failed (exit 1)\nboom"},
+		"exit 255":                {"", 255, "ssh's own failure"},
+		"exit 3, no object":       {"", 3, "install --json: no result object: the installer breaks the machine interface, whose exit 3"},
+		"exit 3, text":            {"text", 3, "invalid character"},
+		"exit 3, no refusal":      {resultNothing, 3, "exit 3 without a refusal"},
+		"exit 3, no reason":       {`{"format":1,"result":"nothing","refused":{"reason":"","fix":"x"}}`, 3, "exit 3 without a refusal"},
+		"exit 3, done":            {`{"format":1,"result":"done","refused":{"reason":"r","fix":"x"}}`, 3, `a refusal whose result is "done"`},
+		"exit 0, refused":         {resultRefused, 0, "a refusal with exit 0"},
+		"exit 0, bad word":        {`{"format":1,"result":"maybe"}`, 0, `result "maybe" is neither`},
+		"exit 0, no object":       {"", 0, "no result object"},
+		"exit 0, text first":      {"log line\n" + resultDone, 0, "invalid character"},
+		"exit 0, data after":      {resultDone + "{}", 0, "data after the JSON object"},
+		"exit 0, release no vers": {`{"format":1,"result":"done","release":{"revision":1}}`, 0, "release has no version"},
+		"exit 0, wrong type":      {`{"format":1,"result":"done","release":{"version":2}}`, 0, "cannot unmarshal"},
 	} {
 		_, err := Outcome("install", []byte(c.out), []byte("boom\n"), c.exit)
 		if !errors.As(err, &failed) || !strings.Contains(err.Error(), c.want) {
@@ -121,6 +179,9 @@ func TestOutcome(t *testing.T) {
 	var ferr *FormatError
 	if _, err := Outcome("install", []byte(`{"format":2,"result":"done"}`), nil, 0); !errors.As(err, &ferr) || ferr.Format != 2 {
 		t.Fatalf("format: %v", err)
+	}
+	if _, err := Outcome("install", []byte(`{"result":"nothing","refused":{"reason":"r","fix":"x"}}`), nil, 3); !errors.As(err, &ferr) || !ferr.Missing {
+		t.Fatalf("no format: %v", err)
 	}
 }
 

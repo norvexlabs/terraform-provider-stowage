@@ -6,12 +6,10 @@ installer's machine interface and decides nothing itself. A finished item is del
 
 ## Must — the first release
 
-1. **The verbs' `--json` result in Stowage** (blocks every apply past `describe`): Stowage's
-   installers do not yet print `{format, result, release, refused}` nor exit 3 on a refusal
-   (DESIGN § 6, its next slice). Until then a verb exiting 0 without the object is reported as
-   failed. Once it lands, prove create, update (re-run, upgrade, rollback) and delete against a
-   real installer (item 6) — the partial state an update saves before a failed upgrade included,
-   which OpenTofu accepts with the error.
+1. **Prove the Docker target against a real installer** (Stowage ≥ 0.34.0, with item 6): create,
+   update (re-run, upgrade, rollback), delete — a refusal (exit 3) and the partial state an
+   update saves before a failed or refused upgrade included, which OpenTofu accepts with the
+   error. Unit tests drive the results as Stowage's `printResult` prints them.
 2. **Plan-time dry run** (P1, opt-in): an upgrade's `--dry-run` over SSH, skipped while the target
    does not exist yet.
 3. **Kubernetes target** (P2): `k8s install|upgrade|uninstall --json` run locally (kubeconfig
@@ -52,6 +50,10 @@ installer's machine interface and decides nothing itself. A finished item is del
 
 - **The minimum Stowage release** (`installer.MinStowage`, 0.34.0) is the release expected to ship
   the machine interface: confirm at that release.
+- **An installer older than 0.34.0 is not told positively**: it has no `describe` (cobra's
+  unknown command, exit 1), so the provider can only say that a failed `describe` may be one.
+  Ask Stowage whether an old installer's failure can be told (it cannot be changed after the
+  fact) — else this stays a hint in the diagnostic.
 
 ## Could
 

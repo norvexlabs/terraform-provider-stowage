@@ -8,9 +8,8 @@ copy of a rule.
 
 **Status: pre-release (0.1.0, unreleased).** What works: the Docker target — create, read,
 update (inputs, then the release: upgrade or rollback), import and delete. Not yet: the plan-time
-dry run, the Kubernetes and VM targets, `stowage_vm_seed` — see [TODO.md](TODO.md). The verbs'
-`--json` result is not yet printed by Stowage's installers: until it is, a verb that exits 0
-without one is reported as failed.
+dry run, the Kubernetes and VM targets, `stowage_vm_seed` — see [TODO.md](TODO.md). Not yet
+proven against a real installer (unit tests drive the verbs' results as Stowage prints them).
 
 - Provider address: `registry.opentofu.org/norvexlabs/stowage`, plugin protocol 6.
 - Needs **OpenTofu ≥ 1.11** (write-only attributes), and for a remote target the system `ssh`
@@ -182,8 +181,10 @@ the remote shell; nothing secret is ever an argument.
   input, secret input (when `secret_inputs_wo_version` is set), `tls`, domain and port given to
   the re-run (the installer counts a value given as recorded as no change), and records the
   provider's `registry`. Its `address` is not compared until then.
-- **Delete**: refused while `deletion_protection`; else `<short>-stow uninstall --yes --no-input
-  --json [--data] --dir ./<name>`. An install directory already gone is success.
+- **Delete**: refused while `deletion_protection`; else the kept installer's `describe --json`
+  (an installer without the machine interface stops there, before `uninstall` is given `--json`),
+  then `<short>-stow uninstall --yes --no-input --json [--data] --dir ./<name>`. An install
+  directory already gone is success, and runs nothing.
 
 ### Plan-time errors
 
@@ -203,10 +204,25 @@ the running release has takes it in an apply of its own). A plan changing anythi
 
 ### The machine interface, as read
 
-- The installer's exit status: **0** done or nothing to do; **3** refused, reported as `<verb>
-  refused: <reason>` and `Fix: <refused.fix>`; anything else failed, with the end of its error
-  output (4 KiB). Exit 255 is noted as possibly ssh's own failure.
-- A verb's result is the JSON object its output ends with; `result` must be `done` or `nothing`.
+- A verb (install and re-run, `upgrade`, `rollback`, `uninstall`) runs with `--json`: its
+  standard output is one object, `{format, result, release, refused}`; its text goes to standard
+  error. Every verb runs after a `describe --json` of the installer it runs (the fetched one, or
+  the kept one), so an installer without the machine interface is stopped there: a failed
+  `describe` says that an installer made by Stowage before 0.34.0 has none.
+- The installer's exit status:
+  - **0** with the object, `result` `done` or `nothing`, no `refused`: success. State is then what
+    `status --json` reads (`nothing` — the install already runs that release — changes nothing).
+  - **3** with the object, `result` `nothing` and `refused.reason` set: refused before anything
+    changed. The diagnostic's summary is `refused.reason`; its detail is `refused.fix` (advice for
+    you: the provider shows it and never runs it), then `<step> was refused by the installer
+    (<verb>, exit 3) before anything changed on the target`. That step saves no state (a refused
+    upgrade after a re-run keeps the re-run's state, as a failed one does).
+  - any other exit: failed, whatever standard output holds (a failure prints no object), with
+    the end of its error output (4 KiB). Exit 255 is noted as possibly ssh's own failure.
+  - Exit 0 or 3 without exactly that object — none, text, data before or after it, a `result`
+    other than `done`/`nothing`, a refusal with exit 0, exit 3 without a refusal or with `result`
+    `done`, a `release` without `version` — is a failure naming the breach (`the installer breaks
+    the machine interface`), never a refusal or a success.
 - **Unknown fields are tolerated** (an installer adds fields without moving `format`); a known
   field of the wrong type, data after the object, a missing `name` or `version`, and a
   `describe` `short_name` that is not one path element (`[a-z0-9][a-z0-9._-]*`) are errors.

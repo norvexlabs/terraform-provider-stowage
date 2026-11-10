@@ -205,13 +205,18 @@ func TestRefusalIsADiagnostic(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t, nil)
 	h.fake.replies["install"] = reply{
-		stdout: `{"format":1,"refused":{"reason":"ADMIN_EMAIL is required","fix":"give --set ADMIN_EMAIL=…"}}`, exit: 3}
+		stdout: "{\n  \"format\": 1,\n  \"result\": \"nothing\",\n  \"refused\": {\n    \"reason\": \"ADMIN_EMAIL is required\",\n    \"fix\": \"give --set ADMIN_EMAIL=…\"\n  }\n}\n",
+		stderr: "error: ADMIN_EMAIL is required\n", exit: 3}
 	config := h.dockerConfig(nil)
 	p := h.plan(nil, config)
 	a := h.apply(nil, p.PlannedState, config)
-	got := errorsOf(a.Diagnostics)
-	if !strings.Contains(got, "refused") || !strings.Contains(got, "ADMIN_EMAIL is required") || !strings.Contains(got, "Fix: give --set ADMIN_EMAIL=…") {
-		t.Fatalf("got %q", got)
+	// The summary is the reason, the detail the fix: shown, never run.
+	if len(a.Diagnostics) != 1 || a.Diagnostics[0].Summary != "ADMIN_EMAIL is required" ||
+		!strings.HasPrefix(a.Diagnostics[0].Detail, "give --set ADMIN_EMAIL=…\n\nInstalling notes was refused by the installer (install, exit 3)") {
+		t.Fatalf("got %q", errorsOf(a.Diagnostics))
+	}
+	if ops := h.fake.ops(); ops[len(ops)-1] != "install" {
+		t.Fatalf("ran something after the refusal: %q", ops)
 	}
 	if v, _ := a.NewState.Unmarshal(h.typ); !v.IsNull() {
 		t.Fatal("a refused install left state")
@@ -220,6 +225,15 @@ func TestRefusalIsADiagnostic(t *testing.T) {
 	a = h.apply(nil, p.PlannedState, config)
 	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "failed (exit 1)") || !strings.Contains(got, "compose up failed") {
 		t.Fatalf("failure: %q", got)
+	}
+	// Exit 3 carries the object: without one it is a failure naming the breach, not a refusal.
+	h.fake.replies["install"] = reply{stderr: "error: ADMIN_EMAIL is required", exit: 3}
+	a = h.apply(nil, p.PlannedState, config)
+	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "install failed (exit 3): install --json: no result object: the installer breaks the machine interface") || !strings.Contains(got, "ADMIN_EMAIL is required") {
+		t.Fatalf("exit 3 without an object: %q", got)
+	}
+	if v, _ := a.NewState.Unmarshal(h.typ); !v.IsNull() {
+		t.Fatal("a failed install left state")
 	}
 }
 
@@ -272,8 +286,8 @@ func TestDeletionProtection(t *testing.T) {
 
 	h3 := newHarness(t, nil)
 	state = h3.create(h3.dockerConfig(map[string]tftypes.Value{"deletion_protection": boolean(false)}))
-	h3.fake.replies["uninstall"] = reply{stdout: `{"format":1,"refused":{"reason":"the stack is busy","fix":"wait"}}`, exit: 3}
-	if got := errorsOf(h3.destroy(state).Diagnostics); !strings.Contains(got, "uninstall refused: the stack is busy") {
+	h3.fake.replies["uninstall"] = reply{stdout: `{"format":1,"result":"nothing","release":{"version":"1.2.0","revision":1},"refused":{"reason":"another lifecycle run holds the install's lock","fix":"wait for it to end"}}`, exit: 3}
+	if got := errorsOf(h3.destroy(state).Diagnostics); !strings.HasPrefix(got, "another lifecycle run holds the install's lock: wait for it to end\n\nUninstalling was refused") {
 		t.Fatalf("refused uninstall: %q", got)
 	}
 	if last := h3.fake.calls[len(h3.fake.calls)-1]; slices.Contains(last.argv, "--data") {
@@ -393,5 +407,47 @@ func TestOtherTargetsAreNotYet(t *testing.T) {
 	}
 	if len(h.fake.calls) != 0 {
 		t.Fatalf("the target was called: %q", h.fake.ops())
+	}
+}
+
+// The kept installer's describe runs before uninstall: one without the machine interface stops
+// there, naming the Stowage release that has it, and no install directory is an install gone.
+func TestDeleteDescribesTheKeptInstallerFirst(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	state := h.create(h.dockerConfig(map[string]tftypes.Value{"deletion_protection": boolean(false)}))
+	h.fake.reset()
+	h.fake.set("kept-describe", reply{stderr: `Error: unknown command "describe" for "notes-stow"`, exit: 1})
+	got := errorsOf(h.destroy(state).Diagnostics)
+	if !strings.Contains(got, "made by Stowage before "+installer.MinStowage) || !strings.Contains(got, `unknown command "describe"`) {
+		t.Fatalf("got %q", got)
+	}
+	if slices.Contains(h.fake.ops(), "uninstall") {
+		t.Fatal("uninstall ran after a failed describe")
+	}
+
+	h.fake.reset()
+	h.fake.set("kept-describe", reply{exit: installer.NotInstalled, stderr: installer.NotInstalledMark + "\n"})
+	if got := errorsOf(h.destroy(state).Diagnostics); got != "" {
+		t.Fatal(got)
+	}
+	if slices.Contains(h.fake.ops(), "uninstall") {
+		t.Fatal("uninstall ran without an install directory")
+	}
+}
+
+// An installer older than the machine interface has no describe: the create stops there, before
+// install is given --json, naming the Stowage release it needs.
+func TestOldInstallerStopsAtDescribe(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	h.fake.replies["describe"] = reply{stderr: `Error: unknown command "describe" for "notes-stow"`, exit: 1}
+	config := h.dockerConfig(nil)
+	p := h.plan(nil, config)
+	if got := errorsOf(h.apply(nil, p.PlannedState, config).Diagnostics); !strings.Contains(got, "use one made by Stowage "+installer.MinStowage+" or later") {
+		t.Fatalf("got %q", got)
+	}
+	if slices.Contains(h.fake.ops(), "install") {
+		t.Fatal("installed after a failed describe")
 	}
 }

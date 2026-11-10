@@ -189,7 +189,7 @@ func (d Docker) Describe(ctx context.Context) (*Describe, error) {
 		return nil, fmt.Errorf("describe: %w", err)
 	}
 	if exit != 0 {
-		return nil, &FailedError{Verb: "describe", Exit: exit, Stderr: tail(stderr)}
+		return nil, &FailedError{Verb: "describe", Exit: exit, Stderr: tail(stderr), Cause: errOldInstaller}
 	}
 	return ParseDescribe(stdout)
 }
@@ -303,15 +303,23 @@ func (d Docker) stow(ctx context.Context, files map[string]string, withDir bool,
 	return d.Runner.Run(ctx, argv, stdin)
 }
 
+// errOldInstaller is what a failed describe tells besides its error: every verb runs after a
+// describe, so an installer without the machine interface stops there, before a verb is given
+// --json.
+var errOldInstaller = fmt.Errorf("if the installer was made by Stowage before %s, it has no describe --json nor --json on its verbs: use one made by Stowage %s or later", MinStowage, MinStowage)
+
 // KeptDescribe runs `describe --json` of the installer the install keeps: the running release's
-// offer. Exit NotInstalled is an error here: the caller read the install first.
+// offer; nil without an install directory.
 func (d Docker) KeptDescribe(ctx context.Context) (*Describe, error) {
 	stdout, stderr, exit, err := d.stow(ctx, nil, false, "describe", "--json")
 	if err != nil {
 		return nil, fmt.Errorf("describe: %w", err)
 	}
+	if notInstalled(stdout, stderr, exit) {
+		return nil, nil
+	}
 	if exit != 0 {
-		return nil, &FailedError{Verb: "describe (the installer the install keeps)", Exit: exit, Stderr: tail(stderr)}
+		return nil, &FailedError{Verb: "describe (the installer the install keeps)", Exit: exit, Stderr: tail(stderr), Cause: errOldInstaller}
 	}
 	return ParseDescribe(stdout)
 }
@@ -424,7 +432,8 @@ func (d Docker) Status(ctx context.Context) (*Status, error) {
 	return nil, &FailedError{Verb: "status", Exit: exit, Stderr: tail(stderr)}
 }
 
-// Uninstall runs the kept installer's `uninstall --yes`, with --data when data is true.
+// Uninstall runs the kept installer's `uninstall --yes`, with --data when data is true. The
+// caller reads the kept installer's describe first.
 func (d Docker) Uninstall(ctx context.Context, data bool) (*Result, error) {
 	args := []string{"uninstall", "--yes", "--no-input", "--json"}
 	if data {

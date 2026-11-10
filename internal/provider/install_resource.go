@@ -410,7 +410,12 @@ func addInstallerError(diags *diag.Diagnostics, summary string, err error) {
 	var format *installer.FormatError
 	switch {
 	case errors.As(err, &refused):
-		diags.AddError(summary+": refused", refused.Error())
+		// The fix is advice for the operator: shown, never run.
+		fix := refused.Fix
+		if fix == "" {
+			fix = "The installer names no fix."
+		}
+		diags.AddError(refused.Reason, fmt.Sprintf("%s\n\n%s was refused by the installer (%s, exit 3) before anything changed on the target.", fix, summary, refused.Verb))
 	case errors.As(err, &format):
 		diags.AddError(summary+": installer format", format.Error())
 	default:
@@ -773,6 +778,10 @@ func (u *update) run(ctx context.Context, save func(*installModel) bool) {
 		addInstallerError(u.diags, "Reading the installer the install keeps", err)
 		return
 	}
+	if running == nil {
+		u.diags.AddError("No install to change", fmt.Sprintf("%s/%s is gone since it was read: apply again.", d.WorkDir, d.Name))
+		return
+	}
 	if running.Name != d.Name {
 		u.diags.AddError("Installer of another project", fmt.Sprintf("The installer kept in %s/%s describes the project %q, not %q.", d.WorkDir, d.Name, running.Name, d.Name))
 		return
@@ -1133,6 +1142,16 @@ func (r *installResource) Delete(ctx context.Context, req resource.DeleteRequest
 	d, err := r.docker(&m, m.ShortName.ValueString())
 	if err != nil {
 		resp.Diagnostics.AddError("Cannot reach the Docker target", err.Error())
+		return
+	}
+	// The kept installer's describe first: one without the machine interface is refused here,
+	// before uninstall is given --json; no install directory is an install already gone.
+	running, err := d.KeptDescribe(ctx)
+	if err != nil {
+		addInstallerError(&resp.Diagnostics, "Reading the installer the install keeps", err)
+		return
+	}
+	if running == nil {
 		return
 	}
 	if _, err := d.Uninstall(ctx, m.DeleteData.ValueBool()); err != nil {
