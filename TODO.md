@@ -30,6 +30,9 @@ installer's machine interface and decides nothing itself. A finished item is del
 
 ## Should
 
+- **A flaky test**: `TestCreateWaitsForTheFirstInstall` failed once in `make check` on a loaded
+  host and passed on the re-run; its 20ms create timeout races the fake's status loop. Scale it
+  with an unexported unit, as the test rules ask.
 - **A short name changed across releases**: state's `short_name` is the running release's after
   a rollback, and the kept `*-stow` fallback runs only when `<short>-stow` is missing; with both
   files left the stale one runs. Re-derive the short name after a rollback (or ask Stowage to

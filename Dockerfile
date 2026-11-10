@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Every build, test and check runs here: the host needs Docker and nothing else.
-#   make check  → target checks   (gofmt, go vet, staticcheck, govulncheck, go test -race)
+#   make check  → target checks   (gofmt, go vet, staticcheck, govulncheck, the hooks' test, go test -race)
 #   make build  → target bin      (the provider binary exported to ./bin, only after green checks)
 ARG GO_VERSION=1.27.3
 
@@ -21,6 +21,7 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
     go vet ./...; \
     go tool staticcheck ./...; \
     go tool govulncheck ./...; \
+    bash test/hooks.sh; \
     CGO_ENABLED=1 go test -race -count=1 -p 4 ./...; \
     touch /checks.ok
 

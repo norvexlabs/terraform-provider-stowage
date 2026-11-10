@@ -31,7 +31,7 @@ line, or what the provider trusts — always fixed now); **Should / Could** = de
 ## Build — Docker only
 
 ```bash
-make check     # GATE: gofmt, go vet, staticcheck, govulncheck, go test -race (Dockerfile target checks)
+make check     # GATE: gofmt, go vet, staticcheck, govulncheck, the hooks' test, go test -race (Dockerfile target checks)
 make build     # ./bin/terraform-provider-stowage — only after green checks
 make test      # fast iteration only; never the gate
 make docs      # tfplugindocs
@@ -39,6 +39,8 @@ make tidy      # go.mod / go.sum
 make fmt       # gofmt -w
 make shell     # interactive toolchain container
 make hooks     # commit identity + .githooks
+make hooks-test  # the hooks' test (test/hooks.sh) on this machine; make check runs it too
+make release-check # goreleaser check + a snapshot release (zips, manifest, checksums; unsigned) in dist/, in Docker
 ```
 
 The host's Go toolchain is for iteration (`go test ./internal/<pkg>`), never a gate. Go version:
@@ -71,10 +73,17 @@ remove or loosen it. Never commit or push with `--no-verify` or another `core.ho
 **Private words.** The tree never names a private project. The words are never written in the
 tree — writing them there would publish them: they are the private-words list in
 `~/.config/norvexlabs/private-words` (`$XDG_CONFIG_HOME/norvexlabs/private-words`; one extended
-regex per line, case-insensitive), outside every clone, and the `pre-commit` hook refuses a match in
-the staged tree (every staged file, so every added line) or a staged file's path, naming the
-`file:line`, never the word. A clone without the list is warned and passes: the maintainer's
-machine holds it. The hook does not read the commit message: keep it free of them too.
+regex per line, case-insensitive), outside every clone. `.githooks/private-words`, which the hooks
+share, refuses a match: `pre-commit` in the staged tree (every staged file, so every added line)
+and its paths, `commit-msg` in the message, `pre-push` in every pushed commit the remote's refs do
+not hold (its changed files and their paths, its whole object: message, author, committer, a
+merged tag), every tag object a pushed ref leads to, and every pushed ref name. It names a file by its
+number in git's listing and a line by its number, never the word, the line or the path. A list that
+cannot be read, or with a line that is not a valid regex, refuses; a clone without the list (or
+with an empty one) is warned and passes: the maintainer's machine holds it. A CRLF list works;
+paths are matched unquoted, case folds in C.UTF-8; a blob missing locally (a partial clone)
+refuses. `test/hooks.sh` (in
+`make check`, and `make hooks-test`) proves its refusals and passes with a fake word.
 
 ## Commit gates
 
@@ -94,7 +103,8 @@ self-review against the code it describes is enough. Every other commit clears, 
 
 ## Release — only a pushed tag publishes
 
-A push to `main` runs CI (`ci.yml`: `make check`, `make build`) and never releases.
+A push to `main` runs CI (`ci.yml`: `make check`, `make build`, `make release-check`) and never
+releases.
 `.github/workflows/release.yml` runs only on a pushed `v*` tag; it publishes a public GitHub release
 that the OpenTofu registry indexes once and never changes, so a release is cut **only when the user
 says go for it** — never on your own.
@@ -104,9 +114,11 @@ says go for it** — never on your own.
    entry's version.
 2. `git tag vx.y.z` on that commit, then `git push origin main vx.y.z` — through the org app's
    credential helper alone (Commit identity).
-3. Watch the release run. Its build job refuses a tag that is not on `main`, does not match the top
-   entry's version or names an undated entry, then runs `make check`; its publish job signs with
-   the release key (secrets `GPG_PRIVATE_KEY`, `PASSPHRASE`), verifies the signature against
+3. Watch the release run. Its build job refuses a tag that is not a version, not on `main`, not the
+   top entry's version or naming an undated entry, then runs `make check` and GoReleaser's check
+   and snapshot release (`make release-check`); its publish job (environment `release`, which alone holds the secrets
+   `GPG_PRIVATE_KEY` and `PASSPHRASE` and admits only `v*` tags) refuses a tag moved since the run
+   started, signs with the release key, verifies the signature against
    `keys/norvexlabs-gpg-public.asc` and publishes the draft as `github-actions`. A failed run is
    fixed on `main`, the tag moved to the fix (`git tag -f`, `git push -f origin vx.y.z`) while the
    release is still a draft or absent; a published release is never changed (a new version fixes

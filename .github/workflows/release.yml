@@ -9,13 +9,20 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 jobs:
-  # Tests with a read-only token: no test runs where a release can be written or the key is.
+  # Tests and builds with a read-only token: no test runs where a release can be written or the key
+  # is.
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
       contents: read
     steps:
+      # A tag is a SemVer version, before anything uses it.
+      - name: tag is a version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "the tag is not a version vX.Y.Z[-pre]"; exit 1; }
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -31,19 +38,42 @@ jobs:
           [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME, CHANGELOG.md's top entry $v"; exit 1; }
           awk -v h="## [$v] - " 'index($0, h) == 1 && substr($0, length(h) + 1) ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/ {found = 1} END {exit !found}' CHANGELOG.md || { echo "CHANGELOG.md's $v entry has no date"; exit 1; }
       - run: make check
+      # GoReleaser's configuration and a snapshot release (unsigned), proven before the publish job.
+      - run: make release-check
 
   # Builds the zips with GoReleaser, signs the checksums with the release key and publishes the
-  # release as github-actions (GITHUB_TOKEN). It runs no test and no script of the repository.
+  # release as github-actions (GITHUB_TOKEN). It runs no test and no script of the repository. The
+  # environment `release` holds the signing secrets and admits only v* tags.
   publish:
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    environment: release
     permissions:
       contents: write     # the release and its assets
     env:
       # The release key (README.md, Release); keys/norvexlabs-gpg-public.asc is its public half.
       GPG_FINGERPRINT: 686D3351040F9F4463D9D3AC0C705E9BAA4F4981
+      TAG: ${{ github.ref_name }}
+      GORELEASER_CURRENT_TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
+      # The tag still names the commit this run was started for: a tag moved since (a fix of a
+      # failed run) leaves this run nothing to publish. Run again before the publication.
+      - name: the tag is still this commit
+        run: |
+          cat > "$RUNNER_TEMP/tag-is-this-commit.sh" <<'SH'
+          set -euo pipefail
+          ref="$(gh api "repos/$GH_REPO/git/ref/tags/$TAG" --jq '.object.type + " " + .object.sha')"
+          type="${ref%% *}" sha="${ref#* }"
+          while [ "$type" = tag ]; do
+            ref="$(gh api "repos/$GH_REPO/git/tags/$sha" --jq '.object.type + " " + .object.sha')"
+            type="${ref%% *}" sha="${ref#* }"
+          done
+          [ "$type" = commit ] && [ "$sha" = "$GITHUB_SHA" ] || { echo "tag $TAG is now $type $sha, not $GITHUB_SHA: a newer run publishes it"; exit 1; }
+          SH
+          bash "$RUNNER_TEMP/tag-is-this-commit.sh"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -62,14 +92,11 @@ jobs:
       # A published release is never changed (the registries index a version once); a draft left by
       # a failed run is replaced. A failed listing stops the run.
       - name: no published release of the tag
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
         run: |
-          drafts="$(gh api --paginate "repos/$GH_REPO/releases" --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\") | .draft")"
+          drafts="$(gh api --paginate "repos/$GH_REPO/releases" --jq '.[] | select(.tag_name == env.TAG) | .draft')"
           case "$drafts" in
             ""|true) ;;
-            *) echo "release $GITHUB_REF_NAME: already published, or more than one ($drafts)"; exit 1 ;;
+            *) echo "release $TAG: already published, or more than one ($drafts)"; exit 1 ;;
           esac
       # The secret key is imported into the runner's own keyring; it must be the release key, whose
       # public half is the one in keys/.
@@ -77,7 +104,7 @@ jobs:
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
         run: |
-          [ -n "$GPG_PRIVATE_KEY" ] || { echo "the GPG_PRIVATE_KEY secret is not set"; exit 1; }
+          [ -n "$GPG_PRIVATE_KEY" ] || { echo "the GPG_PRIVATE_KEY secret is not set (environment release)"; exit 1; }
           gpg --batch --import <<<"$GPG_PRIVATE_KEY"
           gpg --batch --with-colons --list-secret-keys "$GPG_FINGERPRINT" | grep -qx "fpr:::::::::$GPG_FINGERPRINT:" ||
             { echo "GPG_PRIVATE_KEY is not the key $GPG_FINGERPRINT"; exit 1; }
@@ -86,8 +113,8 @@ jobs:
       # The notes are the tag's own CHANGELOG.md entry, up to the next entry or a link definition.
       - name: notes
         run: |
-          awk -v h="## [${GITHUB_REF_NAME#v}] - " 'index($0, h) == 1 {on = 1; next} on && (/^## \[/ || /^\[[^]]+\]: /) {exit} on' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
-          grep -q . "$RUNNER_TEMP/notes.md" || { echo "no notes for $GITHUB_REF_NAME"; exit 1; }
+          awk -v h="## [${TAG#v}] - " 'index($0, h) == 1 {on = 1; next} on && (/^## \[/ || /^\[[^]]+\]: /) {exit} on' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          grep -q . "$RUNNER_TEMP/notes.md" || { echo "no notes for $TAG"; exit 1; }
       - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         with:
           distribution: goreleaser
@@ -100,7 +127,7 @@ jobs:
       # by the key in keys/. Only then is it published.
       - name: verify the signature and the checksums
         run: |
-          v="${GITHUB_REF_NAME#v}"
+          v="${TAG#v}"
           sums="dist/terraform-provider-stowage_${v}_SHA256SUMS"
           gpg --batch --dearmor < keys/norvexlabs-gpg-public.asc > "$RUNNER_TEMP/release.gpg"
           gpgv --keyring "$RUNNER_TEMP/release.gpg" "$sums.sig" "$sums"
@@ -111,7 +138,6 @@ jobs:
           [ "$zips" -gt 0 ] && [ "$zips" = "$#" ] || { echo "$sums lists $zips zips, dist holds others"; exit 1; }
           (cd dist && sha256sum --check --strict --ignore-missing "${sums#dist/}")
       - name: publish
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: gh release edit "$GITHUB_REF_NAME" --draft=false
+        run: |
+          bash "$RUNNER_TEMP/tag-is-this-commit.sh"
+          gh release edit "$TAG" --draft=false

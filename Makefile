@@ -8,21 +8,31 @@ DOCKER_GO  := docker run --rm --memory 4g -u $(shell id -u):$(shell id -g) -e HO
               -e GOMODCACHE=/cache/mod -e GOFLAGS=-trimpath -v $(GOCACHE_DIR):/cache -v $(CURDIR):/src -w /src
 GO         := $(DOCKER_GO) golang:$(GO_VERSION)-bookworm
 
-.PHONY: all check build test fmt tidy docs shell hooks clean
+.PHONY: all check build release-check test hooks-test fmt tidy docs shell hooks clean
 
 all: check build
 
 $(GOCACHE_DIR):
 	mkdir -p $@
 
-check:            ## GATE: gofmt + vet + staticcheck + govulncheck + race tests
+check:            ## GATE: gofmt + vet + staticcheck + govulncheck + the hooks' test + race tests
 	$(BUILD) --target checks .
 
 build:            ## ./bin/terraform-provider-stowage (only after green checks)
 	$(BUILD) --target bin --output type=local,dest=bin .
 
+# GoReleaser's image, pinned by digest; its go command runs the Go of GO_VERSION (GOTOOLCHAIN).
+GORELEASER := docker.io/goreleaser/goreleaser:v2.19.0@sha256:b62e651c2fd9e7b1c94133a4e5d131187649e45aeeca137fbf4940f0f654ad08
+
+release-check: | $(GOCACHE_DIR)    ## .goreleaser.yml checked, a snapshot release made in dist/: zips, manifest, checksums (unsigned, unpublished)
+	$(DOCKER_GO) -e GOTOOLCHAIN=go$(GO_VERSION) --entrypoint sh $(GORELEASER) -c \
+	  'git config --global --add safe.directory /src && goreleaser check && goreleaser release --snapshot --clean --skip=sign,publish --parallelism 2'
+
 test: | $(GOCACHE_DIR)             ## fast loop: unit tests only, no race detector; never the gate
 	$(GO) go test -count=1 -p 4 ./...
+
+hooks-test:       ## the hooks' branches (test/hooks.sh), on this machine; make check runs it too
+	bash test/hooks.sh
 
 fmt: | $(GOCACHE_DIR)              ## rewrite sources with gofmt
 	$(GO) gofmt -w .

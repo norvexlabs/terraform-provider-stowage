@@ -17,3 +17,5 @@ jobs:
       # The same entry points as on a developer machine: Docker is the only requirement.
       - run: make check
       - run: make build
+      # The release's GoReleaser configuration and a snapshot release (unsigned, unpublished), in Docker.
+      - run: make release-check

@@ -276,7 +276,7 @@ upgrade cut there goes on, and the installer refuses another run until it ends.
 Docker is the only requirement.
 
 ```bash
-make check   # GATE: gofmt, go vet, staticcheck, govulncheck, go test -race (Dockerfile target checks)
+make check   # GATE: gofmt, go vet, staticcheck, govulncheck, the hooks' test, go test -race (Dockerfile target checks)
 make build   # ./bin/terraform-provider-stowage, only after green checks
 make test    # fast loop, never the gate
 make docs    # regenerate docs/ with tfplugindocs (needs network)
@@ -284,6 +284,8 @@ make tidy    # go.mod / go.sum
 make fmt     # gofmt -w
 make shell   # toolchain container
 make hooks   # commit identity + .githooks
+make hooks-test  # the hooks' test (test/hooks.sh) on this machine; make check runs it too
+make release-check # goreleaser check + a snapshot release (zips, manifest, checksums; unsigned) in dist/, in Docker
 ```
 
 An acceptance test, `TestAccDockerLocal`, installs a real installer on this machine's Docker
@@ -291,37 +293,49 @@ through OpenTofu: `TF_ACC=1 TF_ACC_TERRAFORM_PATH=<tofu> TF_ACC_PROVIDER_NAMESPA
 TF_ACC_PROVIDER_HOST=registry.opentofu.org STOWAGE_ACC_INSTALLER=<ref@digest>
 STOWAGE_ACC_WORK_DIR=<dir> go test ./internal/provider -run TestAcc`.
 
-CI (`.github/workflows/ci.yml`) runs `make check` and `make build` on every push to `main` and
-every pull request.
+CI (`.github/workflows/ci.yml`) runs `make check`, `make build` and `make release-check`
+(GoReleaser's `check` and a snapshot release into `dist/` — every zip, the manifest and the
+checksums, unsigned and unpublished — in
+GoReleaser v2.19.0's image with the Go of `GO_VERSION`) on every push to `main` and every pull
+request.
 
 ## Release
 
 For maintainers. Only a pushed `v*` tag releases (`.github/workflows/release.yml`); a push to
 `main` never does.
 
+**Once, on GitHub:** create the environment `release` (Settings → Environments) with a deployment
+rule that admits tags `v*` only (no branch), and put the secrets `GPG_PRIVATE_KEY` (the release
+key's armored private key) and `PASSPHRASE` (its passphrase) there — environment secrets, never
+repository secrets, so a workflow run on a branch cannot read them.
+
 1. A commit dates the top CHANGELOG.md entry: `## [x.y.z]` → `## [x.y.z] - YYYY-MM-DD`. The
    Makefile's `VERSION` is that entry's version.
 2. `git tag vx.y.z` on that commit of `main`, pushed with `main`.
-3. The **build** job (read-only token) refuses a tag that is not on `main`, that does not name the
-   top entry's version, or whose entry is undated, then runs `make check`.
-4. The **publish** job (`contents: write`) refuses a tag whose release is already published (a
-   draft left by a failed run is replaced), imports the release key from the `GPG_PRIVATE_KEY`
-   secret (refused unless it is the key below, and unless `keys/norvexlabs-gpg-public.asc` is its
-   public half), and runs GoReleaser (`.goreleaser.yml`, GoReleaser v2.19.0) with the Go of
-   `GO_VERSION`. GoReleaser makes a draft release, its notes the tag's CHANGELOG.md entry, holding
-   what the OpenTofu and Terraform registries read:
-   - `terraform-provider-stowage_<version>_<os>_<arch>.zip` for freebsd, windows, linux and
-     darwin on amd64, 386, arm and arm64 (no darwin/386), each holding
-     `terraform-provider-stowage_v<version>`;
+3. The **build** job (read-only token) refuses a tag that is not a version
+   (`vX.Y.Z` or `vX.Y.Z-<pre-release>`), is not on `main`, does not name the top entry's version,
+   or whose entry is undated; then runs `make check` and `make release-check`.
+4. The **publish** job (environment `release`, `contents: write`) refuses a tag that no longer
+   names the commit its run was started for (a tag moved to a fix: the newer run publishes), and
+   a tag whose release is already published (a draft left by a failed run is replaced). It imports
+   the release key from `GPG_PRIVATE_KEY` (refused unless it is the key below, and unless
+   `keys/norvexlabs-gpg-public.asc` is its public half), and runs GoReleaser (`.goreleaser.yml`,
+   GoReleaser v2.19.0, `GORELEASER_CURRENT_TAG` the pushed tag) with the Go of `GO_VERSION`.
+   GoReleaser makes a draft release, its notes the tag's CHANGELOG.md entry, holding what the
+   OpenTofu and Terraform registries read:
+   - `terraform-provider-stowage_<version>_<os>_<arch>.zip`, each holding
+     `terraform-provider-stowage_v<version>`, for freebsd and linux on amd64, 386, arm and arm64,
+     windows on amd64, 386 and arm64, and darwin on amd64 and arm64 (13 zips);
    - `terraform-provider-stowage_<version>_manifest.json`, from `terraform-registry-manifest.json`
      (plugin protocol 6.0);
    - `terraform-provider-stowage_<version>_SHA256SUMS` over the zips and the manifest, and
      `terraform-provider-stowage_<version>_SHA256SUMS.sig`, its binary detached GPG signature by
-     the release key, its passphrase from the `PASSPHRASE` secret.
+     the release key, its passphrase from `PASSPHRASE`.
 
    The job then verifies the signature with `keys/norvexlabs-gpg-public.asc`, the manifest's and
-   every zip's checksum, and publishes the draft. The release is made by `github-actions` with
-   the workflow's `GITHUB_TOKEN`; nothing is published as a person.
+   every zip's checksum, checks again that the tag still names its commit, and publishes the draft.
+   The release is made by `github-actions` with the workflow's `GITHUB_TOKEN`; nothing is
+   published as a person.
 
 The release key: fingerprint `686D3351040F9F4463D9D3AC0C705E9BAA4F4981`, RSA 4096, `Norvex Labs
 <norvexlabs@gmail.com>`. Its public key is in this repository,
@@ -345,7 +359,8 @@ sha256sum --check --ignore-missing terraform-provider-stowage_<version>_SHA256SU
 | `examples/` | provider and resource examples (read by tfplugindocs) |
 | `.goreleaser.yml`, `terraform-registry-manifest.json` | the release's zips, checksums, signature and registry manifest |
 | `.github/workflows/` | `ci.yml` (check and build), `release.yml` (a pushed tag's release) |
-| `.githooks/` | the commit identity and push guards (`make hooks`) |
+| `.githooks/` | the commit identity, push and private-words guards (`make hooks`) |
+| `test/hooks.sh` | the hooks' test |
 | `keys/` | the release key's public half |
 | `docs/img/` | the logo, mark, icons and the repository's social preview |
 
