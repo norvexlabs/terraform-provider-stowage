@@ -1143,10 +1143,6 @@ func refuseSecretInputs(diags *diag.Diagnostics, given map[string]string, releas
 	}
 }
 
-// releaseStep decides the release change: none when the install runs the desired release (its
-// installer, or the release that installer describes), rollback when the desired installer is the
-// previous release's and allow_rollback is set, else the new installer's upgrade, fetched and
-// described here (next). The installer refuses an older release.
 // keptChecks refuses what an update cannot run over: no install any more, a kept installer of
 // another project, first-install settings the install recorded otherwise (an imported state's
 // first apply, a registry the plan could not tell from the release's own). Each is an error in
@@ -1168,8 +1164,11 @@ func (u *update) keptChecks(d installer.Docker, st *installer.Status, running *i
 	return true
 }
 
-// releaseStep is the release change the update ends with. The new installer, when it must be
-// read, is fetched onto d, or, with fetchTo, onto the Docker fetchTo gives (false: none, the
+// releaseStep decides the release change: none when the install runs the desired release (its
+// installer, or the release that installer describes), rollback when the desired installer is the
+// previous release's and allow_rollback is set, else the new installer's upgrade, fetched and
+// described here (next). The installer refuses an older release. The new installer, when it must
+// be read, is fetched onto d, or, with fetchTo, onto the Docker fetchTo gives (false: none, the
 // step is stay).
 func (u *update) releaseStep(ctx context.Context, d installer.Docker, st *installer.Status, fetchTo func() (installer.Docker, bool)) (releaseStep, *installer.Describe) {
 	desired := u.plan.Installer.ValueString()

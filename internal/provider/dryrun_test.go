@@ -170,3 +170,27 @@ func TestPlanDryRunRoundSix(t *testing.T) {
 		t.Fatalf("a release already running: %q %q", d, h.fake.ops())
 	}
 }
+
+// Round seven: a rollback's dry run checks the inputs as the apply does before reaching the
+// target (a secret input in inputs is refused, nothing run).
+func TestPlanDryRunRollbackChecksTheInputs(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	state := h.create(h.dockerConfig(map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})}))
+	h.fake.reset()
+	h.fake.set("status", reply{stdout: `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1,"installer":"` + image + `"},"channel":"stable",` +
+		`"previous":{"version":"2.0.0","revision":1,"installer":"` + image2 + `"},"inputs":["ADMIN_EMAIL"]}`})
+	h.fake.set("kept-describe", reply{stdout: strings.Replace(describe1, `{"key":"ADMIN_EMAIL"}`, `{"key":"ADMIN_EMAIL","secret":true}`, 1)})
+	got := errorsOf(h.plan(state, h.dockerConfig(map[string]tftypes.Value{"installer": str(image2), "plan_dry_run": boolean(true), "allow_rollback": boolean(true),
+		"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})})).Diagnostics)
+	if !strings.Contains(got, "secret input") || len(h.fake.callsOf("dry-rollback")) != 0 {
+		t.Fatalf("got %q, calls %q", got, h.fake.ops())
+	}
+	// The kept installer gone since status read it: no plan error, the apply says so.
+	h.fake.reset()
+	h.fake.set("kept-describe", reply{exit: 100, stderr: "stowage-provider: no install directory\n"})
+	if got := errorsOf(h.plan(state, h.dockerConfig(map[string]tftypes.Value{"installer": str(image2), "plan_dry_run": boolean(true), "allow_rollback": boolean(true),
+		"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})})).Diagnostics); got != "" {
+		t.Fatalf("gone: %q", got)
+	}
+}
