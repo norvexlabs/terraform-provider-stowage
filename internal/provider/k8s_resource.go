@@ -764,7 +764,7 @@ func installerPrefix(ref string) (name, prefix string, err error) {
 }
 
 // normPrefix is a registry prefix as Docker reads it: a first element that is no host (no `.` or
-// `:`, not localhost) is Docker Hub's docker.io; index.docker.io and registry-1.docker.io are
+// `:`, not localhost) is Docker Hub's docker.io; index.docker.io is
 // docker.io too; the host is case-insensitive.
 func normPrefix(p string) string {
 	host, rest, _ := strings.Cut(p, "/")
@@ -772,7 +772,7 @@ func normPrefix(p string) string {
 		return "docker.io/" + p
 	}
 	host = strings.ToLower(host)
-	if host == "index.docker.io" || host == "registry-1.docker.io" {
+	if host == "index.docker.io" {
 		host = "docker.io"
 	}
 	if rest == "" {

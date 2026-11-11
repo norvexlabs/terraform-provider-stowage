@@ -576,3 +576,50 @@ func TestResolveScriptKeepsTheLinksName(t *testing.T) {
 		t.Fatalf("the home: %q %d %v", out, exit, err)
 	}
 }
+
+// PlanDirScript and PlanRemoveScript under sh: a private directory beside the install, its
+// absolute path printed; removed, and nothing but such a directory is.
+func TestPlanDirScripts(t *testing.T) {
+	t.Parallel()
+	work := t.TempDir()
+	d := Docker{Runner: target.Local{}, WorkDir: work, Name: "notes"}
+	dir, err := d.PlanDir(context.Background())
+	if err != nil || filepath.Dir(dir) != work || !strings.HasPrefix(filepath.Base(dir), ".stowage-plan.") {
+		t.Fatalf("%q %v", dir, err)
+	}
+	if fi, err := os.Stat(dir); err != nil || fi.Mode().Perm() != 0o700 {
+		t.Fatalf("%v %v", fi, err)
+	}
+	if err := d.RemovePlanDir(context.Background(), dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("left: %v", err)
+	}
+	if err := d.RemovePlanDir(context.Background(), work); err == nil {
+		t.Fatal("another directory removed")
+	}
+	if _, err := os.Stat(work); err != nil {
+		t.Fatalf("the work directory: %v", err)
+	}
+}
+
+// ResolveScript takes $HOME only when it is an absolute directory the run is in: a missing or
+// relative $HOME, or another directory, falls back to cd and pwd -L; Resolve cleans the spelling.
+func TestResolveScriptHomeGuards(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	run := func(home string) string {
+		out, _, _, _ := target.Local{}.Run(context.Background(), []string{"env", "HOME=" + home, "sh", "-c", `cd "$0" && unset PWD && sh -c "$1" sh .`, dir, ResolveScript}, nil)
+		return strings.TrimSpace(string(out))
+	}
+	for home, want := range map[string]string{dir: dir, dir + "/": dir + "/", ".": dir, dir + "/missing": dir, "/": dir} {
+		if got := run(home); got != want && !(want == dir && strings.HasSuffix(got, filepath.Base(dir))) {
+			t.Errorf("HOME=%q: %q, want %q", home, got, want)
+		}
+	}
+	got, err := Docker{Runner: &recorder{out: dir + "//\n"}, WorkDir: "."}.Resolve(context.Background())
+	if err != nil || got != dir {
+		t.Fatalf("cleaned: %q %v", got, err)
+	}
+}

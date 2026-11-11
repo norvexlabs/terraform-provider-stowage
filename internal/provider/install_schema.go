@@ -42,6 +42,7 @@ type installModel struct {
 	AllowRollback         types.Bool     `tfsdk:"allow_rollback"`
 	DeletionProtection    types.Bool     `tfsdk:"deletion_protection"`
 	DeleteData            types.Bool     `tfsdk:"delete_data"`
+	PlanDryRun            types.Bool     `tfsdk:"plan_dry_run"`
 	Registry              types.String   `tfsdk:"registry"`
 	RegistryCADigest      types.String   `tfsdk:"registry_ca_digest"`
 	ShortName             types.String   `tfsdk:"short_name"`
@@ -177,6 +178,10 @@ func installSchema(ctx context.Context) schema.Schema {
 			"deletion_protection": schema.BoolAttribute{
 				Optional: true, Computed: true, Default: booldefault.StaticBool(true),
 				MarkdownDescription: "While true (the default), destroying the resource is refused. Set it false and apply before a destroy.",
+			},
+			"plan_dry_run": schema.BoolAttribute{
+				Optional: true, Computed: true, Default: booldefault.StaticBool(false),
+				MarkdownDescription: "On Docker, a plan changing `installer` runs the change's `--dry-run` on the target (the new release's `upgrade --dry-run`, fetched into a private directory beside the install and removed after; or the kept installer's `rollback --dry-run`), so the installer's refusal is a plan error. Opt-in: the plan reaches the target. Skipped for an imported state never applied, and while `installer` or the connection is not known.",
 			},
 			"delete_data": schema.BoolAttribute{
 				Optional: true, Computed: true, Default: booldefault.StaticBool(false),

@@ -6,8 +6,6 @@ installer's machine interface and decides nothing itself. A finished item is del
 
 ## Must — the first release
 
-2. **Plan-time dry run** (P1, opt-in): an upgrade's `--dry-run` over SSH, skipped while the target
-   does not exist yet.
 4. **Run `make acc-vm`** (written, never run): `stowage_vm_seed` and the VM target against a real
    VM on TrueNAS with Stowage ≥ 0.35.0 — the seed (its disk written by `disk_dir`), the module's
    VM, the first install over SSH under the one-time key, the own key read, a re-run, an upgrade

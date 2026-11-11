@@ -40,6 +40,8 @@ follow [SemVer](https://semver.org/).
 - A create over an install already in the directory, and an imported install's first apply,
   refuse a configuration whose address, registry or registry CA is not the install's; a read
   records the install's own, so the next plan shows a drift as an error.
+- `plan_dry_run`: on Docker, a plan changing the release runs its upgrade's (or rollback's)
+  `--dry-run` on the target, so the installer's refusal is a plan error.
 - Reference documentation in `docs/`, generated from OpenTofu's own schema of the provider
   (`make docs`), never Terraform's.
 - A pull account's login keeps the Docker context in use, so the fetch reaches the daemon the

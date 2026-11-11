@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	pathpkg "path"
 	"regexp"
 	"slices"
 	"strings"
@@ -316,10 +317,14 @@ func (d Docker) Fetch(ctx context.Context, installer string, login *Login) error
 }
 
 // ResolveScript prints its argument's directory as an absolute path: "." in the home (an SSH
-// run's start) as $HOME names it, a symbolic link's name kept (sshd sets no PWD, so pwd alone
-// would print the physical path); any other as the shell names it after cd.
-const ResolveScript = `if [ "$1" = . ] && [ -n "${HOME:-}" ] && [ "$(cd -- "$HOME" 2>/dev/null && pwd -P)" = "$(pwd -P)" ]; then
-  printf '%s\n' "$HOME"
+// run's start) as $HOME names it — an absolute $HOME that is the directory the run is in, by
+// their physical paths, both read — so a symbolic link's name is kept (sshd sets no PWD, so pwd
+// alone would print the physical path); any other as the shell names it after cd.
+const ResolveScript = `h=${HOME:-} here=$(pwd -P 2>/dev/null) || here=
+there=
+case $h in /*) there=$(cd -- "$h" 2>/dev/null && pwd -P) || there= ;; esac
+if [ "$1" = . ] && [ -n "$here" ] && [ "$here" = "$there" ]; then
+  printf '%s\n' "$h"
 else
   cd -- "$1" && pwd -L
 fi`
@@ -339,6 +344,11 @@ func (d Docker) Resolve(ctx context.Context) (string, error) {
 	}
 	if !strings.HasPrefix(dir, "/") {
 		return "", fmt.Errorf("resolving %s: %q is not an absolute path", d.WorkDir, dir)
+	}
+	// One spelling: $HOME may end with / or hold //; a .. in it is kept, as Clean would
+	// change the directory it names through a symbolic link.
+	if !strings.Contains(dir, "/../") && !strings.HasSuffix(dir, "/..") {
+		dir = pathpkg.Clean(dir)
 	}
 	return dir, nil
 }

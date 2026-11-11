@@ -46,6 +46,10 @@ func (c call) op() string {
 		return "tools"
 	case installer.ResolveScript:
 		return "resolve"
+	case installer.PlanDirScript:
+		return "plan-dir"
+	case installer.PlanRemoveScript:
+		return "plan-rm"
 	case installer.RunLoginScript:
 		return "install" // vm seed, the one program run so
 	case installer.K8sScript:
@@ -63,6 +67,8 @@ func (c call) op() string {
 			return "new-status" // the fetched installer's, before a create
 		case contains(c.argv, "describe"):
 			return "describe"
+		case contains(c.argv, "upgrade") && contains(c.argv, "--dry-run"):
+			return "dry-upgrade"
 		case contains(c.argv, "upgrade"):
 			return "upgrade"
 		}
@@ -73,6 +79,8 @@ func (c call) op() string {
 			return "rerun"
 		case verb == "describe":
 			return "kept-describe"
+		case verb == "rollback" && contains(c.argv, "--dry-run"):
+			return "dry-rollback"
 		default:
 			return verb
 		}
@@ -117,6 +125,10 @@ func newFake() *fake {
 	return &fake{queue: map[string][]reply{}, replies: map[string]reply{
 		"fetch":         {},
 		"resolve":       {stdout: "/home/ops\n"},
+		"plan-dir":      {stdout: "/srv/.stowage-plan.abc\n"},
+		"plan-rm":       {},
+		"dry-upgrade":   {stdout: `{"format":1,"result":"nothing","release":{"version":"1.2.0","revision":1}}`},
+		"dry-rollback":  {stdout: `{"format":1,"result":"nothing","release":{"version":"2.0.0","revision":1}}`},
 		"describe":      {stdout: describe1},
 		"kept-describe": {stdout: describe1},
 		"install":       {stdout: `{"format":1,"result":"done","release":{"version":"1.2.0","revision":1}}`},

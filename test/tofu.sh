@@ -8,8 +8,8 @@ tofu_path() {
 	local cache=${XDG_CACHE_HOME:-$HOME/.cache} tools tmp
 	tools=$cache/terraform-provider-stowage-tools/$TOFU_SHA
 	if [[ ! -x $tools/tofu ]]; then
-		mkdir -p "$tools"
-		tmp=$(mktemp -d "$tools/.dl.XXXXXX")
+		mkdir -p "$tools" && tmp=$(mktemp -d "$tools/.dl.XXXXXX") ||
+			{ echo "FAIL: cannot make $tools" >&2; return 1; }
 		curl -fsSL "https://github.com/opentofu/opentofu/releases/download/v$TOFU_VERSION/tofu_${TOFU_VERSION}_linux_amd64.tar.gz" -o "$tmp/tofu.tgz" ||
 			{ echo "FAIL: download OpenTofu" >&2; rm -rf "$tmp"; return 1; }
 		echo "$TOFU_SHA  $tmp/tofu.tgz" | sha256sum -c --quiet - ||
