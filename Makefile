@@ -66,8 +66,11 @@ fmt: | $(GOCACHE_DIR)              ## rewrite sources with gofmt
 tidy: | $(GOCACHE_DIR)             ## refresh go.mod / go.sum
 	$(GO) go mod tidy
 
-docs: | $(GOCACHE_DIR)             ## regenerate docs/ from the schema and examples/ (tfplugindocs; needs network)
-	$(GO) go tool tfplugindocs generate --provider-name stowage
+# docs: tfplugindocs reads OpenTofu's schema of the provider built here (test/schema.sh, the
+# pinned tofu through dev_overrides), so it never builds the provider or downloads Terraform.
+docs: build | $(GOCACHE_DIR)       ## regenerate docs/ from OpenTofu's schema and examples/ (tfplugindocs)
+	bash test/schema.sh > $(GOCACHE_DIR)/schema.json
+	$(GO) go tool tfplugindocs generate --provider-name stowage --providers-schema /cache/schema.json
 
 shell: | $(GOCACHE_DIR)            ## a shell with the toolchain and the repo mounted
 	$(DOCKER_GO) -it golang:$(GO_VERSION)-bookworm bash

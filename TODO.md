@@ -14,16 +14,12 @@ installer's machine interface and decides nothing itself. A finished item is del
    and its reboot, the rollback, the destroy. Fix what it finds; until then the VM target is
    proven by unit tests alone. `make acc-docker` and `make acc-k8s` run again against Stowage
    0.35.0 too.
-5. **Docs** (P4): `make docs` (tfplugindocs) into `docs/` from the schema and `examples/`; needs a
-   way to give tfplugindocs OpenTofu's schema instead of downloading Terraform.
 7. **First release** (P5), on the maintainer's decision: a GPG key for the release
    (`GPG_FINGERPRINT`); a release workflow (GoReleaser on a pushed tag); registry submission by
    hand.
 
 ## Should
 
-- **`make acc-docker` ships with the host's Docker uncapped**: `stowage ship` builds the example's
-  images with this machine's builder, whose memory is not capped as the test's containers are.
 - **Blocked on Stowage — a verb on the VM that retires the one-time host key** and prints the VM's
   own key (`sudo <short>-stow host-key --json` → `{known_hosts_line, fingerprint}`, refused on the
   recovery or live system). `vm host-key` does it from the operator's machine over its own SSH

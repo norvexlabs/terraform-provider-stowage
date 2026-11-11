@@ -16,7 +16,7 @@
 set -euo pipefail
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-: "${STOWAGE_SRC:?set STOWAGE_SRC to a Stowage checkout (>= 0.34.0) whose ./bin/stowage is built}"
+: "${STOWAGE_SRC:?set STOWAGE_SRC to a Stowage checkout (>= 0.35.0) whose ./bin/stowage is built}"
 STOWAGE=$STOWAGE_SRC/bin/stowage
 [[ -x $STOWAGE ]] || { echo "FAIL: $STOWAGE is missing: run make build in $STOWAGE_SRC" >&2; exit 1; }
 PROVIDER_BIN=${PROVIDER_BIN:-$REPO/bin/terraform-provider-stowage}
@@ -28,8 +28,6 @@ HTPASSWD=httpd:2.4-alpine@sha256:3440c39d8d6f54fa9ad2549e5a60c19ddd435faadc29c1a
 COSIGN=gcr.io/projectsigstore/cosign:v3.0.2@sha256:b29487e48205d875c324c79583e2806d9d269c0fa299e0861bbec023d8430c8b
 DIND=docker:29.9.3-dind@sha256:08a98015fce594af7c382883bea080ea206de74402a95da9dc52b6428c8cd121
 PG=postgres:18-alpine@sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395
-TOFU_VERSION=1.13.9
-TOFU_SHA=b34b327cc1ef07178207b6f2cd1f5276537d3e5b7be316500f6dac50d4c0a857
 
 CACHE=${XDG_CACHE_HOME:-$HOME/.cache}
 mkdir -p "$CACHE"
@@ -39,6 +37,7 @@ export XDG_CACHE_HOME=$WORK/cache
 
 cleanup() {
 	docker rm -f "$N-target" "$N-zot" "$N-net" >/dev/null 2>&1 || true
+	docker buildx rm "$N-builder" >/dev/null 2>&1 || true
 	docker volume rm -f "$N-docker" >/dev/null 2>&1 || true
 	# The images ship built and pushed, kept by tag on this host's Docker.
 	docker images --format '{{.Repository}}:{{.Tag}}' --filter "reference=$REG/notes/*" 2>/dev/null | xargs -r docker rmi >/dev/null 2>&1 || true
@@ -54,16 +53,9 @@ token() { head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 free_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])'; }
 
 step "OpenTofu $TOFU_VERSION, the provider"
-TOOLS=$CACHE/terraform-provider-stowage-tools/$TOFU_SHA
-if [[ ! -x $TOOLS/tofu ]]; then
-	mkdir -p "$TOOLS"
-	tmp=$(mktemp -d "$TOOLS/.dl.XXXXXX")
-	curl -fsSL "https://github.com/opentofu/opentofu/releases/download/v$TOFU_VERSION/tofu_${TOFU_VERSION}_linux_amd64.tar.gz" -o "$tmp/tofu.tgz" || fail "download OpenTofu"
-	echo "$TOFU_SHA  $tmp/tofu.tgz" | sha256sum -c --quiet - || fail "OpenTofu's archive is not $TOFU_SHA"
-	tar -xzf "$tmp/tofu.tgz" -C "$tmp" tofu && mv -f "$tmp/tofu" "$TOOLS/tofu"
-	rm -rf "$tmp"
-fi
-TOFU=$TOOLS/tofu
+# shellcheck source=test/tofu.sh
+. "$REPO/test/tofu.sh"
+TOFU=$(tofu_path) || fail "OpenTofu $TOFU_VERSION"
 mkdir -p "$WORK/plugins" "$WORK/root"
 cp "$PROVIDER_BIN" "$WORK/plugins/terraform-provider-stowage"
 cat >"$WORK/tofurc" <<HCL
@@ -141,6 +133,10 @@ assert s.count(old) == 1, old
 s = s.replace(old, old + '  - { key: E2E_TOKEN, prompt: "A token", secret: true, optional: true }\n')
 open(path, "w").write(s)
 PY
+# ship builds the example's images with buildx: a builder of its own, capped as the test's
+# containers are (BUILDX_BUILDER, which docker buildx reads), removed at the exit.
+docker buildx create --name "$N-builder" --driver docker-container --driver-opt memory=4g --driver-opt memory-swap=4g >/dev/null
+export BUILDX_BUILDER=$N-builder
 S=("$STOWAGE" -C "$P" --test-registry "$REG/notes" --test-push publisher:STOWAGE_PUSH_TOKEN --test-pull pull:NOTES_PULL_TOKEN
 	--test-key "$P/keys/release.key" --test-public-key keys/release.pub --shapes docker)
 "${S[@]}" lock --update >/dev/null

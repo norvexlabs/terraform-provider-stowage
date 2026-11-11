@@ -717,7 +717,7 @@ Docker is the only requirement.
 make check   # GATE: gofmt, go vet, staticcheck, govulncheck, the hooks' test, go test -race (Dockerfile target checks)
 make build   # ./bin/terraform-provider-stowage, only after green checks
 make test    # fast loop, never the gate
-make docs    # regenerate docs/ with tfplugindocs (needs network)
+make docs    # docs/ by tfplugindocs from OpenTofu's schema of the built provider (test/schema.sh; the pinned tofu, downloaded once)
 make tidy    # go.mod / go.sum
 make fmt     # gofmt -w
 make shell   # toolchain container
@@ -738,7 +738,9 @@ account), a refresh planning nothing, a re-run, an upgrade adding an input, a ro
 error without `allow_rollback`), an upgrade across the barrier, a refused upgrade after a re-run
 (the re-run's state saved, the reason and the fix shown), a refused rollback, an import and its
 first apply, and a destroy refused by `deletion_protection`, then one with `delete_data`; it
-prints `PASS`. Everything it starts is named `acc-docker-<pid>` and removed at its exit; its work
+prints `PASS`. `stowage ship` builds the example's images with a buildx builder of its own
+(`docker-container` driver, capped at 4 GiB, `BUILDX_BUILDER`). Everything it starts is named
+`acc-docker-<pid>` and removed at its exit; its work
 directory is under `~/.cache` (`ACC_LOGS=<dir>` keeps the logs). Needs Docker, curl, jq, python3,
 ssh, ssh-keygen and network access.
 
@@ -820,16 +822,18 @@ sha256sum --check --ignore-missing terraform-provider-stowage_<version>_SHA256SU
 | Path | |
 |---|---|
 | `main.go` | the plugin server |
-| `internal/provider` | provider configuration and `stowage_install` |
-| `internal/installer` | the machine interface's documents, exit mapping, the Docker and Kubernetes targets' scripts |
+| `internal/provider` | provider configuration, `stowage_install` (Docker, Kubernetes, VM) and `stowage_vm_seed` |
+| `internal/installer` | the machine interface's documents, exit mapping, the targets' scripts |
+| `internal/testutil` | the tests' shared helpers |
 | `internal/target` | `Runner`: this machine, or the system `ssh` with a pinned host key |
 | `examples/` | provider and resource examples (read by tfplugindocs) |
 | `.goreleaser.yml`, `terraform-registry-manifest.json` | the release's zips, checksums, signature and registry manifest |
 | `.github/workflows/` | `ci.yml` (check and build), `release.yml` (a pushed tag's release) |
 | `.githooks/` | the commit identity, push and private-words guards (`make hooks`) |
 | `test/hooks.sh` | the hooks' test |
-| `test/acc-k8s.sh` | the Kubernetes target's acceptance test (`make acc-k8s`) |
+| `test/acc-docker.sh`, `test/acc-k8s.sh`, `test/acc-vm.sh` | the targets' acceptance tests (`make acc-docker`, `acc-k8s`, `acc-vm`); `test/acc.Dockerfile` their runner |
+| `test/tofu.sh`, `test/schema.sh` | the pinned OpenTofu; the provider's schema by it (`make docs`) |
 | `keys/` | the release key's public half |
-| `docs/img/` | the logo, mark, icons and the repository's social preview |
+| `docs/` | the reference documentation `make docs` generates; `docs/img/` the logo, mark, icons and the repository's social preview |
 
 Licence: Apache-2.0.
