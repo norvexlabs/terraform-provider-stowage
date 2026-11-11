@@ -6,9 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -133,24 +131,8 @@ func TestLocalRun(t *testing.T) {
 	if err != nil || exit != 3 || string(out) != "in" || string(errOut) != "e\n" {
 		t.Fatalf("got %q %q %d %v", out, errOut, exit, err)
 	}
-	if _, _, exit, err := (Local{}).Run(context.Background(), []string{"/nonexistent/prog"}, nil); err != nil || exit != 127 {
+	if _, _, exit, err := (Local{}).Run(context.Background(), []string{"/nonexistent/prog"}, nil); err == nil || exit != -1 {
 		t.Fatalf("missing program: exit %d err %v", exit, err)
-	}
-}
-
-// A process the program started that outlives it, holding its standard output, adds nothing to
-// the output: it is the program's alone, taken once it exited, with its exit status; its file is
-// gone once the run returns (TMPDIR set: no t.Parallel).
-func TestRunOutputIsTheProgramsAlone(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("TMPDIR", dir)
-	prog := `echo '{"a":1}'; (sleep 0.3; echo late) & exit 4`
-	out, _, exit, err := Local{}.Run(context.Background(), []string{"sh", "-c", prog}, nil)
-	if err != nil || exit != 4 || string(out) != "{\"a\":1}\n" {
-		t.Fatalf("got %q %d %v", out, exit, err)
-	}
-	if left, _ := filepath.Glob(filepath.Join(dir, "*")); len(left) != 0 {
-		t.Fatalf("left %q", left)
 	}
 }
 
@@ -219,7 +201,7 @@ func TestSSHRunWritesPinnedKey(t *testing.T) {
 		t.Fatalf("exit %d err %v", exit, err)
 	}
 	path, rest, _ := strings.Cut(string(out), "\n")
-	want := HostKeyAlias + " ssh-ed25519 " + edKey + "\n-rw-------\ncmd=" + ShellJoin([]string{"sh", "-c", OutputScript, "sh", "echo", "a b"}) + "\nsecret-on-stdin"
+	want := HostKeyAlias + " ssh-ed25519 " + edKey + "\n-rw-------\ncmd=echo 'a b'\nsecret-on-stdin"
 	if rest != want {
 		t.Fatalf("got %q\nwant %q", rest, want)
 	}
@@ -279,28 +261,4 @@ func runScript(s SSH, argv []string, stdin []byte) ([]byte, []byte, int, error) 
 		}
 		time.Sleep(time.Millisecond)
 	}
-}
-
-// A run its context cuts kills the program with its wrapper: none is left running.
-func TestLocalRunCutKillsTheProgram(t *testing.T) {
-	t.Parallel()
-	pid := filepath.Join(t.TempDir(), "pid")
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	_, _, _, err := Local{}.Run(ctx, []string{"sh", "-c", `echo $$ > "$1"; exec sleep 30`, "sh", pid}, nil)
-	if err == nil {
-		t.Fatal("a cut run is no error")
-	}
-	b, rerr := os.ReadFile(pid)
-	if rerr != nil {
-		t.Fatal(rerr)
-	}
-	p, _ := strconv.Atoi(strings.TrimSpace(string(b)))
-	for i := 0; i < 100; i++ {
-		if syscall.Kill(p, 0) != nil {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("the program %d still runs", p)
 }

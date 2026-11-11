@@ -184,6 +184,6 @@ func (s SSH) Run(ctx context.Context, argv []string, stdin []byte) ([]byte, []by
 	if err := os.WriteFile(kh, []byte(keys), 0o600); err != nil {
 		return nil, nil, -1, fmt.Errorf("ssh: known_hosts: %w", err)
 	}
-	full := s.Argv(kh, ShellJoin(append([]string{"sh", "-c", OutputScript, "sh"}, argv...)))
+	full := s.Argv(kh, ShellJoin(argv))
 	return run(ctx, exec.CommandContext(ctx, full[0], full[1:]...), stdin)
 }

@@ -52,10 +52,10 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 token() { head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 free_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])'; }
 
-step "OpenTofu $TOFU_VERSION, the provider"
 # shellcheck source=test/tofu.sh
 . "$REPO/test/tofu.sh"
-TOFU=$(tofu_path) || fail "OpenTofu $TOFU_VERSION"
+step "OpenTofu $TOFU_VERSION, the provider"
+TOFU=$(XDG_CACHE_HOME=$CACHE tofu_path) || fail "OpenTofu $TOFU_VERSION" # the cache's, not the run's own
 mkdir -p "$WORK/plugins" "$WORK/root"
 cp "$PROVIDER_BIN" "$WORK/plugins/terraform-provider-stowage"
 cat >"$WORK/tofurc" <<HCL

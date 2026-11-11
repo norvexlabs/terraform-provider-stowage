@@ -537,7 +537,7 @@ func TestKeptDescribePre035(t *testing.T) {
 func TestAuthKeyAndLoginGuards(t *testing.T) {
 	t.Parallel()
 	for host, want := range map[string]string{"docker.io": "https://index.docker.io/v1/", "Index.Docker.io": "https://index.docker.io/v1/",
-		"registry-1.docker.io": "https://index.docker.io/v1/", "mirror.lan:5000": "mirror.lan:5000", "ghcr.io": "ghcr.io"} {
+		"registry-1.docker.io": "registry-1.docker.io", "mirror.lan:5000": "mirror.lan:5000", "ghcr.io": "ghcr.io"} {
 		if got := AuthKey(host); got != want {
 			t.Errorf("%s: %q", host, got)
 		}
@@ -553,7 +553,8 @@ func TestAuthKeyAndLoginGuards(t *testing.T) {
 	}
 }
 
-// ResolveScript names a home reached through a symbolic link by the link's name, as $HOME does.
+// ResolveScript names a home reached through a symbolic link by the link's name, as $HOME does,
+// even with no PWD (an SSH run's); another directory as cd names it.
 func TestResolveScriptKeepsTheLinksName(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -567,5 +568,11 @@ func TestResolveScriptKeepsTheLinksName(t *testing.T) {
 	got, err := Docker{Runner: target.Local{}, WorkDir: link}.Resolve(context.Background())
 	if err != nil || got != link {
 		t.Fatalf("%q %v", got, err)
+	}
+	// "." in the home, as an SSH run starts: $HOME's name, though the process has no PWD.
+	out, _, exit, err := target.Local{}.Run(context.Background(), []string{"env", "-u", "PWD", "HOME=" + link, "sh", "-c",
+		`cd "$HOME" && unset PWD && sh -c "$0" sh .`, ResolveScript}, nil)
+	if err != nil || exit != 0 || strings.TrimSpace(string(out)) != link {
+		t.Fatalf("the home: %q %d %v", out, exit, err)
 	}
 }

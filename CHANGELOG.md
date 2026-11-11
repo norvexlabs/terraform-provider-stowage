@@ -40,8 +40,6 @@ follow [SemVer](https://semver.org/).
 - A create over an install already in the directory, and an imported install's first apply,
   refuse a configuration whose address, registry or registry CA is not the install's; a read
   records the install's own, so the next plan shows a drift as an error.
-- A program's standard output is its own: a process it started that outlives it adds nothing to
-  the result read; a local run cut by its timeout stops the program with its wrapper.
 - Reference documentation in `docs/`, generated from OpenTofu's own schema of the provider
   (`make docs`), never Terraform's.
 - A pull account's login keeps the Docker context in use, so the fetch reaches the daemon the

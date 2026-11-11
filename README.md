@@ -650,16 +650,15 @@ The system `ssh` runs with `BatchMode=yes`, `StrictHostKeyChecking=yes`, a priva
 `ConnectTimeout=30`, and with a key file `IdentitiesOnly=yes`. The user's `~/.ssh/config` still
 applies to everything else (a `ProxyJump`, for one). Output is kept up to 16 MiB per stream.
 
-Every program runs under `sh -c '<wrapper>' sh <program> <args>…` (on a remote target, that
-command line quoted for its login shell, a POSIX one): its standard output goes to a private file
-(`mktemp`, 0600, removed afterwards) printed once it exited, with its exit status, so a process it
-started that outlives it (a daemon, a container's attach) adds nothing to the document a reader
-takes; its standard input and error are its own. A run cut by its timeout kills the local `ssh`
-(on this machine, the wrapper and the program, a process group of their own), then waits at
-most 10 seconds for the error output to close; so does a program that exited while one it
-started holds that output, which keeps its exit status. It does not stop the program on a remote
-target, by design: an install or upgrade stopped halfway would be left half done, while one cut
-there goes on and the installer refuses another run until it ends (the next apply then says so).
+A run cut by its timeout kills the local `ssh` (or, on this machine, the program), then waits at
+most 10 seconds for its output to close; so does a program that exited while one it started holds
+the output, which keeps its exit status — what that process writes meanwhile is part of the output,
+which a `--json` reader then refuses as data after the object (an installer's verbs start none
+that write to it). The output is never staged in a file, so a secret a verb prints (`vm seed`'s
+host key) reaches no disk, and a verb whose machine reboots right after its result (the VM's
+upgrade and rollback) has it read before. A cut run does not stop the program on a remote target,
+by design: an install or upgrade stopped halfway would be left half done, while one cut there goes
+on and the installer refuses another run until it ends (the next apply then says so).
 The target's Docker daemon must trust a mirror's CA itself to fetch the installer image (its
 `/etc/docker/certs.d`): the provider never changes a daemon's configuration, which every
 container on the host shares.

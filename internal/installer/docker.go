@@ -57,11 +57,11 @@ __stowage_login() {
 `
 
 // AuthKey is the auths key the Docker client looks a registry's login up by: Docker Hub's
-// (docker.io, index.docker.io, registry-1.docker.io) is https://index.docker.io/v1/, any other
-// the host itself.
+// (docker.io, index.docker.io) is https://index.docker.io/v1/, any other the host itself
+// (registry-1.docker.io included, which neither the Docker CLI nor its libraries take for it).
 func AuthKey(host string) string {
 	switch strings.ToLower(host) {
-	case "docker.io", "index.docker.io", "registry-1.docker.io":
+	case "docker.io", "index.docker.io":
 		return "https://index.docker.io/v1/"
 	}
 	return host
@@ -315,9 +315,14 @@ func (d Docker) Fetch(ctx context.Context, installer string, login *Login) error
 	return nil
 }
 
-// ResolveScript prints its argument's directory as an absolute path, as the shell names it after
-// cd (logical: a home reached through a symbolic link keeps the link's name, as $HOME does).
-const ResolveScript = `cd -- "$1" && pwd -L`
+// ResolveScript prints its argument's directory as an absolute path: "." in the home (an SSH
+// run's start) as $HOME names it, a symbolic link's name kept (sshd sets no PWD, so pwd alone
+// would print the physical path); any other as the shell names it after cd.
+const ResolveScript = `if [ "$1" = . ] && [ -n "${HOME:-}" ] && [ "$(cd -- "$HOME" 2>/dev/null && pwd -P)" = "$(pwd -P)" ]; then
+  printf '%s\n' "$HOME"
+else
+  cd -- "$1" && pwd -L
+fi`
 
 // Resolve is the work directory as the target resolves it: an absolute path.
 func (d Docker) Resolve(ctx context.Context) (string, error) {

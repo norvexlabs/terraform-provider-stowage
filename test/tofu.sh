@@ -14,7 +14,11 @@ tofu_path() {
 			{ echo "FAIL: download OpenTofu" >&2; rm -rf "$tmp"; return 1; }
 		echo "$TOFU_SHA  $tmp/tofu.tgz" | sha256sum -c --quiet - ||
 			{ echo "FAIL: OpenTofu's archive is not $TOFU_SHA" >&2; rm -rf "$tmp"; return 1; }
-		tar -xzf "$tmp/tofu.tgz" -C "$tmp" tofu && mv -f "$tmp/tofu" "$tools/tofu"
+		if ! { tar -xzf "$tmp/tofu.tgz" -C "$tmp" tofu && mv -f "$tmp/tofu" "$tools/tofu"; }; then
+			echo "FAIL: unpacking OpenTofu into $tools" >&2
+			rm -rf "$tmp"
+			return 1
+		fi
 		rm -rf "$tmp"
 	fi
 	printf '%s\n' "$tools/tofu"
