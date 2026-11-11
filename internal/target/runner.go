@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -36,12 +37,30 @@ func (l Local) Run(ctx context.Context, argv []string, stdin []byte) ([]byte, []
 	if len(argv) == 0 {
 		return nil, nil, -1, errors.New("local: no program to run")
 	}
-	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd := exec.CommandContext(ctx, "sh", append([]string{"-c", OutputScript, "sh"}, argv...)...)
+	// The wrapper and the program in a process group of their own, killed together by the
+	// context: killing the wrapper alone would leave the program running.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 	if len(l.Unset) > 0 {
 		cmd.Env = without(os.Environ(), l.Unset)
 	}
 	return run(ctx, cmd, stdin)
 }
+
+// OutputScript runs its arguments as a program whose standard output goes to a private file
+// (0600, removed afterwards) printed once the program exited, with its exit status: a process the
+// program started that outlives it and keeps its standard output (a daemon, a container's
+// attach) cannot add to the output a reader takes as one document. Its standard input and error
+// are the program's own.
+const OutputScript = `__stowage_o=$(umask 077 && mktemp) || exit 125
+trap 'rm -f "$__stowage_o"' EXIT
+trap 'exit 130' HUP INT TERM
+__stowage_rc=0
+"$@" >"$__stowage_o" || __stowage_rc=$?
+cat "$__stowage_o"
+exit "$__stowage_rc"
+`
 
 // EnvFilter is a Runner on the machine running OpenTofu that can run without some of its
 // environment's variables: WithoutEnv is that Runner, leaving the keys named out.

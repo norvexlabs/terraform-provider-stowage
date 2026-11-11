@@ -29,10 +29,4 @@ installer's machine interface and decides nothing itself. A finished item is del
 
 ## Could
 
-- **A run that outlives its program** (a child holding the output) returns what that child wrote
-  too, which a `--json` reader then refuses as data after the object.
-- **A run cut by its timeout leaves the program on the target running** (no tty, no SIGHUP over
-  ssh); stopping it would need the installer's own cancellation.
-- A registry CA for the installer image's own fetch (`/etc/docker/certs.d` on the target), today
-  the target's Docker daemon's own configuration.
 - `stowage_install` data source reading `status --json` without managing the install.
