@@ -392,26 +392,6 @@ func TestUpdate(t *testing.T) {
 	}
 }
 
-func TestOtherTargetsAreNotYet(t *testing.T) {
-	t.Parallel()
-	h := newHarness(t, nil)
-	for name, config := range map[string]tftypes.Value{
-		"vm": fill(h.typ, map[string]tftypes.Value{"vm": h.block("vm", map[string]tftypes.Value{
-			"host": str("vm.example"), "user": str("ops"), "known_hosts_line": str(hostLine), "version": str("1.2.0")})}),
-	} {
-		if d := errorsOf(h.validate(config)); d != "" {
-			t.Fatalf("%s: %s", name, d)
-		}
-		p := h.plan(nil, config)
-		if got := errorsOf(h.apply(nil, p.PlannedState, config).Diagnostics); !strings.Contains(got, "is not implemented yet") {
-			t.Errorf("%s: got %q", name, got)
-		}
-	}
-	if len(h.fake.calls) != 0 {
-		t.Fatalf("the target was called: %q", h.fake.ops())
-	}
-}
-
 // The kept installer's describe runs before uninstall: one without the machine interface stops
 // there, naming the Stowage release that has it, and no install directory is an install gone.
 func TestDeleteDescribesTheKeptInstallerFirst(t *testing.T) {

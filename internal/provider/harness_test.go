@@ -2,8 +2,10 @@ package provider
 
 import (
 	"context"
+	"fmt"
 	"maps"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -218,13 +220,16 @@ func (f *fake) ops() []string {
 
 // harness drives the provider through the plugin protocol, as OpenTofu does.
 type harness struct {
-	t      *testing.T
-	srv    tfprotov6.ProviderServer
-	typ    tftypes.Object
-	ptyp   tftypes.Object
-	fake   *fake
-	schema *tfprotov6.Schema
-	tmp    string // where Kubernetes runs make their private directories
+	t *testing.T
+	// failedPlans are the planned states of plans that failed, which apply refuses.
+	mu          sync.Mutex
+	failedPlans map[*tfprotov6.DynamicValue]bool
+	srv         tfprotov6.ProviderServer
+	typ         tftypes.Object
+	ptyp        tftypes.Object
+	fake        *fake
+	schema      *tfprotov6.Schema
+	tmp         string // where Kubernetes runs make their private directories
 }
 
 func newHarness(t *testing.T, providerConfig map[string]tftypes.Value) *harness {
@@ -368,14 +373,100 @@ func (h *harness) plan(prior *tfprotov6.DynamicValue, config tftypes.Value) *tfp
 		prior = &p
 	}
 	cfg := h.dv(h.typ, config)
-	proposed := h.dv(h.typ, h.withoutWriteOnly(config))
+	proposed := h.dv(h.typ, h.proposedNew(h.value(prior), h.withoutWriteOnly(config)))
 	resp, err := h.srv.PlanResourceChange(context.Background(), &tfprotov6.PlanResourceChangeRequest{
 		TypeName: "stowage_install", PriorState: prior, ProposedNewState: &proposed, Config: &cfg,
 	})
 	if err != nil {
 		h.t.Fatal(err)
 	}
+	if errorsOf(resp.Diagnostics) != "" && resp.PlannedState != nil {
+		h.mu.Lock()
+		if h.failedPlans == nil {
+			h.failedPlans = map[*tfprotov6.DynamicValue]bool{}
+		}
+		h.failedPlans[resp.PlannedState] = true // OpenTofu applies no plan that failed
+		h.mu.Unlock()
+	}
 	return resp
+}
+
+// proposedNew is the proposed new state as OpenTofu makes it: config, with prior's value for each
+// computed attribute config leaves null, at the top and in each nested block both hold.
+func (h *harness) proposedNew(prior, config tftypes.Value) tftypes.Value {
+	if prior.IsNull() || config.IsNull() {
+		return config
+	}
+	v, err := mergeComputed(h.schema.Block, prior, config)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return v
+}
+
+// mergeComputed is config with prior's computed values, as proposedNew says; a nesting the harness
+// does not model (set or map blocks, nested attributes but single) is an error, never a silent
+// proposal OpenTofu would not make.
+func mergeComputed(b *tfprotov6.SchemaBlock, prior, config tftypes.Value) (tftypes.Value, error) {
+	var pv, cv map[string]tftypes.Value
+	if prior.As(&pv) != nil || config.As(&cv) != nil {
+		return config, nil
+	}
+	out := map[string]tftypes.Value{}
+	for k, v := range cv {
+		out[k] = v
+	}
+	for _, a := range b.Attributes {
+		switch {
+		case a.NestedType != nil && a.NestedType.Nesting != tfprotov6.SchemaObjectNestingModeSingle:
+			return config, fmt.Errorf("the harness models no %v nested attribute (%s)", a.NestedType.Nesting, a.Name)
+		case a.Computed && cv[a.Name].IsNull():
+			out[a.Name] = pv[a.Name]
+		case a.NestedType != nil && !cv[a.Name].IsNull() && !pv[a.Name].IsNull():
+			m, err := mergeComputed(&tfprotov6.SchemaBlock{Attributes: a.NestedType.Attributes}, pv[a.Name], cv[a.Name])
+			if err != nil {
+				return config, err
+			}
+			out[a.Name] = m
+		}
+	}
+	for _, nb := range b.BlockTypes {
+		c, pr := cv[nb.TypeName], pv[nb.TypeName]
+		switch nb.Nesting {
+		case tfprotov6.SchemaNestedBlockNestingModeSingle, tfprotov6.SchemaNestedBlockNestingModeList:
+		default:
+			return config, fmt.Errorf("the harness models no %v block (%s)", nb.Nesting, nb.TypeName)
+		}
+		if c.IsNull() || pr.IsNull() || !c.IsKnown() || !pr.IsKnown() {
+			continue
+		}
+		switch nb.Nesting {
+		case tfprotov6.SchemaNestedBlockNestingModeSingle:
+			m, err := mergeComputed(nb.Block, pr, c)
+			if err != nil {
+				return config, err
+			}
+			out[nb.TypeName] = m
+		case tfprotov6.SchemaNestedBlockNestingModeList:
+			// Elements correspond by index, as OpenTofu proposes them.
+			var ce, pe []tftypes.Value
+			if c.As(&ce) == nil && pr.As(&pe) == nil {
+				merged := make([]tftypes.Value, len(ce))
+				for i := range ce {
+					merged[i] = ce[i]
+					if i < len(pe) {
+						m, err := mergeComputed(nb.Block, pe[i], ce[i])
+						if err != nil {
+							return config, err
+						}
+						merged[i] = m
+					}
+				}
+				out[nb.TypeName] = tftypes.NewValue(c.Type(), merged)
+			}
+		}
+	}
+	return tftypes.NewValue(config.Type(), out), nil
 }
 
 func (h *harness) apply(prior *tfprotov6.DynamicValue, planned *tfprotov6.DynamicValue, config tftypes.Value) *tfprotov6.ApplyResourceChangeResponse {
@@ -384,13 +475,39 @@ func (h *harness) apply(prior *tfprotov6.DynamicValue, planned *tfprotov6.Dynami
 		p := h.dv(h.typ, tftypes.NewValue(h.typ, nil))
 		prior = &p
 	}
+	// The final plan, as OpenTofu makes it before an apply: config known now. Its errors are the
+	// apply's, nothing applied; a value the first plan knew must stand in it.
+	validated := h.validate(config)
+	if errorsOf(validated) != "" {
+		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: validated, NewState: prior}
+	}
+	final := h.plan(prior, config)
+	if errorsOf(final.Diagnostics) != "" {
+		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: append(validated, final.Diagnostics...), NewState: prior}
+	}
+	h.mu.Lock()
+	failed := h.failedPlans[planned]
+	h.mu.Unlock()
+	switch {
+	case planned == nil:
+		return &tfprotov6.ApplyResourceChangeResponse{NewState: prior, Diagnostics: []*tfprotov6.Diagnostic{{
+			Severity: tfprotov6.DiagnosticSeverityError, Summary: "harness: no plan to apply"}}}
+	case failed:
+		return &tfprotov6.ApplyResourceChangeResponse{NewState: prior, Diagnostics: []*tfprotov6.Diagnostic{{
+			Severity: tfprotov6.DiagnosticSeverityError, Summary: "harness: the plan applied failed", Detail: "OpenTofu applies no plan that failed."}}}
+	}
+	for _, e := range h.inconsistencies(planned, final.PlannedState, false) {
+		h.t.Errorf("inconsistent final plan: %s", e)
+	}
 	cfg := h.dv(h.typ, config)
 	resp, err := h.srv.ApplyResourceChange(context.Background(), &tfprotov6.ApplyResourceChangeRequest{
-		TypeName: "stowage_install", PriorState: prior, PlannedState: planned, Config: &cfg,
+		TypeName: "stowage_install", PriorState: prior, PlannedState: final.PlannedState, Config: &cfg,
 	})
 	if err != nil {
 		h.t.Fatal(err)
 	}
+	h.consistent(final.PlannedState, resp.NewState, errorsOf(resp.Diagnostics) == "")
+	resp.Diagnostics = append(append(validated, final.Diagnostics...), resp.Diagnostics...) // OpenTofu shows them all
 	return resp
 }
 
@@ -421,6 +538,8 @@ func (h *harness) destroy(state *tfprotov6.DynamicValue) *tfprotov6.ApplyResourc
 	if err != nil {
 		h.t.Fatal(err)
 	}
+	// A destroy that succeeds returns no state; one that fails, a wholly known one.
+	h.consistent(&null, resp.NewState, errorsOf(resp.Diagnostics) == "")
 	return resp
 }
 
@@ -446,10 +565,7 @@ func (h *harness) read(state *tfprotov6.DynamicValue) *tfprotov6.ReadResourceRes
 // attrs decodes a state into its attributes.
 func (h *harness) attrs(state *tfprotov6.DynamicValue) map[string]tftypes.Value {
 	h.t.Helper()
-	v, err := state.Unmarshal(h.typ)
-	if err != nil {
-		h.t.Fatal(err)
-	}
+	v := h.value(state)
 	out := map[string]tftypes.Value{}
 	if v.IsNull() {
 		return nil
@@ -470,4 +586,131 @@ func asString(t *testing.T, v tftypes.Value) string {
 		t.Fatal(err)
 	}
 	return s
+}
+
+// consistent holds an apply to OpenTofu's rules, failing the test on a breach: on success,
+// inconsistencies; on an error, the state it returns is still wholly known.
+func (h *harness) consistent(planned, applied *tfprotov6.DynamicValue, ok bool) {
+	h.t.Helper()
+	for _, e := range h.applyBreaches(planned, applied, ok) {
+		h.t.Error(e)
+	}
+}
+
+// applyBreaches is what consistent fails on.
+func (h *harness) applyBreaches(planned, applied *tfprotov6.DynamicValue, ok bool) []string {
+	h.t.Helper()
+	if applied == nil || h.value(applied).IsNull() {
+		if ok && planned != nil && !h.value(planned).IsNull() {
+			return []string{"invalid result: a create or update succeeded with no state"}
+		}
+		return nil
+	}
+	if ok {
+		return h.inconsistencies(planned, applied, true)
+	}
+	return unknowns(h.value(applied))
+}
+
+func (h *harness) value(d *tfprotov6.DynamicValue) tftypes.Value {
+	h.t.Helper()
+	v, err := d.Unmarshal(h.typ)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return v
+}
+
+// unknowns is the breach of a state returned holding an unknown value.
+func unknowns(v tftypes.Value) []string {
+	if !v.IsFullyKnown() {
+		return []string{fmt.Sprintf("invalid result: the applied state holds an unknown value: %v", v)}
+	}
+	return nil
+}
+
+// inconsistencies are the breaches of OpenTofu's rules against an earlier plan: every value it
+// knew — at any depth, a collection's length included, a set by its length alone — is the one
+// in later; and later is wholly known when it is an applied state (known).
+func (h *harness) inconsistencies(planned, later *tfprotov6.DynamicValue, applied bool) []string {
+	h.t.Helper()
+	return breaches(h.value(planned), h.value(later), applied)
+}
+
+// breaches is inconsistencies on decoded values.
+func breaches(pv, av tftypes.Value, applied bool) []string {
+	var out []string
+	if applied {
+		out = unknowns(av)
+	}
+	_ = tftypes.Walk(pv, func(p *tftypes.AttributePath, v tftypes.Value) (bool, error) {
+		if !v.IsKnown() {
+			return false, nil // planned unknown: any value goes
+		}
+		got, rest, err := tftypes.WalkAttributePath(av, p)
+		g, isValue := got.(tftypes.Value)
+		if err != nil || len(rest.Steps()) > 0 || !isValue {
+			out = append(out, fmt.Sprintf("inconsistent result: %s planned %v, absent", p, v))
+			return false, nil
+		}
+		if v.IsFullyKnown() && !v.Type().Is(tftypes.Object{}) || v.IsNull() {
+			if !v.Equal(g) {
+				out = append(out, fmt.Sprintf("inconsistent result: %s planned %v, then %v", p, v, g))
+			}
+			return false, nil
+		}
+		if v.Type().Is(tftypes.Set{}) {
+			out = append(out, setBreaches(p, v, g)...)
+			return false, nil
+		}
+		// A block, or a collection known in part: its length is known, then each element.
+		if n, m := elems(v), elems(g); n != m {
+			out = append(out, fmt.Sprintf("inconsistent result: %s planned %d elements, then %d", p, n, m))
+		}
+		return true, nil
+	})
+	return out
+}
+
+// setBreaches holds a set known in part to OpenTofu's rule: every planned element — known in part
+// included — is compatible with an applied one, every applied element with a planned one, and the
+// applied set is no longer than planned (unknown elements may coalesce).
+func setBreaches(p *tftypes.AttributePath, planned, applied tftypes.Value) []string {
+	var pe, ae []tftypes.Value
+	if planned.As(&pe) != nil || applied.As(&ae) != nil {
+		return []string{fmt.Sprintf("inconsistent result: %s planned %v, then %v", p, planned, applied)}
+	}
+	compatible := func(x, y tftypes.Value) bool { return len(breaches(x, y, false)) == 0 }
+	var out []string
+	if len(ae) > len(pe) {
+		out = append(out, fmt.Sprintf("inconsistent result: %s planned %d elements, then %d", p, len(pe), len(ae)))
+	}
+	for _, e := range pe {
+		if !slices.ContainsFunc(ae, func(a tftypes.Value) bool { return compatible(e, a) }) {
+			out = append(out, fmt.Sprintf("inconsistent result: %s planned element %v does not correlate with any applied", p, e))
+		}
+	}
+	for _, a := range ae {
+		if !slices.ContainsFunc(pe, func(e tftypes.Value) bool { return compatible(e, a) }) {
+			out = append(out, fmt.Sprintf("inconsistent result: %s applied element %v was not planned", p, a))
+		}
+	}
+	return out
+}
+
+// elems is the number of elements of a known collection, -1 for anything else.
+func elems(v tftypes.Value) int {
+	switch {
+	case v.Type().Is(tftypes.Map{}):
+		var m map[string]tftypes.Value
+		if v.As(&m) == nil {
+			return len(m)
+		}
+	case v.Type().Is(tftypes.List{}), v.Type().Is(tftypes.Set{}):
+		var l []tftypes.Value
+		if v.As(&l) == nil {
+			return len(l)
+		}
+	}
+	return -1
 }

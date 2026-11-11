@@ -7,6 +7,30 @@ follow [SemVer](https://semver.org/).
 
 ### Added
 
+- `stowage_vm_seed`: a new Kairos VM's first-boot material (`vm seed --json` of an installer, run on
+  the machine running OpenTofu), generated once: the cloud-config and the one-time SSH host key
+  (both sensitive), its `known_hosts` line and fingerprint, the disk each platform boots, the
+  secret inputs the first install waits for. A seed with the `byo` TLS mode is refused at plan
+  time, naming what to do instead. An example makes a TrueNAS VM of it with Stowage's module.
+- `stowage_install` on a Kairos VM (`vm` block): its first install over SSH once the VM's first
+  boot settled, pinned to the seed's one-time key, the secret inputs and given values on standard
+  input, of the release the VM's OS carries (another `vm.version` is refused at create); then the
+  VM's own host key read, the one-time key retired, and the VM's own key alone accepted from then
+  on. `secrets_wo` is refused on a VM: a seed cannot make its first boot wait. A change of inputs
+  re-runs the install; a new `vm.version` upgrades the VM and follows its reboot until the health
+  gate judged it, a fallback or a kept failed boot being an error that saves the release the VM
+  runs; `previous.version` with `allow_rollback` rolls it back. Read reports the release the VM
+  runs; destroy forgets the install; import takes `vm:<host>/<short>-stow`. `vm.short_name` and
+  `vm.channel` are first-install only, a channel other than the VM's refused; a VM without the
+  installer state names (a release that renamed it) is told apart from another failure, with the
+  route to take the install over.
+- A first install still running when the create's timeout ends says so, whatever step the
+  deadline cut.
+- An imported install's first apply records the provider's `registry` as a planned change, no
+  longer an inconsistent result.
+- A failed `describe` names an installer older than Stowage 0.34.0 only when it exits 1 (an
+  unknown command), on Docker and on the VM.
+
 - `stowage_install` on a Docker host, reached over SSH with its host key pinned or on the machine
   running OpenTofu: create (the installer fetched on the target by digest, its `describe` read,
   the install run unattended), read (`status --json`, the release that runs replacing the one

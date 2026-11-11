@@ -9,7 +9,6 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
-
 )
 
 const (
@@ -800,7 +799,6 @@ func TestCreateOverAnExistingInstall(t *testing.T) {
 	}
 }
 
-
 // An imported state holds registry null until its first apply records the provider's: the plan
 // says so (unknown), or OpenTofu refuses the apply's result as inconsistent with it.
 func TestImportedPlanLeavesTheRegistryToTheApply(t *testing.T) {
@@ -821,7 +819,6 @@ func TestImportedPlanLeavesTheRegistryToTheApply(t *testing.T) {
 		t.Fatalf("planned registry %v, applied %v", planned, got)
 	}
 }
-
 
 // A null element is refused by key at validation; an unknown one (known at apply) is not, and a
 // port out of range is refused at apply once known, before anything runs.

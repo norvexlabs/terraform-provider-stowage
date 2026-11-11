@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -155,7 +156,7 @@ func TestK8sCreate(t *testing.T) {
 	if got := h.fake.ops(); !slices.Equal(got, []string{"tools", "fetch", "k8s-describe", "k8s-status", "k8s-install", "k8s-status"}) {
 		t.Fatalf("calls %q", got)
 	}
-	if c := h.fake.conns[0]; c != (Connection{}) {
+	if c := h.fake.conns[0]; !reflect.DeepEqual(c, Connection{}) {
 		t.Fatalf("a Kubernetes run is on this machine, not %+v", c)
 	}
 	install := h.fake.callsOf("k8s-install")[0]
