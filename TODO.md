@@ -24,7 +24,3 @@ installer's machine interface and decides nothing itself. A finished item is del
   (no port, no `~/.ssh/config`), so the provider runs the steps Stowage's README documents
   itself (the key's file and drop-in removed, the `.retired` mark, sshd reloaded, the recovery and
   live systems refused): a copy of that rule, to drop once the VM's verb exists.
-
-## Could
-
-- `stowage_install` data source reading `status --json` without managing the install.

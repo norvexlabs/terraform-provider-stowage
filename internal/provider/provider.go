@@ -198,5 +198,5 @@ func (p *stowageProvider) Resources(context.Context) []func() resource.Resource 
 }
 
 func (p *stowageProvider) DataSources(context.Context) []func() datasource.DataSource {
-	return nil
+	return []func() datasource.DataSource{newInstallDataSource}
 }

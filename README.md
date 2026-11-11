@@ -667,6 +667,29 @@ The target's Docker daemon must trust a mirror's CA itself to fetch the installe
 `/etc/docker/certs.d`): the provider never changes a daemon's configuration, which every
 container on the host shares.
 
+## Data source `stowage_install`
+
+Reads an install's `status --json` without managing it: a Docker install by the installer it keeps
+(`<work_dir>/<name>/<short_name>-stow status --json`, through the same scripts as the resource's
+read) or a VM by its OS bundle's (`<short_name>-stow status --json`, as the SSH user). Nothing on
+the target changes, and no installer image is fetched: a Kubernetes release, whose read needs one,
+is read by the resource. Exactly one of the `docker` and `vm` blocks (`One target`); no install in
+the directory (`No install`) and another project's (`Another project's install`) are errors.
+
+| Argument | | |
+|---|---|---|
+| `name`, `short_name` | required | The project's name (the install directory `<name>/` on Docker; compared with the status's) and the installer's short name, one path element each. |
+| `docker` | block | `host`, `port`, `user`, `private_key_file`, `known_hosts_line`, `work_dir`, as the resource's `docker` block (left out, `host` is this machine and `work_dir` the home). |
+| `vm` | block | `host`, `port`, `user`, `private_key_file`, `known_hosts_line` (the VM's own key), as the resource's `vm` block. |
+
+| Attribute | |
+|---|---|
+| `id` | `<work_dir>/<name>` on Docker, `vm:<host>/<short_name>-stow` on a VM. |
+| `installed`, `previous` | `{version, revision, installer}` (`installer` null on a VM); null before the first install, and when the install keeps no release for `rollback`. |
+| `channel`, `status` | As the resource's. |
+| `inputs` | The input keys the install records, sorted, never a value; null when the installer does not tell. |
+| `registry`, `address`, `registry_ca_digest` | What the first install recorded; null when the status gives none. |
+
 ## Resource `stowage_vm_seed`
 
 A new Kairos VM's first-boot material: `vm seed --json` of the release an installer carries, run
