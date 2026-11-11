@@ -254,7 +254,8 @@ func TestMovedSecretAtPlanOnEveryTarget(t *testing.T) {
 	t.Parallel()
 	vh, _ := newVMHarness(t)
 	vstate := vh.create(vh.vmConfig("1.1.0", map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@b"})}))
-	if got := errorsOf(vh.plan(vstate, vh.vmConfig("1.1.0", map[string]tftypes.Value{"secret_inputs_wo": strMap(map[string]string{"ADMIN_EMAIL": "c@d"})})).Diagnostics); !strings.Contains(got, "an input moved to secret_inputs_wo") {
+	if got := errorsOf(vh.plan(vstate, vh.vmConfig("1.1.0", map[string]tftypes.Value{"inputs": tftypes.NewValue(tftypes.Map{ElementType: tftypes.String}, nil),
+		"secret_inputs_wo": strMap(map[string]string{"ADMIN_EMAIL": "c@d"})})).Diagnostics); !strings.Contains(got, "an input moved to secret_inputs_wo") {
 		t.Errorf("vm: %q", got)
 	}
 	kh := k8sHarness(t, nil)
