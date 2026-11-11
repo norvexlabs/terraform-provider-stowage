@@ -1,5 +1,5 @@
 # Docker is the only host requirement: every target runs the Go toolchain in a container.
-GO_VERSION ?= 1.27.3
+GO_VERSION ?= 1.27.4
 VERSION    ?= $(shell sed -n 's/^## \[\([^]]*\)\].*/\1/p' CHANGELOG.md | head -n1)
 BUILD      := DOCKER_BUILDKIT=1 docker buildx build --build-arg GO_VERSION=$(GO_VERSION) --build-arg VERSION=$(VERSION)
 # Module and build caches persist on the host disk, owned by the caller.
@@ -8,7 +8,7 @@ DOCKER_GO  := docker run --rm --memory 4g -u $(shell id -u):$(shell id -g) -e HO
               -e GOMODCACHE=/cache/mod -e GOFLAGS=-trimpath -v $(GOCACHE_DIR):/cache -v $(CURDIR):/src -w /src
 GO         := $(DOCKER_GO) golang:$(GO_VERSION)-bookworm
 
-.PHONY: all check build release-check test hooks-test fmt tidy docs shell hooks clean
+.PHONY: all check build release-check test hooks-test acc-docker fmt tidy docs shell hooks clean
 
 all: check build
 
@@ -30,6 +30,10 @@ release-check: | $(GOCACHE_DIR)    ## .goreleaser.yml checked, a snapshot releas
 
 test: | $(GOCACHE_DIR)             ## fast loop: unit tests only, no race detector; never the gate
 	$(GO) go test -count=1 -p 4 ./...
+
+# STOWAGE_SRC: a Stowage checkout (>= 0.34.0) with ./bin/stowage built; its examples/minimal is shipped.
+acc-docker: build ## acceptance: the Docker target against a real installer, through OpenTofu (test/acc-docker.sh)
+	STOWAGE_SRC="$(STOWAGE_SRC)" bash test/acc-docker.sh
 
 hooks-test:       ## the hooks' branches (test/hooks.sh), on this machine; make check runs it too
 	bash test/hooks.sh

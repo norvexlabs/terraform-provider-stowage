@@ -112,20 +112,35 @@ func (r *installResource) ValidateConfig(ctx context.Context, req resource.Valid
 		resp.Diagnostics.AddAttributeError(path.Root("kubernetes").AtName("namespace"), "kubernetes.namespace is required", "Give the namespace the release lives in.")
 	}
 
-	inputs := stringMap(ctx, m.Inputs, &resp.Diagnostics)
-	for _, k := range slices.Sorted(maps.Keys(inputs)) {
+	// The configuration's maps are read by key: a value may not be known yet (a write-only one
+	// from an ephemeral variable, one computed from another resource); a null one is refused.
+	for _, c := range []struct {
+		name string
+		m    types.Map
+	}{{"inputs", m.Inputs}, {"secret_inputs_wo", m.SecretInputsWO}, {"domains", m.Domains}, {"ports", m.Ports}} {
+		for _, k := range mapKeys(c.m) {
+			if c.m.Elements()[k].IsNull() {
+				p := path.Root(c.name).AtMapKey(k)
+				if c.name == "secret_inputs_wo" {
+					p = path.Root(c.name) // a write-only map's keys are not shown
+				}
+				resp.Diagnostics.AddAttributeError(p, c.name+"."+k+" is null", fmt.Sprintf("Give %s.%s a value, or take it out.", c.name, k))
+			}
+		}
+	}
+	inputs := mapKeys(m.Inputs)
+	for _, k := range inputs {
 		if !installer.ValidInputKey(k) {
 			resp.Diagnostics.AddAttributeError(path.Root("inputs").AtMapKey(k), "not an input key",
 				fmt.Sprintf("%q: an input key is a letter or _, then letters, digits or _ (and not tls).", k))
 		}
 	}
-	secrets := stringMap(ctx, m.SecretInputsWO, &resp.Diagnostics)
-	for _, k := range slices.Sorted(maps.Keys(secrets)) {
+	for _, k := range mapKeys(m.SecretInputsWO) {
 		if !installer.ValidInputKey(k) {
 			resp.Diagnostics.AddAttributeError(path.Root("secret_inputs_wo"), "not an input key",
 				fmt.Sprintf("%q: an input key is a letter or _, then letters, digits or _ (and not tls).", k))
 		}
-		if _, ok := inputs[k]; ok {
+		if slices.Contains(inputs, k) {
 			resp.Diagnostics.AddAttributeError(path.Root("inputs").AtMapKey(k), "input given twice",
 				fmt.Sprintf("%s is in inputs and in secret_inputs_wo: keep it in one.", k))
 		}
@@ -134,23 +149,28 @@ func (r *installResource) ValidateConfig(ctx context.Context, req resource.Valid
 		resp.Diagnostics.AddAttributeWarning(path.Root("secret_inputs_wo_version"), "secret_inputs_wo_version is not set",
 			"A write-only value is never compared: without a version to bump, a later change of secret_inputs_wo is never applied.")
 	}
-	for _, k := range slices.Sorted(maps.Keys(stringMap(ctx, m.Domains, &resp.Diagnostics))) {
+	for _, k := range mapKeys(m.Domains) {
 		if !installer.ValidRoute(k) {
 			resp.Diagnostics.AddAttributeError(path.Root("domains").AtMapKey(k), "not a route name", fmt.Sprintf("%q is not a route name.", k))
 		}
 	}
-	if known(m.Ports) {
-		ports := map[string]int64{}
-		resp.Diagnostics.Append(m.Ports.ElementsAs(ctx, &ports, false)...)
-		for _, k := range slices.Sorted(maps.Keys(ports)) {
-			if !installer.ValidRoute(k) {
-				resp.Diagnostics.AddAttributeError(path.Root("ports").AtMapKey(k), "not a route name", fmt.Sprintf("%q is not a route name.", k))
-			}
-			if p := ports[k]; p < 1 || p > 65535 {
-				resp.Diagnostics.AddAttributeError(path.Root("ports").AtMapKey(k), "port out of range", fmt.Sprintf("%d is not a port (1-65535).", p))
-			}
+	for _, k := range mapKeys(m.Ports) {
+		if !installer.ValidRoute(k) {
+			resp.Diagnostics.AddAttributeError(path.Root("ports").AtMapKey(k), "not a route name", fmt.Sprintf("%q is not a route name.", k))
+		}
+		if p, ok := m.Ports.Elements()[k].(types.Int64); ok && known(p) && (p.ValueInt64() < 1 || p.ValueInt64() > 65535) {
+			resp.Diagnostics.AddAttributeError(path.Root("ports").AtMapKey(k), "port out of range", fmt.Sprintf("%d is not a port (1-65535).", p.ValueInt64()))
 		}
 	}
+}
+
+// mapKeys is a known map's keys, sorted, whether or not each value is known; nil for a null or
+// unknown map.
+func mapKeys(m types.Map) []string {
+	if !known(m) {
+		return nil
+	}
+	return slices.Sorted(maps.Keys(m.Elements()))
 }
 
 func validateSSH(p path.Path, host, user, line, key types.String, port types.Int64, localAllowed bool, diags *diag.Diagnostics) {
@@ -260,6 +280,9 @@ func (r *installResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 		unknowns = []string{"version", "revision", "channel", "status", "previous", "short_name"}
 	case len(remoteChange(&plan, &state)) > 0:
 		unknowns = []string{"status"} // a re-run may finish a first install that failed
+	}
+	if imported(&state) {
+		unknowns = append(unknowns, "registry") // the first apply records the provider's
 	}
 	if len(unknowns) > 0 {
 		for _, a := range unknowns {
@@ -676,26 +699,56 @@ func (r *installResource) Read(ctx context.Context, req resource.ReadRequest, re
 		return
 	}
 	applyStatus(&m, st, true)
-	resp.Diagnostics.Append(dropUnrecorded(ctx, &m, st)...)
+	resp.Diagnostics.Append(dropUnrecorded(ctx, &m, st, d.KeptDescribe)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }
 
 // dropUnrecorded removes from m's inputs a key given a value that the install does not record,
-// so the next plan shows it given again. Nothing is dropped while the recorded keys are unknown.
-func dropUnrecorded(ctx context.Context, m *installModel, st *installer.Status) diag.Diagnostics {
+// so the next plan shows it given again. status --json lists the recorded inputs among those the
+// running release declares: a key it does not list is dropped only when the running release
+// declares it (describe, its kept installer's, read only when a key would go) — after a rollback,
+// an input only the newer release declares stays recorded, unlisted. Nothing is dropped while the
+// recorded keys are unknown, or when describe fails (a warning).
+func dropUnrecorded(ctx context.Context, m *installModel, st *installer.Status, describe func(context.Context) (*installer.Describe, error)) diag.Diagnostics {
 	var diags diag.Diagnostics
 	if st.Inputs == nil || !known(m.Inputs) {
 		return nil
 	}
 	inputs := stringMap(ctx, m.Inputs, &diags)
-	kept := map[string]string{}
-	for k, v := range inputs {
-		if v == "" || slices.Contains(*st.Inputs, k) {
-			kept[k] = v
+	unlisted := []string{}
+	for _, k := range slices.Sorted(maps.Keys(inputs)) {
+		if inputs[k] != "" && !slices.Contains(*st.Inputs, k) {
+			unlisted = append(unlisted, k)
+		}
+	}
+	if len(unlisted) == 0 {
+		return diags
+	}
+	running, err := describe(ctx)
+	why := ""
+	switch {
+	case err != nil:
+		why = fmt.Sprintf("describing the kept installer failed: %v", err)
+	case running == nil:
+		why = "the install directory is gone since status read it"
+	case st.Installed == nil || running.Release.Version != st.Installed.Version || running.Release.Revision != st.Installed.Revision:
+		why = fmt.Sprintf("the kept installer carries %s %s (revision %d), not the release installed", running.Name, running.Release.Version, running.Release.Revision)
+	}
+	if why != "" {
+		diags.AddWarning("Cannot tell the inputs the install records",
+			fmt.Sprintf("status --json does not list %s, and %s, so state keeps them.", strings.Join(unlisted, ", "), why))
+		return diags
+	}
+	kept := maps.Clone(inputs)
+	for _, k := range unlisted {
+		if running.Declares(k) {
+			delete(kept, k)
 		}
 	}
 	if len(kept) != len(inputs) {
-		m.Inputs, diags = types.MapValueFrom(ctx, types.StringType, kept)
+		var d diag.Diagnostics
+		m.Inputs, d = types.MapValueFrom(ctx, types.StringType, kept)
+		diags.Append(d...)
 	}
 	return diags
 }
@@ -1099,6 +1152,10 @@ func portMap(ctx context.Context, m types.Map, diags *diag.Diagnostics) map[stri
 	diags.Append(m.ElementsAs(ctx, &nums, false)...)
 	out := map[string]string{}
 	for k, n := range nums {
+		// Checked here too: a port unknown when the configuration was validated is known now.
+		if n < 1 || n > 65535 {
+			diags.AddAttributeError(path.Root("ports").AtMapKey(k), "port out of range", fmt.Sprintf("%d is not a port (1-65535).", n))
+		}
 		out[k] = strconv.FormatInt(n, 10)
 	}
 	return out

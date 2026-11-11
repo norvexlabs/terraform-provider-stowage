@@ -6,10 +6,6 @@ installer's machine interface and decides nothing itself. A finished item is del
 
 ## Must — the first release
 
-1. **Prove the Docker target against a real installer** (Stowage ≥ 0.34.0, with item 6): create,
-   update (re-run, upgrade, rollback), delete — a refusal (exit 3) and the partial state an
-   update saves before a failed or refused upgrade included, which OpenTofu accepts with the
-   error. Unit tests drive the results as Stowage's `printResult` prints them.
 2. **Plan-time dry run** (P1, opt-in): an upgrade's `--dry-run` over SSH, skipped while the target
    does not exist yet.
 3. **Kubernetes target** (P2): `k8s install|upgrade|uninstall --json` run locally (kubeconfig
@@ -21,14 +17,22 @@ installer's machine interface and decides nothing itself. A finished item is del
    `installed` the target; a fallback or a failed boot an error saving the release that runs).
 5. **Docs** (P4): `make docs` (tfplugindocs) into `docs/` from the schema and `examples/`; needs a
    way to give tfplugindocs OpenTofu's schema instead of downloading Terraform.
-6. **Acceptance scripts against `tofu`** (P4): sshd + Docker-in-Docker for the Docker target,
-   kind for Kubernetes, one TrueNAS VM; run in Docker like the gates, with a memory cap.
+6. **Acceptance scripts against `tofu`** (P4): kind for Kubernetes, one TrueNAS VM, beside the
+   Docker target's `test/acc-docker.sh` (`make acc-docker`); with memory caps.
 7. **First release** (P5): the public repository `norvexlabs/terraform-provider-stowage`, created
    by the maintainer with the org's GitHub App and its ruleset (pushes as the app only, like
    Stowage); a GPG key for the release (`GPG_FINGERPRINT`); a release workflow (GoReleaser
    on a pushed tag); registry submission by hand.
 
 ## Should
+
+- **`status --json` lists only the running release's inputs**: Stowage lists the recorded inputs
+  among those the running release declares, so after a rollback an input only the newer release
+  declares — kept by the install — is not listed, and Read describes the kept installer at every
+  refresh to tell it from one dropped (`dropUnrecorded`). Ask Stowage to list every input key the
+  install records, whichever release declares it; then drop the describe.
+- **`make acc-docker` ships with the host's Docker uncapped**: `stowage ship` builds the example's
+  images with this machine's builder, whose memory is not capped as the test's containers are.
 
 - **A flaky test**: `TestCreateWaitsForTheFirstInstall` failed once in `make check` on a loaded
   host and passed on the re-run; its 20ms create timeout races the fake's status loop. Scale it

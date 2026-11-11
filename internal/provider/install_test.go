@@ -454,3 +454,39 @@ func TestOldInstallerStopsAtDescribe(t *testing.T) {
 		t.Fatal("installed after a failed describe")
 	}
 }
+
+// A value not known while the configuration is validated — a write-only input from an ephemeral
+// variable, an input or port computed from another resource — is not an error: its key is still
+// checked.
+func TestValidateUnknownMapValues(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	unknown := tftypes.NewValue(tftypes.String, tftypes.UnknownValue)
+	strs := func(m map[string]tftypes.Value) tftypes.Value {
+		return tftypes.NewValue(tftypes.Map{ElementType: tftypes.String}, m)
+	}
+	config := h.dockerConfig(map[string]tftypes.Value{
+		"inputs":                   strs(map[string]tftypes.Value{"ADMIN_EMAIL": unknown}),
+		"secret_inputs_wo":         strs(map[string]tftypes.Value{"SMTP_PASSWORD": unknown}),
+		"secret_inputs_wo_version": num(1),
+		"tls":                      str("internal"),
+		"domains":                  strs(map[string]tftypes.Value{"web": unknown}),
+		"ports": tftypes.NewValue(tftypes.Map{ElementType: tftypes.Number},
+			map[string]tftypes.Value{"web": tftypes.NewValue(tftypes.Number, tftypes.UnknownValue)}),
+	})
+	if got := diagText(h.validate(config)); got != "" {
+		t.Fatalf("got %q", got)
+	}
+	config = h.dockerConfig(map[string]tftypes.Value{
+		"inputs":           strs(map[string]tftypes.Value{"bad-key": unknown}),
+		"secret_inputs_wo": strs(map[string]tftypes.Value{"ADMIN_EMAIL": unknown, "bad key": unknown}),
+		"ports": tftypes.NewValue(tftypes.Map{ElementType: tftypes.Number},
+			map[string]tftypes.Value{"no route": tftypes.NewValue(tftypes.Number, tftypes.UnknownValue)}),
+	})
+	got := errorsOf(h.validate(config))
+	for _, want := range []string{`"bad-key": an input key`, `"bad key": an input key`, `"no route" is not a route name`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("no %q in %q", want, got)
+		}
+	}
+}

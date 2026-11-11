@@ -2,7 +2,7 @@
 # Every build, test and check runs here: the host needs Docker and nothing else.
 #   make check  → target checks   (gofmt, go vet, staticcheck, govulncheck, the hooks' test, go test -race)
 #   make build  → target bin      (the provider binary exported to ./bin, only after green checks)
-ARG GO_VERSION=1.27.3
+ARG GO_VERSION=1.27.4
 
 FROM golang:${GO_VERSION}-bookworm AS base
 WORKDIR /src

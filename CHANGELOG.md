@@ -33,7 +33,9 @@ follow [SemVer](https://semver.org/).
   domain or a port is a plan error.
 - Import of a Docker install by the installer it keeps: `[<host>:]<work_dir>/<name>/<short>-stow`.
 - A create waits, within its timeout, for a first install still in progress.
-- Read removes from state an input the install does not record, so the next plan gives it again.
+- Read removes from state an input the install does not record, so the next plan gives it again;
+  an input the running release does not declare (one only a newer release declares, after a
+  rollback) stays.
 - `short_name` attribute; `status --json` must carry its `format`; `update` timeout (default 30m).
 - The Kubernetes and VM targets' schema (not yet installed).
 - A create over an install already in its directory (a create that failed or timed out, or an
@@ -47,6 +49,11 @@ follow [SemVer](https://semver.org/).
   upgrade goes to included; one moved to
   `secret_inputs_wo` is no longer given empty, and needs a new `secret_inputs_wo_version`.
 - A missing install directory is recognised behind an SSH banner.
+- A value not known until apply — a write-only secret input from an ephemeral variable, an input,
+  domain or port computed from another resource — passes validation; its key is still checked.
+  A null value there is refused by its key; a port is checked again at apply, once known.
+- An imported install's first apply records the provider's `registry` (the plan leaves it to the
+  apply), where OpenTofu refused the result as inconsistent.
 - Releases in the OpenTofu registry's layout: a zip per platform, the plugin protocol manifest, and
   checksums signed with the Norvex Labs release key `686D3351040F9F4463D9D3AC0C705E9BAA4F4981`,
   whose public key the repository publishes.

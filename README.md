@@ -24,8 +24,9 @@ copy of a rule.
 
 **Status: pre-release (0.1.0, unreleased).** What works: the Docker target — create, read,
 update (inputs, then the release: upgrade or rollback), import and delete. Not yet: the plan-time
-dry run, the Kubernetes and VM targets, `stowage_vm_seed` — see [TODO.md](TODO.md). Not yet
-proven against a real installer (unit tests drive the verbs' results as Stowage prints them).
+dry run, the Kubernetes and VM targets, `stowage_vm_seed` — see [TODO.md](TODO.md). The Docker
+target is proven against a real Stowage 0.34.0 installer over SSH (`make acc-docker`, under
+[Build](#build)).
 
 - Provider address: `registry.opentofu.org/norvexlabs/stowage`, plugin protocol 6.
 - Needs **OpenTofu ≥ 1.11** (write-only attributes), and for a remote target the system `ssh`
@@ -87,12 +88,16 @@ two, is an error).
 | `secrets_wo` | optional, **write-only** | A decrypted `secrets export` of a machine made again (`--secrets`), used at create, on standard input. |
 | `tls` | optional | The front's TLS mode, `--tls`: `acme`, `dns-cloudflare`, `byo` or `internal`. Left out, loopback mode. A change is given to the re-run (`--tls`); taking it out is a plan error. |
 | `domains` | optional map | Route → domain, `--domains route=host,…` (sorted). A route name is a letter or digit, then letters, digits, `_ . -`; a value holding `,`, `=` or a space is refused. A changed or added route is given to the re-run; taking one out, or adding one while `installer` changes, is a plan error. |
-| `ports` | optional map of numbers | Route → port (1–65535), `--ports route=port,…`. A changed port is given to the re-run; a route state does not record goes to the upgrade's `--ports` when the release changes (taken as a route the release adds: set the port of a route the running release has in an apply of its own), else to the re-run; taking one out is a plan error. |
+| `ports` | optional map of numbers | Route → port (1–65535; checked again at apply, for a port computed from another resource), `--ports route=port,…`. A changed port is given to the re-run; a route state does not record goes to the upgrade's `--ports` when the release changes (taken as a route the release adds: set the port of a route the running release has in an apply of its own), else to the re-run; taking one out is a plan error. |
 | `address` | optional | The loopback address the routes bind, `--address`. First-install only. |
 | `allow_rollback` | default `false` | Lets a change of `installer` to `previous.installer` run the kept installer's `rollback`. Without it, that change is a plan error (and an apply error when `status --json` names it `previous` only at apply). |
 | `deletion_protection` | default `true` | While true, a destroy is refused (`deletion_protection is on`). Set it `false` and apply first. |
 | `delete_data` | default `false` | A destroy runs `uninstall --data` (the volumes deleted) instead of `uninstall` (kept). |
 | `timeouts` | block | `create` (default 30m; it bounds the wait for a first install still `installing`), `read` (5m), `update` (30m), `delete` (15m). A run cut by its timeout is a failure. |
+
+A null value in `inputs`, `secret_inputs_wo`, `domains` or `ports` is refused by its key
+(`<attribute>.<key> is null`); a value not known until apply (an ephemeral variable's, one computed
+from another resource) is not, its key checked when the configuration is validated.
 
 **`docker` block** — the Docker shape.
 
@@ -162,7 +167,12 @@ the remote shell; nothing secret is ever an argument.
   failure). A release other than the configured one
   (`installed.installer`) replaces `installer` in state, so the next plan shows the change back.
   When `status` lists the recorded input keys, a key of `inputs` with a non-empty value it does not
-  record is removed from state, so the next plan gives it again; `inputs` absent (the kept
+  list is removed from state, so the next plan gives it again — when the running release declares
+  it: `status` lists the recorded inputs among those the running release declares, so the kept
+  installer's `describe --json` is read then (only when a key would go), and a key it does not
+  declare (after a rollback, an input only the newer release declares, which the install keeps)
+  stays; a `describe` that fails, finds the install gone or carries another release than `status`
+  reports installed removes nothing, with a warning. `inputs` absent (the kept
   installer does not carry the installed release) is unknown and removes nothing. An imported
   remote state (no `known_hosts_line` yet) is not read: the configuration's connection reads it at
   the first apply.
@@ -227,7 +237,8 @@ removed`); a rollback with any other change of what the target applies (`a rollb
 alone`); a route added to `domains` while `installer` changes (known at plan time) (`a domain added with a release
 change`: a route the new release adds takes its domain from its domain input, in `inputs`; one
 the running release has takes it in an apply of its own). A plan changing anything the target applies plans `status` unknown; one changing
-`installer` also `version`, `revision`, `channel`, `previous` and `short_name`.
+`installer` also `version`, `revision`, `channel`, `previous` and `short_name`; an imported state's
+first plan also `registry`.
 
 ### The machine interface, as read
 
@@ -287,6 +298,21 @@ make hooks   # commit identity + .githooks
 make hooks-test  # the hooks' test (test/hooks.sh) on this machine; make check runs it too
 make release-check # goreleaser check + a snapshot release (zips, manifest, checksums; unsigned) in dist/, in Docker
 ```
+
+**`make acc-docker`** (`STOWAGE_SRC=<a Stowage checkout ≥ 0.34.0, its ./bin/stowage built>`)
+runs `test/acc-docker.sh`, the Docker target's acceptance test against a real installer through
+OpenTofu: a registry (zot) and a Docker host — sshd beside Docker-in-Docker, its host key pinned
+by `known_hosts_line` — share one network namespace; Stowage's `examples/minimal` is shipped there
+as 1.0.0, 2.0.0 (an input added) and 3.0.0 (a rollback barrier); OpenTofu (1.13.9, its archive's
+checksum checked, kept in `~/.cache/terraform-provider-stowage-tools`) loads the provider built
+from this tree (`dev_overrides`). It walks a create (inputs, a secret input, ports, the pull
+account), a refresh planning nothing, a re-run, an upgrade adding an input, a rollback (a plan
+error without `allow_rollback`), an upgrade across the barrier, a refused upgrade after a re-run
+(the re-run's state saved, the reason and the fix shown), a refused rollback, an import and its
+first apply, and a destroy refused by `deletion_protection`, then one with `delete_data`; it
+prints `PASS`. Everything it starts is named `acc-docker-<pid>` and removed at its exit; its work
+directory is under `~/.cache` (`ACC_LOGS=<dir>` keeps the logs). Needs Docker, curl, jq, python3,
+ssh, ssh-keygen and network access.
 
 An acceptance test, `TestAccDockerLocal`, installs a real installer on this machine's Docker
 through OpenTofu: `TF_ACC=1 TF_ACC_TERRAFORM_PATH=<tofu> TF_ACC_PROVIDER_NAMESPACE=norvexlabs
