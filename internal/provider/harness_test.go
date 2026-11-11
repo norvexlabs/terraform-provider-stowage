@@ -125,7 +125,7 @@ func newFake() *fake {
 	return &fake{queue: map[string][]reply{}, replies: map[string]reply{
 		"fetch":         {},
 		"resolve":       {stdout: "/home/ops\n"},
-		"plan-dir":      {stdout: "/srv/.stowage-plan.abc\n"},
+		"plan-dir":      {stdout: "/srv/.stowage-plan.abc123\n"},
 		"plan-rm":       {},
 		"dry-upgrade":   {stdout: `{"format":1,"result":"nothing","release":{"version":"1.2.0","revision":1}}`},
 		"dry-rollback":  {stdout: `{"format":1,"result":"nothing","release":{"version":"2.0.0","revision":1}}`},

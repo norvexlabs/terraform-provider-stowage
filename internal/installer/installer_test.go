@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/norvexlabs/terraform-provider-stowage/internal/target"
 )
@@ -596,11 +597,41 @@ func TestPlanDirScripts(t *testing.T) {
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatalf("left: %v", err)
 	}
-	if err := d.RemovePlanDir(context.Background(), work); err == nil {
-		t.Fatal("another directory removed")
+	// Nothing but a plan's directory of the work directory is removed: no other name, no ..,
+	// none of another directory.
+	inside := filepath.Join(work, "notes")
+	if err := os.Mkdir(inside, 0o755); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(work); err != nil {
-		t.Fatalf("the work directory: %v", err)
+	other := t.TempDir()
+	stray := filepath.Join(other, ".stowage-plan.abcdef")
+	if err := os.Mkdir(stray, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{work, inside, filepath.Join(work, ".stowage-plan.abcdef", "..", "notes"), stray} {
+		if err := d.RemovePlanDir(context.Background(), bad); err == nil {
+			t.Errorf("%s removed", bad)
+		}
+	}
+	for _, keep := range []string{work, inside, stray} {
+		if _, err := os.Stat(keep); err != nil {
+			t.Fatalf("%s: %v", keep, err)
+		}
+	}
+	// A plan's directory an hour old, left by a killed plan, goes at the next plan's.
+	old := filepath.Join(work, ".stowage-plan.zzzzzz")
+	if err := os.Mkdir(old, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(old, past, past); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.PlanDir(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Fatalf("an old plan's directory stays: %v", err)
 	}
 }
 

@@ -317,7 +317,6 @@ func (r *installResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 	r.planRollback(ctx, &plan, &state, &resp.Diagnostics)
 	planVM(ctx, &plan, &state, resp)
 	planRemovals(ctx, &plan, &state, &resp.Diagnostics)
-	r.planDryRun(ctx, req, &plan, &state, &resp.Diagnostics)
 	if r.data != nil && r.data.RegistryCAKnown && !imported(&state) && plan.Kubernetes == nil {
 		firstInstallOnlyFix(&resp.Diagnostics, path.Root("registry_ca_digest"), "the provider's registry_ca", state.RegistryCADigest.ValueString(), caDigest(r.data.RegistryCA),
 			"The install keeps the registry CA its first install was given (status --json registry_ca), which a re-run cannot change: give the provider that CA again (an empty one for none).")
@@ -329,6 +328,8 @@ func (r *installResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 	if r.data != nil && r.data.RegistryKnown && known(state.Registry) {
 		firstInstallOnly(&resp.Diagnostics, path.Root("registry"), "the provider's registry", state.Registry.ValueString(), r.data.Registry)
 	}
+	// Last: a plan another check refuses never reaches the target.
+	r.planDryRun(ctx, req, &plan, &state, &resp.Diagnostics)
 	unknowns := []string{}
 	switch {
 	case !plan.Installer.Equal(state.Installer) || imported(&state):

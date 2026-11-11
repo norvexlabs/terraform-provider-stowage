@@ -317,12 +317,15 @@ func (d Docker) Fetch(ctx context.Context, installer string, login *Login) error
 }
 
 // ResolveScript prints its argument's directory as an absolute path: "." in the home (an SSH
-// run's start) as $HOME names it — an absolute $HOME that is the directory the run is in, by
-// their physical paths, both read — so a symbolic link's name is kept (sshd sets no PWD, so pwd
+// run's start) as $HOME names it — an absolute $HOME with no . or .. element that is the
+// directory the run is in, by their physical paths, both read — so a symbolic link's name is kept (sshd sets no PWD, so pwd
 // alone would print the physical path); any other as the shell names it after cd.
 const ResolveScript = `h=${HOME:-} here=$(pwd -P 2>/dev/null) || here=
 there=
-case $h in /*) there=$(cd -- "$h" 2>/dev/null && pwd -P) || there= ;; esac
+case $h in
+*/../* | */.. | */./* | */.) ;;
+/*) there=$(cd -- "$h" 2>/dev/null && pwd -P) || there= ;;
+esac
 if [ "$1" = . ] && [ -n "$here" ] && [ "$here" = "$there" ]; then
   printf '%s\n' "$h"
 else
@@ -345,12 +348,9 @@ func (d Docker) Resolve(ctx context.Context) (string, error) {
 	if !strings.HasPrefix(dir, "/") {
 		return "", fmt.Errorf("resolving %s: %q is not an absolute path", d.WorkDir, dir)
 	}
-	// One spelling: $HOME may end with / or hold //; a .. in it is kept, as Clean would
-	// change the directory it names through a symbolic link.
-	if !strings.Contains(dir, "/../") && !strings.HasSuffix(dir, "/..") {
-		dir = pathpkg.Clean(dir)
-	}
-	return dir, nil
+	// One spelling ($HOME may end with / or hold //): the script takes no $HOME holding a . or ..
+	// element, so cleaning changes no directory it names.
+	return pathpkg.Clean(dir), nil
 }
 
 // Describe runs the fetched bootstrap script's `describe --json`.
@@ -560,16 +560,27 @@ func (d Docker) Rerun(ctx context.Context, c Change) (*Result, error) {
 // Upgrade runs the fetched bootstrap script's `upgrade` on the install: the new release's
 // installer, given the inputs and ports the release adds.
 func (d Docker) Upgrade(ctx context.Context, c Change) (*Result, error) {
+	return d.upgrade(ctx, c, "./"+d.Name+".sh", "./"+d.Name, false)
+}
+
+// upgrade runs script's `upgrade` on the install dir, given c's inputs, secret inputs and ports;
+// with dryRun, `--dry-run`.
+func (d Docker) upgrade(ctx context.Context, c Change, script, dir string, dryRun bool) (*Result, error) {
 	added := Change{Inputs: c.Inputs, SecretInputs: c.SecretInputs, Ports: c.Ports} // --tls and --domains are a re-run's
-	args, files, err := changeArgs(added, "sh", "./"+d.Name+".sh", "upgrade", "--no-input", "--json", "--dir", "./"+d.Name)
+	verb := []string{"sh", script, "upgrade"}
+	name := "upgrade"
+	if dryRun {
+		verb, name = append(verb, "--dry-run"), "upgrade --dry-run"
+	}
+	args, files, err := changeArgs(added, append(verb, "--no-input", "--json", "--dir", dir)...)
 	if err != nil {
 		return nil, err
 	}
 	stdout, stderr, exit, err := d.run(ctx, files, args...)
 	if err != nil {
-		return nil, fmt.Errorf("upgrade: %w", err)
+		return nil, fmt.Errorf("%s: %w", name, err)
 	}
-	return Outcome("upgrade", stdout, stderr, exit)
+	return Outcome(name, stdout, stderr, exit)
 }
 
 // Rollback runs the kept installer's `rollback --json`: back to the release the last upgrade
