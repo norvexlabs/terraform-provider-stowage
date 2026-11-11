@@ -10,7 +10,6 @@ import (
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
 
-	"github.com/norvexlabs/terraform-provider-stowage/internal/installer"
 )
 
 const (
@@ -351,6 +350,15 @@ func TestCreateWaitsForTheFirstInstall(t *testing.T) {
 	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "still installing when the create timeout ran out") {
 		t.Fatalf("timeout: %q", got)
 	}
+
+	// A status read the create timeout cuts says the same, not the read's own error.
+	h = newHarness(t, nil)
+	h.fake.set("status", reply{block: true})
+	config = h.dockerConfig(map[string]tftypes.Value{"timeouts": h.block("timeouts", map[string]tftypes.Value{"create": str("50ms")})})
+	a = h.apply(nil, h.plan(nil, config).PlannedState, config)
+	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "still installing when the create timeout ran out") {
+		t.Fatalf("a read cut by the timeout: %q", got)
+	}
 }
 
 func TestUpdateTimeout(t *testing.T) {
@@ -377,6 +385,18 @@ func TestReadDropsUnrecordedInputs(t *testing.T) {
 	got := inputsOf(t, h, h.read(state).NewState)
 	if _, ok := got["ADMIN_EMAIL"]; ok || len(got) != 1 {
 		t.Fatalf("an unrecorded input stays: %v", got)
+	}
+	// status --json lists every key the install records, whichever release declared it: a listed
+	// key stays, an unlisted one goes, and Read runs no describe to tell them.
+	state = h.create(h.dockerConfig(map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com", "E2E_NOTE": "hello"})}))
+	h.fake.reset()
+	h.fake.set("status", reply{stdout: `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1,"installer":"` + image + `"},"inputs":["E2E_NOTE"]}`})
+	got = inputsOf(t, h, h.read(state).NewState)
+	if _, ok := got["ADMIN_EMAIL"]; ok || got["E2E_NOTE"] != "hello" {
+		t.Fatalf("inputs %v: ADMIN_EMAIL (unlisted) dropped, E2E_NOTE (listed) kept", got)
+	}
+	if ops := h.fake.ops(); slices.Contains(ops, "kept-describe") {
+		t.Fatalf("calls %q", ops)
 	}
 }
 
@@ -780,41 +800,6 @@ func TestCreateOverAnExistingInstall(t *testing.T) {
 	}
 }
 
-// status --json lists the recorded inputs among those the running release declares: after a
-// rollback, an input only the newer release declares stays recorded, unlisted. Read keeps it, and
-// drops only an input the running release declares (its kept installer's describe, read only when
-// a key would go); a describe that fails drops nothing.
-func TestReadKeepsAnInputTheRunningReleaseDoesNotDeclare(t *testing.T) {
-	t.Parallel()
-	h := newHarness(t, nil)
-	state := h.create(h.dockerConfig(map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com", "E2E_NOTE": "hello"})}))
-	h.fake.reset()
-	h.fake.set("status", reply{stdout: `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1,"installer":"` + image + `"},"inputs":[]}`})
-	got := inputsOf(t, h, h.read(state).NewState)
-	if _, ok := got["ADMIN_EMAIL"]; ok || got["E2E_NOTE"] != "hello" {
-		t.Fatalf("inputs %v: ADMIN_EMAIL (declared, unrecorded) dropped, E2E_NOTE (not declared) kept", got)
-	}
-	if ops := h.fake.ops(); !slices.Contains(ops, "kept-describe") {
-		t.Fatalf("calls %q", ops)
-	}
-	// Nothing to drop: no describe.
-	h.fake.reset()
-	h.fake.set("status", reply{stdout: `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1,"installer":"` + image + `"},"inputs":["ADMIN_EMAIL","E2E_NOTE"]}`})
-	h.read(state)
-	if ops := h.fake.ops(); slices.Contains(ops, "kept-describe") {
-		t.Fatalf("calls %q", ops)
-	}
-	h.fake.reset()
-	h.fake.set("status", reply{stdout: `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1,"installer":"` + image + `"},"inputs":[]}`})
-	h.fake.set("kept-describe", reply{exit: 1, stderr: "error: boom\n"})
-	r := h.read(state)
-	if got := inputsOf(t, h, r.NewState); got["ADMIN_EMAIL"] != "a@example.com" || got["E2E_NOTE"] != "hello" {
-		t.Fatalf("inputs %v after a failed describe", got)
-	}
-	if d := diagText(r.Diagnostics); !strings.Contains(d, "boom") {
-		t.Fatalf("diagnostics %q", d)
-	}
-}
 
 // An imported state holds registry null until its first apply records the provider's: the plan
 // says so (unknown), or OpenTofu refuses the apply's result as inconsistent with it.
@@ -837,27 +822,6 @@ func TestImportedPlanLeavesTheRegistryToTheApply(t *testing.T) {
 	}
 }
 
-// Read's describe of the kept installer drops nothing unless it carries the release status says
-// is installed: none (the install gone meanwhile) or another release keeps every input.
-func TestReadDropsByTheInstalledReleaseAlone(t *testing.T) {
-	t.Parallel()
-	h := newHarness(t, nil)
-	state := h.create(h.dockerConfig(map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})}))
-	h.fake.set("status", reply{stdout: `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1,"installer":"` + image + `"},"inputs":[]}`})
-	for _, r := range []reply{
-		{exit: installer.NotInstalled, stderr: installer.NotInstalledMark + "\n"},
-		{stdout: describe2},
-	} {
-		h.fake.set("kept-describe", r)
-		resp := h.read(state)
-		if got := inputsOf(t, h, resp.NewState); got["ADMIN_EMAIL"] != "a@example.com" {
-			t.Fatalf("inputs %v after describe %q", got, r.stdout+r.stderr)
-		}
-		if d := diagText(resp.Diagnostics); !strings.Contains(d, "Cannot tell the inputs the install records") {
-			t.Fatalf("diagnostics %q", d)
-		}
-	}
-}
 
 // A null element is refused by key at validation; an unknown one (known at apply) is not, and a
 // port out of range is refused at apply once known, before anything runs.

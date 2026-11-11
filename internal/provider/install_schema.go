@@ -64,13 +64,6 @@ type dockerModel struct {
 	WorkDir        types.String `tfsdk:"work_dir"`
 }
 
-type k8sModel struct {
-	Kubeconfig types.String `tfsdk:"kubeconfig"`
-	Context    types.String `tfsdk:"context"`
-	Namespace  types.String `tfsdk:"namespace"`
-	Release    types.String `tfsdk:"release"`
-}
-
 type vmModel struct {
 	Host           types.String `tfsdk:"host"`
 	Port           types.Int64  `tfsdk:"port"`
@@ -123,9 +116,9 @@ func installSchema(ctx context.Context) schema.Schema {
 	}
 	return schema.Schema{
 		MarkdownDescription: "One install of a Stowage product on one target: a Docker host, a Kubernetes cluster or a Kairos VM. " +
-			"Exactly one of the `docker`, `kubernetes` and `vm` blocks. Only the Docker target installs in this release.",
+			"Exactly one of the `docker`, `kubernetes` and `vm` blocks. The Docker and Kubernetes targets install in this release.",
 		Attributes: map[string]schema.Attribute{
-			"id": computedString("`<work_dir>/<name>` on the target."),
+			"id": computedString("`<work_dir>/<name>` on Docker; `<namespace>/<release>` on Kubernetes."),
 			"installer": schema.StringAttribute{
 				Optional:            true,
 				MarkdownDescription: "The installer image by digest, `<prefix>/<name>-installer@sha256:<64 hex>`, as `ship` prints it: an installer carries one release, so the digest is the release. Required with `docker` and `kubernetes`; the VM's release is `vm.version`.",
@@ -154,7 +147,7 @@ func installSchema(ctx context.Context) schema.Schema {
 			"secrets_wo": schema.StringAttribute{
 				Optional:            true,
 				WriteOnly:           true,
-				MarkdownDescription: "A decrypted `secrets export` of a machine made again (the installer's `--secrets`), write-only, used at create, on standard input. Docker and the VM.",
+				MarkdownDescription: "A decrypted `secrets export` of a machine made again (the installer's `--secrets`), write-only, used at create, on standard input. Docker and the VM: refused with `kubernetes`, whose release keeps its secrets in the cluster.",
 			},
 			"tls": schema.StringAttribute{
 				Optional:            true,
@@ -205,15 +198,7 @@ func installSchema(ctx context.Context) schema.Schema {
 				MarkdownDescription: "The Docker shape: the installer runs on the host (`docker run --rm <installer> > <name>.sh`, then `sh <name>.sh --no-input`).",
 				Attributes:          docker,
 			},
-			"kubernetes": schema.SingleNestedBlock{
-				MarkdownDescription: "The Kubernetes shape (`<short>-stow k8s install`). Not yet implemented: the schema only.",
-				Attributes: map[string]schema.Attribute{
-					"kubeconfig": schema.StringAttribute{Optional: true, MarkdownDescription: "Path of the kubeconfig; left out, kubectl's default."},
-					"context":    schema.StringAttribute{Optional: true, MarkdownDescription: "The kubeconfig context."},
-					"namespace":  schema.StringAttribute{Optional: true, MarkdownDescription: "The release's namespace; required in this block."},
-					"release":    schema.StringAttribute{Optional: true, MarkdownDescription: "The helm release's name; left out, the installer's."},
-				},
-			},
+			"kubernetes": k8sBlock(),
 			"vm": schema.SingleNestedBlock{
 				MarkdownDescription: "The Kairos VM shape, reached over SSH. Not yet implemented: the schema only.",
 				Attributes:          vm,

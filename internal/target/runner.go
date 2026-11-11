@@ -7,7 +7,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"time"
 )
@@ -23,15 +25,46 @@ type Runner interface {
 // kept part ends with a note, so a runaway program cannot exhaust the provider's memory.
 const MaxOutput = 16 << 20
 
-// Local runs argv on the machine that runs OpenTofu.
-type Local struct{}
+// Local runs argv on the machine that runs OpenTofu, in its environment without the variables
+// Unset names.
+type Local struct {
+	Unset []string
+}
 
 // Run implements Runner.
-func (Local) Run(ctx context.Context, argv []string, stdin []byte) ([]byte, []byte, int, error) {
+func (l Local) Run(ctx context.Context, argv []string, stdin []byte) ([]byte, []byte, int, error) {
 	if len(argv) == 0 {
 		return nil, nil, -1, errors.New("local: no program to run")
 	}
-	return run(ctx, exec.CommandContext(ctx, argv[0], argv[1:]...), stdin)
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	if len(l.Unset) > 0 {
+		cmd.Env = without(os.Environ(), l.Unset)
+	}
+	return run(ctx, cmd, stdin)
+}
+
+// EnvFilter is a Runner on the machine running OpenTofu that can run without some of its
+// environment's variables: WithoutEnv is that Runner, leaving the keys named out.
+type EnvFilter interface {
+	Runner
+	WithoutEnv(keys []string) Runner
+}
+
+// WithoutEnv implements EnvFilter.
+func (l Local) WithoutEnv(keys []string) Runner {
+	return Local{Unset: append(slices.Clone(l.Unset), keys...)}
+}
+
+// without is env (KEY=VALUE entries) less the keys named.
+func without(env, keys []string) []string {
+	out := make([]string, 0, len(env))
+	for _, e := range env {
+		k, _, _ := strings.Cut(e, "=")
+		if !slices.Contains(keys, k) {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // waitDelay is how long a run waits for its output to close once the program exited or was

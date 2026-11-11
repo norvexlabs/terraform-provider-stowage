@@ -128,6 +128,14 @@ type Status struct {
 	// Inputs are the recorded keys, never a value; sorted. Nil (absent, or null) is unknown: the
 	// installer run does not carry the installed release, whose spec tells them — never "none".
 	Inputs *Keys `json:"inputs"`
+	// Helm is Kubernetes's: the release's latest revision and its status, as helm lists it.
+	Helm *HelmStatus `json:"helm"`
+}
+
+// HelmStatus is a helm release's latest revision and its status (deployed, failed, …).
+type HelmStatus struct {
+	Revision int64  `json:"revision"`
+	Status   string `json:"status"`
 }
 
 // Keys reads the recorded keys, a JSON array of strings; any other type is refused.

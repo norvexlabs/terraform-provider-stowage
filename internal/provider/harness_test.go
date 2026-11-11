@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"maps"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -28,6 +29,7 @@ const (
 type call struct {
 	argv  []string
 	stdin []byte
+	unset []string // what the runner left out of the environment (WithoutEnv), for this call
 }
 
 // op names a call by the script it runs and the verb it asks.
@@ -38,6 +40,17 @@ func (c call) op() string {
 	switch c.argv[2] {
 	case installer.FetchScript:
 		return "fetch"
+	case installer.ToolsScript:
+		return "tools"
+	case installer.K8sScript:
+		// sh -c K8sScript sh <dir> <kubeconfig> <files> sh ./<name>.sh <args…>
+		switch {
+		case len(c.argv) > 10 && c.argv[9] == "k8s":
+			return "k8s-" + c.argv[10]
+		case len(c.argv) > 9:
+			return "k8s-" + c.argv[9]
+		}
+		return "?"
 	case installer.RunScript:
 		switch {
 		case len(c.argv) > 8 && c.argv[8] == "status":
@@ -74,6 +87,8 @@ type reply struct {
 	stdout string
 	stderr string
 	exit   int
+	// block: the call waits for its context to end, then fails as a run cut by it does.
+	block bool
 }
 
 // fake is a Runner answering each operation with its next queued reply, else its set reply,
@@ -145,10 +160,32 @@ func (f *fake) factory(c Connection) (target.Runner, error) {
 	return f, nil
 }
 
+// filtered is the fake as an EnvFilter's result: its calls record the keys left out.
+type filtered struct {
+	f     *fake
+	unset []string
+}
+
+// WithoutEnv makes the fake an EnvFilter, as the runner on this machine is.
+func (f *fake) WithoutEnv(keys []string) target.Runner { return filtered{f, keys} }
+
+// WithoutEnv adds keys to those left out, as Local's does.
+func (r filtered) WithoutEnv(keys []string) target.Runner {
+	return filtered{r.f, append(append([]string(nil), r.unset...), keys...)}
+}
+
+func (r filtered) Run(ctx context.Context, argv []string, stdin []byte) ([]byte, []byte, int, error) {
+	return r.f.run(ctx, argv, stdin, r.unset)
+}
+
 func (f *fake) Run(ctx context.Context, argv []string, stdin []byte) ([]byte, []byte, int, error) {
+	return f.run(ctx, argv, stdin, nil)
+}
+
+func (f *fake) run(ctx context.Context, argv []string, stdin []byte, unset []string) ([]byte, []byte, int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	c := call{argv: append([]string(nil), argv...), stdin: append([]byte(nil), stdin...)}
+	c := call{argv: append([]string(nil), argv...), stdin: append([]byte(nil), stdin...), unset: unset}
 	f.calls = append(f.calls, c)
 	if err := ctx.Err(); err != nil {
 		return nil, nil, -1, err
@@ -159,6 +196,12 @@ func (f *fake) Run(ctx context.Context, argv []string, stdin []byte) ([]byte, []
 	}
 	if !ok {
 		return nil, []byte("unexpected call"), 99, nil
+	}
+	if r.block {
+		f.mu.Unlock()
+		<-ctx.Done()
+		f.mu.Lock()
+		return nil, nil, -1, ctx.Err()
 	}
 	return []byte(r.stdout), []byte(r.stderr), r.exit, nil
 }
@@ -181,12 +224,16 @@ type harness struct {
 	ptyp   tftypes.Object
 	fake   *fake
 	schema *tfprotov6.Schema
+	tmp    string // where Kubernetes runs make their private directories
 }
 
 func newHarness(t *testing.T, providerConfig map[string]tftypes.Value) *harness {
 	t.Helper()
 	f := newFake()
-	srv, err := providerserver.NewProtocol6WithError(newWithPoll("test", f.factory, time.Millisecond)())()
+	// Kubernetes runs make their private directories here, and leave none.
+	tmp := t.TempDir()
+	t.Cleanup(func() { noneLeft(t, tmp) })
+	srv, err := providerserver.NewProtocol6WithError(newIn("test", f.factory, time.Millisecond, tmp, t.TempDir())())()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +242,7 @@ func newHarness(t *testing.T, providerConfig map[string]tftypes.Value) *harness 
 	if err != nil || len(s.Diagnostics) > 0 {
 		t.Fatalf("schema: %v %v", err, s.Diagnostics)
 	}
-	h := &harness{t: t, srv: srv, fake: f, schema: s.ResourceSchemas["stowage_install"]}
+	h := &harness{t: t, srv: srv, fake: f, schema: s.ResourceSchemas["stowage_install"], tmp: tmp}
 	h.typ = h.schema.ValueType().(tftypes.Object)
 	h.ptyp = s.Provider.ValueType().(tftypes.Object)
 	cfg := h.dv(h.ptyp, fill(h.ptyp, providerConfig))
@@ -204,6 +251,14 @@ func newHarness(t *testing.T, providerConfig map[string]tftypes.Value) *harness 
 		t.Fatalf("configure: %v %s", err, diagText(resp.Diagnostics))
 	}
 	return h
+}
+
+// noneLeft fails t when dir holds anything: a run's private directory (a kubeconfig) left.
+func noneLeft(t *testing.T, dir string) {
+	t.Helper()
+	if left, err := os.ReadDir(dir); err != nil || len(left) > 0 {
+		t.Errorf("left in %s: %v %v", dir, left, err)
+	}
 }
 
 // fill is an object of typ with vals, every other attribute null.

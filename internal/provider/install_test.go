@@ -396,7 +396,6 @@ func TestOtherTargetsAreNotYet(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t, nil)
 	for name, config := range map[string]tftypes.Value{
-		"kubernetes": fill(h.typ, map[string]tftypes.Value{"installer": str(image), "kubernetes": h.block("kubernetes", map[string]tftypes.Value{"namespace": str("notes")})}),
 		"vm": fill(h.typ, map[string]tftypes.Value{"vm": h.block("vm", map[string]tftypes.Value{
 			"host": str("vm.example"), "user": str("ops"), "known_hosts_line": str(hostLine), "version": str("1.2.0")})}),
 	} {

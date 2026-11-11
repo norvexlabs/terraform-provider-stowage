@@ -4,6 +4,8 @@ package provider
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -51,8 +53,16 @@ type Data struct {
 	// on another resource): the plan-time comparison with the install's is then skipped.
 	RegistryKnown bool
 	NewRunner     RunnerFactory
+	// Kubernetes is the provider's kubernetes block, nil without one: the cluster every
+	// kubernetes target reaches.
+	Kubernetes *k8sConnModel
 	// Poll is how often a create reads an install still installing.
 	Poll time.Duration
+	// TempDir holds each Kubernetes run's private directory; "" is the system's.
+	TempDir string
+	// CacheDir keeps each installer's bootstrap script by digest, for the Kubernetes runs; ""
+	// keeps none.
+	CacheDir string
 }
 
 // defaultPoll is how often a create reads an install still installing.
@@ -62,13 +72,16 @@ type stowageProvider struct {
 	version   string
 	newRunner RunnerFactory
 	poll      time.Duration
+	tmp       string
+	cache     string
 }
 
 type providerModel struct {
-	Username   types.String `tfsdk:"username"`
-	Password   types.String `tfsdk:"password"`
-	Registry   types.String `tfsdk:"registry"`
-	RegistryCA types.String `tfsdk:"registry_ca"`
+	Username   types.String  `tfsdk:"username"`
+	Password   types.String  `tfsdk:"password"`
+	Registry   types.String  `tfsdk:"registry"`
+	RegistryCA types.String  `tfsdk:"registry_ca"`
+	Kubernetes *k8sConnModel `tfsdk:"kubernetes"`
 }
 
 // New returns the provider's constructor, reaching targets with DefaultRunner.
@@ -82,7 +95,25 @@ func NewWithRunner(version string, f RunnerFactory) func() provider.Provider {
 }
 
 func newWithPoll(version string, f RunnerFactory, poll time.Duration) func() provider.Provider {
-	return func() provider.Provider { return &stowageProvider{version: version, newRunner: f, poll: poll} }
+	return newIn(version, f, poll, "", defaultCache())
+}
+
+// defaultCache is the provider's cache of bootstrap scripts: the user's cache directory's
+// terraform-provider-stowage/installers; "" (none) without one.
+func defaultCache() string {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "terraform-provider-stowage", "installers")
+}
+
+// newIn is newWithPoll whose Kubernetes runs make their private directories in tmp and keep the
+// bootstrap scripts in cache.
+func newIn(version string, f RunnerFactory, poll time.Duration, tmp, cache string) func() provider.Provider {
+	return func() provider.Provider {
+		return &stowageProvider{version: version, newRunner: f, poll: poll, tmp: tmp, cache: cache}
+	}
 }
 
 func (p *stowageProvider) Metadata(_ context.Context, _ provider.MetadataRequest, resp *provider.MetadataResponse) {
@@ -112,6 +143,7 @@ func (p *stowageProvider) Schema(_ context.Context, _ provider.SchemaRequest, re
 				MarkdownDescription: "PEM of the certificate authority the mirror's certificate chains to (the installer's `--registry-ca`), sent on standard input.",
 			},
 		},
+		Blocks: map[string]schema.Block{"kubernetes": k8sConnBlock()},
 	}
 }
 
@@ -131,7 +163,14 @@ func (p *stowageProvider) Configure(ctx context.Context, req provider.ConfigureR
 			"Give the certificate authority's PEM (-----BEGIN CERTIFICATE-----), e.g. file(\"mirror-ca.pem\").")
 		return
 	}
+	if m.Kubernetes != nil {
+		validateK8sConn(m.Kubernetes, &resp.Diagnostics)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	}
 	d := &Data{
+		Kubernetes:    m.Kubernetes,
 		Username:      m.Username.ValueString(),
 		Password:      m.Password.ValueString(),
 		Registry:      m.Registry.ValueString(),
@@ -139,6 +178,8 @@ func (p *stowageProvider) Configure(ctx context.Context, req provider.ConfigureR
 		RegistryKnown: !m.Registry.IsUnknown(),
 		NewRunner:     p.newRunner,
 		Poll:          p.poll,
+		TempDir:       p.tmp,
+		CacheDir:      p.cache,
 	}
 	resp.ResourceData = d
 	resp.DataSourceData = d

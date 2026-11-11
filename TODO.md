@@ -8,17 +8,14 @@ installer's machine interface and decides nothing itself. A finished item is del
 
 2. **Plan-time dry run** (P1, opt-in): an upgrade's `--dry-run` over SSH, skipped while the target
    does not exist yet.
-3. **Kubernetes target** (P2): `k8s install|upgrade|uninstall --json` run locally (kubeconfig
-   and context, helm ≥ 3.14, kubectl, a linux/amd64 runner); the installer fetched locally by
-   digest; `k8s upgrade --given -` for a recorded input; no `secrets_wo` (refuse it).
 4. **`stowage_vm_seed` and the VM target** (P3): the seed as a managed resource (`vm seed --json`,
    the one-time host key's private key in state until the install), the VM's `install --set`,
    `upgrade --version V --yes` followed by the reboot (a new `boot_id`, the trial over,
    `installed` the target; a fallback or a failed boot an error saving the release that runs).
 5. **Docs** (P4): `make docs` (tfplugindocs) into `docs/` from the schema and `examples/`; needs a
    way to give tfplugindocs OpenTofu's schema instead of downloading Terraform.
-6. **Acceptance scripts against `tofu`** (P4): kind for Kubernetes, one TrueNAS VM, beside the
-   Docker target's `test/acc-docker.sh` (`make acc-docker`); with memory caps.
+6. **Acceptance scripts against `tofu`** (P4): one TrueNAS VM, beside `make acc-docker` and
+   `make acc-k8s`; with memory caps.
 7. **First release** (P5): the public repository `norvexlabs/terraform-provider-stowage`, created
    by the maintainer with the org's GitHub App and its ruleset (pushes as the app only, like
    Stowage); a GPG key for the release (`GPG_FINGERPRINT`); a release workflow (GoReleaser

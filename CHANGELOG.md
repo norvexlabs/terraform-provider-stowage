@@ -37,7 +37,27 @@ follow [SemVer](https://semver.org/).
   an input the running release does not declare (one only a newer release declares, after a
   rollback) stays.
 - `short_name` attribute; `status --json` must carry its `format`; `update` timeout (default 30m).
-- The Kubernetes and VM targets' schema (not yet installed).
+- The VM target's schema (not yet installed).
+- `stowage_install` on Kubernetes: the provider's `kubernetes` block, named as the helm
+  provider's (`host` with a token, a client certificate or an `exec` credential plugin, or
+  `config_path` and `config_context`), reaches the cluster, never in state; a kubeconfig is written
+  for each run and removed after it; the resource's `kubernetes` block names the `namespace` and
+  `release`. The installer runs on the machine running OpenTofu (linux/amd64, with docker, helm and
+  kubectl): create (`k8s install`), read (`k8s status --json`), changed inputs (`k8s upgrade
+  --given` by the running release's installer), a new release (its `k8s upgrade`), rollback
+  (`k8s rollback`, with `allow_rollback`), import (`kubernetes:<namespace>/<release>`) and delete
+  (`k8s uninstall`, `--data` with `delete_data`). The front's settings and `secrets_wo` are refused
+  with it; a change of namespace or release is a plan error. The installer's run never takes an
+  input from an exported variable, nor helm's cluster from `HELM_KUBE*` or its store from
+  `HELM_DRIVER`; a release helm left failed is applied again, one helm works on refused. An
+  installer's bootstrap script is kept by digest in the user's cache: a refresh fetches it once.
+- A Docker install on the machine running OpenTofu no longer takes an input from an exported
+  variable of its name, over the configured value.
+- A create whose timeout ends during a status read says the install is still installing.
+- An installer a Kubernetes release records is fetched and run only when it is the project's, by
+  digest, from the configured installer's registry (or the provider's mirror). One from elsewhere
+  is never run, nor anything over it: a refresh shows it in `status`, and a plan is an error
+  naming the fix.
 - A create over an install already in its directory (a create that failed or timed out, or an
   install a destroy kept with its data) runs the installer again on it, without the settings only
   a first install takes, with a warning; another project's install there is refused.
