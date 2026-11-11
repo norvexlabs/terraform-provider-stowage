@@ -181,3 +181,19 @@ func TestSeedRefusals(t *testing.T) {
 		t.Errorf("no kairos shape: %s %q", got, s2.fake.ops())
 	}
 }
+
+// Validation reads inputs by key: a value not known yet (a variable at validate) is no error.
+func TestSeedValidateUnknownInput(t *testing.T) {
+	t.Parallel()
+	s := newSeedHarness(t, nil)
+	cfg := s.config(map[string]tftypes.Value{"inputs": tftypes.NewValue(tftypes.Map{ElementType: tftypes.String},
+		map[string]tftypes.Value{"ADMIN_EMAIL": tftypes.NewValue(tftypes.String, tftypes.UnknownValue)})})
+	if got := errorsOf(s.validate(cfg)); got != "" {
+		t.Fatalf("%q", got)
+	}
+	bad := s.config(map[string]tftypes.Value{"inputs": tftypes.NewValue(tftypes.Map{ElementType: tftypes.String},
+		map[string]tftypes.Value{"A=B": tftypes.NewValue(tftypes.String, tftypes.UnknownValue)})})
+	if got := errorsOf(s.validate(bad)); !strings.Contains(got, "not an input key") {
+		t.Fatalf("a bad key: %q", got)
+	}
+}

@@ -218,7 +218,8 @@ func (r *seedResource) ValidateConfig(ctx context.Context, req resource.Validate
 		resp.Diagnostics.AddAttributeError(path.Root("await_secrets"), "await_secrets with tls byo",
 			"The first install waits for one of them: a secrets export (await_secrets) or a byo certificate (tls = \"byo\"). Give the certificate after the restore, by a re-run's given_wo.")
 	}
-	for k := range stringMap(ctx, m.Inputs, &resp.Diagnostics) {
+	// By key: a value may not be known yet (a variable at validate, another resource's).
+	for _, k := range mapKeys(m.Inputs) {
 		if !installer.ValidInputKey(k) {
 			resp.Diagnostics.AddAttributeError(path.Root("inputs").AtMapKey(k), "not an input key",
 				fmt.Sprintf("%q: an input key is a letter or _, then letters, digits or _ (and not tls).", k))
