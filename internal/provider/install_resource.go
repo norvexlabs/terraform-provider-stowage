@@ -647,7 +647,8 @@ func (r *installResource) providerCA() types.String {
 
 // planMovedSecrets refuses at plan an input taken out of inputs and given in secret_inputs_wo
 // (a write-only value the configuration holds at plan) with another value, without a new
-// secret_inputs_wo_version: its value would never be sent, as the apply refuses too.
+// secret_inputs_wo_version: its value would never be sent. The one check of it: OpenTofu plans
+// again with the final configuration before an apply, write-only values known then.
 func planMovedSecrets(ctx context.Context, req resource.ModifyPlanRequest, plan, state *installModel, diags *diag.Diagnostics) {
 	if !plan.SecretInputsWOVersion.Equal(state.SecretInputsWOVersion) || !known(plan.Inputs) && !plan.Inputs.IsNull() {
 		return
@@ -1215,6 +1216,8 @@ func (u *update) releaseStep(ctx context.Context, d installer.Docker, st *instal
 // declares it and the upgrade does not drop it. Secret inputs go to the re-run when
 // secret_inputs_wo_version changed; those the running release does not declare go with every
 // upgrade.
+// split decides only: what it reports in u.diags is the maps' own conversion, which a known map
+// of strings never fails.
 func (u *update) split(ctx context.Context, running, next *installer.Describe) (rerun, up installer.Change) {
 	plan, state := u.plan, u.state
 	rerun = installer.Change{Inputs: map[string]string{}, SecretInputs: map[string]string{}, Domains: map[string]string{}, Ports: map[string]string{}}
@@ -1235,12 +1238,10 @@ func (u *update) split(ctx context.Context, running, next *installer.Describe) (
 	bump := !plan.SecretInputsWOVersion.Equal(state.SecretInputsWOVersion)
 	for _, k := range slices.Sorted(maps.Keys(was)) {
 		// An input moved to secret_inputs_wo is not emptied: --set would win over its answer,
-		// which goes only with a new secret_inputs_wo_version.
+		// which goes only with a new secret_inputs_wo_version: the plan refuses one without
+		// (planMovedSecrets), and OpenTofu plans again with the final configuration before any
+		// apply, so no apply sees one.
 		if _, secret := u.secrets[k]; secret {
-			if _, ok := now[k]; !ok && !bump && u.secrets[k] != was[k] {
-				u.diags.AddAttributeError(path.Root("secret_inputs_wo_version"), "an input moved to secret_inputs_wo",
-					fmt.Sprintf("%s is taken out of inputs and given in secret_inputs_wo: change secret_inputs_wo_version in the same apply, so its value is sent (else the install keeps the one inputs gave).", k))
-			}
 			continue
 		}
 		if _, ok := now[k]; !ok && running.Declares(k) && (!upgrading || next.Declares(k)) {

@@ -913,11 +913,9 @@ func vmSplit(ctx context.Context, u *update, running *installer.Describe, upgrad
 	}
 	bump := !plan.SecretInputsWOVersion.Equal(state.SecretInputsWOVersion)
 	for _, k := range slices.Sorted(maps.Keys(was)) {
+		// An input moved to secret_inputs_wo is not emptied: its answer goes with a new
+		// secret_inputs_wo_version, which the plan requires (planMovedSecrets).
 		if _, secret := u.secrets[k]; secret {
-			if _, ok := given[k]; !ok && !bump && u.secrets[k] != was[k] {
-				u.diags.AddAttributeError(path.Root("secret_inputs_wo_version"), "an input moved to secret_inputs_wo",
-					fmt.Sprintf("%s is taken out of inputs and given in secret_inputs_wo: change secret_inputs_wo_version in the same apply, so its value is sent (else the install keeps the one inputs gave).", k))
-			}
 			continue
 		}
 		if _, ok := given[k]; !ok && running.Declares(k) {

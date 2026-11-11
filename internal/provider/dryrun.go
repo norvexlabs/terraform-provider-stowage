@@ -96,16 +96,9 @@ func (r *installResource) planDryRun(ctx context.Context, req resource.ModifyPla
 		}
 	}()
 	fetchTo := func() (installer.Docker, bool) {
-		// Its own diagnostics: the split after the fetch reports any of them again.
-		var scratch diag.Diagnostics
-		pre := *u
-		pre.diags = &scratch
-		certain, _ := pre.split(ctx, running, running)
-		if scratch.HasError() {
-			diags.Append(scratch...)
-			return installer.Docker{}, false
-		}
-		if certainRerun(plan, running, certain) {
+		// split decides only (it refuses nothing): against the running release alone, what any
+		// new release leaves to the re-run.
+		if certain, _ := u.split(ctx, running, running); certainRerun(plan, running, certain) {
 			noDryRun(diags, false)
 			return installer.Docker{}, false
 		}

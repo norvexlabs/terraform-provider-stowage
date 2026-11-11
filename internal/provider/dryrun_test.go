@@ -232,3 +232,35 @@ func TestPlanDryRunTakesTheStatusShortName(t *testing.T) {
 		t.Fatalf("kept-describe %q", kd)
 	}
 }
+
+// An input moved to secret_inputs_wo without a new version is the plan's error before the dry run
+// (planMovedSecrets), which then never starts: nothing reaches the target. The dry run itself
+// holds no check of it, as none can be reached.
+func TestPlanDryRunAfterAMovedSecret(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	state := h.create(h.dockerConfig(map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})}))
+	h.fake.reset()
+	got := errorsOf(h.plan(state, h.dockerConfig(map[string]tftypes.Value{"installer": str(image2), "plan_dry_run": boolean(true),
+		"secret_inputs_wo": strMap(map[string]string{"ADMIN_EMAIL": "b@example.com"})})).Diagnostics)
+	if strings.Count(got, "an input moved to secret_inputs_wo") != 1 || len(h.fake.ops()) != 0 {
+		t.Fatalf("got %q, calls %q", got, h.fake.ops())
+	}
+}
+
+// The plan's check of a moved secret input holds on the VM and on Kubernetes too, the one check
+// of it on every target.
+func TestMovedSecretAtPlanOnEveryTarget(t *testing.T) {
+	t.Parallel()
+	vh, _ := newVMHarness(t)
+	vstate := vh.create(vh.vmConfig("1.1.0", map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@b"})}))
+	if got := errorsOf(vh.plan(vstate, vh.vmConfig("1.1.0", map[string]tftypes.Value{"secret_inputs_wo": strMap(map[string]string{"ADMIN_EMAIL": "c@d"})})).Diagnostics); !strings.Contains(got, "an input moved to secret_inputs_wo") {
+		t.Errorf("vm: %q", got)
+	}
+	kh := k8sHarness(t, nil)
+	kh.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
+	kstate := kh.create(kh.k8sConfig(map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@b"})}))
+	if got := errorsOf(kh.plan(kstate, kh.k8sConfig(map[string]tftypes.Value{"secret_inputs_wo": strMap(map[string]string{"ADMIN_EMAIL": "c@d"})})).Diagnostics); !strings.Contains(got, "an input moved to secret_inputs_wo") {
+		t.Errorf("k8s: %q", got)
+	}
+}

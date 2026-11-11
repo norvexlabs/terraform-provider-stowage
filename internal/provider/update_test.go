@@ -715,8 +715,8 @@ func TestInputMovedToSecretInputsIsNotEmptied(t *testing.T) {
 	if len(rerun) != 1 || contains(rerun[0].argv, "--set") || untarAll(t, rerun[0].stdin)["answers"] != "ADMIN_EMAIL: \"b@example.com\"\n" {
 		t.Fatalf("re-run %q", rerun)
 	}
-	// Moved without a new version, its value would never be sent: refused at plan, and at apply
-	// (a plan made before the check).
+	// Moved without a new version, its value would never be sent: refused at plan, and so at
+	// apply, whose final plan (OpenTofu's, the harness's) holds the configuration then.
 	h.fake.reset()
 	moved := h.dockerConfig(map[string]tftypes.Value{"secret_inputs_wo": strMap(map[string]string{"ADMIN_EMAIL": "b@example.com"})})
 	if got := errorsOf(h.plan(state, moved).Diagnostics); !strings.Contains(got, "an input moved to secret_inputs_wo") {
