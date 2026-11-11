@@ -265,7 +265,7 @@ func TestHasCtl(t *testing.T) {
 // another key type, or exit 3 without its object, is an error.
 func TestRetireHostKey(t *testing.T) {
 	t.Parallel()
-	r := &vmRecorder{stdout: `{"format":1,"known_hosts_line":"notes ssh-ed25519 ` + edKey + `","fingerprint":"SHA256:x"}`}
+	r := &vmRecorder{stdout: `{"format":1,"public_key":"ssh-ed25519 ` + edKey + `","known_hosts_line":"notes ssh-ed25519 ` + edKey + `","retired":true,"fingerprint":"SHA256:x"}`}
 	v := VM{Runner: r, Short: "notes"}
 	key, err := v.RetireHostKey(context.Background())
 	if err != nil || key != "ssh-ed25519 "+edKey || !slices.Equal(r.argv, []string{"sudo", "-n", "notes-stow", "host-key", "--json"}) {
@@ -276,15 +276,40 @@ func TestRetireHostKey(t *testing.T) {
 	if _, err := v.RetireHostKey(context.Background()); !errors.As(err, &refused) || !strings.Contains(refused.Reason, "recovery") {
 		t.Fatalf("refused: %v", err)
 	}
+	// The reload not taken: the key, with the reason, exit 1.
+	r.exit, r.stdout, r.stderr = 1, `{"format":1,"public_key":"ssh-ed25519 `+edKey+`","retired":false,"reason":"sshd did not reload: it may serve the one-time key until it does"}`,
+		"error: sshd did not reload; run `sudo systemctl reload ssh`, or reboot the VM"
+	var nr *NotRetiredError
+	if key, err := v.RetireHostKey(context.Background()); key != "ssh-ed25519 "+edKey || !errors.As(err, &nr) || !strings.Contains(err.Error(), "sudo systemctl reload ssh") || !strings.Contains(err.Error(), "may serve the one-time key") {
+		t.Fatalf("not retired: %q %v", key, err)
+	}
+	// No reason: a default one.
+	r.stdout = `{"format":1,"public_key":"ssh-ed25519 ` + edKey + `","retired":false}`
+	if _, err := v.RetireHostKey(context.Background()); !errors.As(err, &nr) || nr.Reason != "sshd did not reload" {
+		t.Fatalf("no reason: %v", err)
+	}
+	// A host name a line cannot hold: no line, the key all the same.
+	r.exit, r.stderr, r.stdout = 0, "", `{"format":1,"public_key":"ssh-ed25519 `+edKey+`","retired":true,"note":"no known_hosts line: the VM's host name cannot sit in one"}`
+	if key, err := v.RetireHostKey(context.Background()); err != nil || key != "ssh-ed25519 "+edKey {
+		t.Fatalf("no line: %q %v", key, err)
+	}
 	for name, c := range map[string]vmRecorder{
 		"exit 3 without its object": {exit: 3},
 		"a failure":                 {exit: 1, stderr: "the mark on /oem not written"},
-		"an rsa key":                {stdout: `{"format":1,"known_hosts_line":"notes ssh-rsa ` + edKey + `"}`},
-		"no format":                 {stdout: `{"known_hosts_line":"notes ssh-ed25519 ` + edKey + `"}`},
-		"data after":                {stdout: `{"format":1,"known_hosts_line":"notes ssh-ed25519 ` + edKey + `"} x`},
+		"an rsa key":                {stdout: `{"format":1,"public_key":"ssh-rsa ` + edKey + `","retired":true}`},
+		"no format":                 {stdout: `{"public_key":"ssh-ed25519 ` + edKey + `","retired":true}`},
+		"exit 0, not retired":       {stdout: `{"format":1,"public_key":"ssh-ed25519 ` + edKey + `","retired":false}`},
+		"exit 1, retired":           {exit: 1, stdout: `{"format":1,"public_key":"ssh-ed25519 ` + edKey + `","retired":true}`},
+		"exit 1, no retired":        {exit: 1, stdout: `{"format":1,"public_key":"ssh-ed25519 ` + edKey + `"}`},
+		"exit 1, not JSON":          {exit: 1, stdout: "sshd: oops"},
+		"a host in public_key":      {stdout: `{"format":1,"public_key":"notes ssh-ed25519 ` + edKey + `","retired":true}`},
+		"an empty public_key":       {stdout: `{"format":1,"public_key":"","retired":true}`},
+		"data after":                {stdout: `{"format":1,"public_key":"ssh-ed25519 ` + edKey + `","known_hosts_line":"notes ssh-ed25519 ` + edKey + `","retired":true} x`},
 	} {
 		c := c
-		if _, err := (VM{Runner: &c, Short: "notes"}).RetireHostKey(context.Background()); err == nil || errors.As(err, &refused) {
+		var failed *FailedError
+		_, err := (VM{Runner: &c, Short: "notes"}).RetireHostKey(context.Background())
+		if err == nil || errors.As(err, &refused) || errors.As(err, &nr) || (name != "no format" && !errors.As(err, &failed)) {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
@@ -325,5 +350,15 @@ func TestRetireHostKeyUnknownVerb(t *testing.T) {
 	r := &vmRecorder{exit: 1, stderr: `Error: unknown command "host-key" for "notes-stow"`}
 	if _, err := (VM{Runner: r, Short: "notes"}).RetireHostKey(context.Background()); err == nil || !strings.Contains(err.Error(), "has no host-key verb") {
 		t.Fatalf("%v", err)
+	}
+}
+
+// An exit-1 object whose stderr happens to say "unknown command" is still read as the object.
+func TestRetireHostKeyObjectFirst(t *testing.T) {
+	t.Parallel()
+	r := &vmRecorder{exit: 1, stdout: `{"format":1,"public_key":"ssh-ed25519 ` + edKey + `","retired":false}`, stderr: "systemctl: unknown command reload"}
+	var nr *NotRetiredError
+	if key, err := (VM{Runner: r, Short: "notes"}).RetireHostKey(context.Background()); key == "" || !errors.As(err, &nr) {
+		t.Fatalf("%q %v", key, err)
 	}
 }

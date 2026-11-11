@@ -98,7 +98,7 @@ func newVMFake() *vmFake {
 		"upgrade":  {stdout: `{"format":1,"result":"done","release":{"version":"1.1.0","revision":1}}`},
 		"rollback": {stdout: `{"format":1,"result":"done","release":{"version":"1.2.0","revision":1}}`},
 		"hostkey":  {stdout: "ssh-ed25519 " + ownKey + " root@notes\n"},
-		"retire":   {stdout: `{"format":1,"known_hosts_line":"notes ssh-ed25519 ` + ownKey + `","fingerprint":"SHA256:own"}`},
+		"retire":   {stdout: `{"format":1,"public_key":"ssh-ed25519 ` + ownKey + `","known_hosts_line":"notes ssh-ed25519 ` + ownKey + `","retired":true,"fingerprint":"SHA256:own"}`},
 		"probe":    {}, // the installer is found
 	}}
 }
@@ -1609,7 +1609,7 @@ func TestVMRetireRetryComparesTheKey(t *testing.T) {
 		return h, f, a.NewState
 	}
 	h, f, state := setup(t)
-	f.set("retire", reply{stdout: `{"format":1,"known_hosts_line":"NOTES.example. ssh-ed25519 ` + ownKey + `","fingerprint":"SHA256:own"}`})
+	f.set("retire", reply{stdout: `{"format":1,"public_key":"ssh-ed25519 ` + ownKey + `","known_hosts_line":"NOTES.example. ssh-ed25519 ` + ownKey + `","retired":true,"fingerprint":"SHA256:own"}`})
 	moved := h.vmConfig("1.1.0", map[string]tftypes.Value{"vm": h.vmBlock("1.1.0", map[string]tftypes.Value{"host": str("vm.example")}),
 		"inputs": strMap(map[string]string{"ADMIN_EMAIL": "c@d"})})
 	up := h.update(state, moved)
@@ -1617,7 +1617,7 @@ func TestVMRetireRetryComparesTheKey(t *testing.T) {
 		t.Fatalf("another host field, the same key: %s seed_boot_id %s", d, vmAttr(t, h, up.NewState, "seed_boot_id"))
 	}
 	h, f, state = setup(t)
-	f.set("retire", reply{stdout: `{"format":1,"known_hosts_line":"notes ssh-ed25519 ` + edKey + `","fingerprint":"SHA256:x"}`})
+	f.set("retire", reply{stdout: `{"format":1,"public_key":"ssh-ed25519 ` + edKey + `","known_hosts_line":"notes ssh-ed25519 ` + edKey + `","retired":true,"fingerprint":"SHA256:x"}`})
 	got := errorsOf(h.update(state, h.vmConfig("1.1.0", map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "c@d"})})).Diagnostics)
 	if !strings.Contains(got, "The VM's own host key changed") || len(f.callsOf("install")) != 0 || slices.Contains(f.ops(), "hostkey") {
 		t.Fatalf("another key: %q, calls %q", got, f.ops())
@@ -1659,7 +1659,7 @@ func TestVMUpgradeNothingStopsOnAnotherKey(t *testing.T) {
 	f.then("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", "")})
 	f.set("status", reply{stdout: vmStatusJSON("1.2.0", "boot-1", "")})
 	f.set("upgrade", reply{stdout: `{"format":1,"result":"nothing","release":{"version":"1.2.0","revision":1}}`})
-	f.set("retire", reply{stdout: `{"format":1,"known_hosts_line":"notes ssh-ed25519 ` + edKey + `","fingerprint":"SHA256:x"}`})
+	f.set("retire", reply{stdout: `{"format":1,"public_key":"ssh-ed25519 ` + edKey + `","known_hosts_line":"notes ssh-ed25519 ` + edKey + `","retired":true,"fingerprint":"SHA256:x"}`})
 	up := h.update(a.NewState, h.vmConfig("1.2.0", nil))
 	if got := errorsOf(up.Diagnostics); !strings.Contains(got, "The VM's own host key changed") || !strings.Contains(got, "vm:<host>/<short>-stow") || len(f.callsOf("install")) != 0 {
 		t.Fatalf("got %q, calls %q", got, f.ops())
@@ -1695,5 +1695,41 @@ func TestVMRetireCutByTheTimeout(t *testing.T) {
 	d := diagText(a.Diagnostics)
 	if !strings.Contains(d, "The VM's own host key was not read") || !strings.Contains(d, "ssh-keygen -lf") || strings.Contains(d, "reading it alone") {
 		t.Fatalf("%s, calls %q", d, f.ops())
+	}
+}
+
+// A host-key whose sshd reload did not take (exit 1, "retired": false) gives the VM's key: state
+// records it, the one-time key still accepted beside it, no check of the own key alone run, and
+// the warning names the reload.
+func TestVMRetireReloadNotTaken(t *testing.T) {
+	t.Parallel()
+	h, f := newVMHarness(t)
+	f.set("retire", reply{exit: 1, stdout: `{"format":1,"public_key":"ssh-ed25519 ` + ownKey + `","retired":false,"reason":"sshd did not reload: it may serve the one-time key until it does"}`,
+		stderr: "error: sshd did not reload; run `sudo systemctl reload ssh`, or reboot the VM"})
+	cfg := h.vmConfig("1.1.0", nil)
+	a := h.apply(nil, h.plan(nil, cfg).PlannedState, cfg)
+	d := diagText(a.Diagnostics)
+	if errorsOf(a.Diagnostics) != "" || !strings.Contains(d, "sudo systemctl reload ssh") || vmAttr(t, h, a.NewState, "host_key_line") != ownLine ||
+		vmAttr(t, h, a.NewState, "seed_boot_id") != "boot-1" || !slices.Contains(f.ops(), "retire") || slices.Contains(f.ops()[slices.Index(f.ops(), "retire"):], "hostkey") ||
+		strings.Contains(d, "no reboot needed") {
+		t.Fatalf("%s %s %s %q", d, vmAttr(t, h, a.NewState, "host_key_line"), vmAttr(t, h, a.NewState, "seed_boot_id"), f.ops())
+	}
+}
+
+// A retry whose reload is still not taken keeps seed, runs no check of the own key alone.
+func TestVMRetryReloadNotTaken(t *testing.T) {
+	t.Parallel()
+	h, f := newVMHarness(t)
+	f.retireNoop = true
+	f.then("status", reply{stdout: vmStatusJSON("1.1.0", "", "")}, reply{stdout: vmStatusJSON("1.1.0", "", "")})
+	cfg := h.vmConfig("1.1.0", nil)
+	a := h.apply(nil, h.plan(nil, cfg).PlannedState, cfg)
+	f.reset()
+	f.retireNoop = false
+	f.set("retire", reply{exit: 1, stdout: `{"format":1,"public_key":"ssh-ed25519 ` + ownKey + `","retired":false,"reason":"sshd did not reload"}`})
+	up := h.update(a.NewState, h.vmConfig("1.1.0", map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "c@d"})}))
+	if errorsOf(up.Diagnostics) != "" || vmAttr(t, h, up.NewState, "seed_boot_id") != unreadBoot || !strings.Contains(diagText(up.Diagnostics), "still not retired") ||
+		slices.Contains(f.ops()[slices.Index(f.ops(), "retire")+1:], "hostkey") {
+		t.Fatalf("%s %s %q", diagText(up.Diagnostics), vmAttr(t, h, up.NewState, "seed_boot_id"), f.ops())
 	}
 }

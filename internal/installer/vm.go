@@ -2,6 +2,7 @@ package installer
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -266,18 +267,34 @@ func (v VM) Boot(ctx context.Context, name string) error {
 	return nil
 }
 
-// hostKeyResult is the VM's `<short>-stow host-key --json`: its own SSH host key as a known_hosts
-// line, under the VM's host name (its fingerprint is not read).
+// hostKeyResult is the VM's `<short>-stow host-key --json`: its own SSH host key, and whether the
+// seed's one-time key is retired (its files gone, sshd's reload taken), the reason when not.
 type hostKeyResult struct {
-	Format         *int   `json:"format"`
-	KnownHostsLine string `json:"known_hosts_line"`
+	Format    *int   `json:"format"`
+	PublicKey string `json:"public_key"`
+	Retired   *bool  `json:"retired"`
+	Reason    string `json:"reason"`
+}
+
+// NotRetiredError is a host-key run that read the VM's own key but whose retirement did not take
+// (sshd did not reload): the VM may serve the one-time key until it does. Reason and Stderr are
+// the installer's, its fix among them.
+type NotRetiredError struct{ Reason, Stderr string }
+
+func (e *NotRetiredError) Error() string {
+	msg := "host-key read the VM's own key, but the one-time key is not retired: " + e.Reason
+	if e.Stderr != "" {
+		msg += "\n" + e.Stderr
+	}
+	return msg
 }
 
 // RetireHostKey runs `sudo -n <short>-stow host-key --json` on the VM: the VM's own ed25519 host
-// key, read, and the seed's one-time key retired by Stowage's own steps (run again, it changes
-// nothing more). Its refusal (exit 3: a recovery or live boot, not run as root, the first install
-// not done, a host name a known_hosts line cannot hold) is a *RefusedError; its key is
-// "ssh-ed25519 <base64>" (the line's host field is not read).
+// key, "ssh-ed25519 <base64>" (`public_key`, whatever the VM's host name), and the seed's one-time
+// key retired by Stowage's own steps (run again, it changes nothing more). A run whose reload did
+// not take (exit 1, `"retired": false`) gives the key with a *NotRetiredError; a refusal (exit 3:
+// a recovery or live boot, not run as root, the first install not done) is a *RefusedError, no
+// key; any other failure, no key.
 func (v VM) RetireHostKey(ctx context.Context) (string, error) {
 	ctl, err := v.ctl()
 	if err != nil {
@@ -287,37 +304,46 @@ func (v VM) RetireHostKey(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("host-key: %w", err)
 	}
-	switch exit {
-	case 0:
-	case 3:
-		r, err := ParseRefused("host-key --json", stdout, stderr)
+	const doc = "host-key --json"
+	out := bytes.TrimSpace(stdout)
+	failed := func(cause error) error {
+		return &FailedError{Verb: "host-key", Exit: exit, Stderr: tail(stderr), Cause: cause}
+	}
+	switch {
+	case exit == 3:
+		r, err := ParseRefused(doc, stdout, stderr)
 		if err != nil {
 			return "", err
 		}
 		return "", r
-	case 1:
-		if bytes.Contains(stderr, []byte("unknown command")) {
-			return "", &FailedError{Verb: "host-key", Exit: exit, Stderr: tail(stderr),
-				Cause: fmt.Errorf("the VM's %s has no host-key verb: its OS carries an installer built before Stowage %s's; the reboot of the next release change retires the one-time key: set vm.version to a release built by Stowage %s or later and apply", ctl, MinStowage, MinStowage)}
-		}
-		return "", &FailedError{Verb: "host-key", Exit: exit, Stderr: tail(stderr)}
-	default:
-		return "", &FailedError{Verb: "host-key", Exit: exit, Stderr: tail(stderr)}
+	case exit == 1 && len(out) == 0 && bytes.Contains(stderr, []byte("unknown command")):
+		return "", failed(fmt.Errorf("the VM's %s has no host-key verb: its OS carries an installer built before Stowage %s's; the reboot of the next release change retires the one-time key: set vm.version to a release built by Stowage %s or later and apply", ctl, MinStowage, MinStowage))
+	case exit != 0 && exit != 1, len(out) == 0:
+		return "", failed(nil)
 	}
-	const doc = "host-key --json"
 	var h hostKeyResult
-	if err := decodeOne(doc, bytes.TrimSpace(stdout), &h); err != nil {
-		return "", err
+	if err := decodeOne(doc, out, &h); err != nil {
+		return "", failed(err)
 	}
 	if err := checkFormat(doc, h.Format); err != nil {
 		return "", err
 	}
-	k, err := target.ParseKnownHostsLine(h.KnownHostsLine)
-	if err != nil {
-		return "", fmt.Errorf("%s: %w", doc, err)
+	if h.Retired == nil {
+		return "", failed(fmt.Errorf("%s: no retired: the installer breaks the machine interface", doc))
 	}
-	if k.Type != "ssh-ed25519" {
-		return "", fmt.Errorf("%s: a %s key, not the VM's ed25519 one", doc, k.Type)
+	f := strings.Fields(h.PublicKey)
+	if len(f) != 2 || f[0] != "ssh-ed25519" {
+		return "", failed(fmt.Errorf("%s: public_key %q is not an ed25519 public key (`ssh-ed25519 <base64>`)", doc, h.PublicKey))
 	}
-	return k.Type + " " + k.Key, nil
+	if _, err := target.ParseKnownHostsLine(h.PublicKey); err != nil {
+		return "", failed(fmt.Errorf("%s: public_key: %w", doc, err))
+	}
+	key := f[0] + " " + f[1]
+	switch {
+	case exit == 0 && *h.Retired:
+		return key, nil
+	case exit == 1 && !*h.Retired:
+		return key, &NotRetiredError{Reason: cmp.Or(h.Reason, "sshd did not reload"), Stderr: tail(stderr)}
+	}
+	return "", failed(fmt.Errorf("%s: exit %d with retired %v: the installer breaks the machine interface", doc, exit, *h.Retired))
 }

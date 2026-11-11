@@ -499,24 +499,30 @@ argument.
      install runs again and finishes). Then `vm.channel`, when given, must be the channel the VM
      follows (the `vm` block's `channel` row), else an error saving no state.
   5. The one-time key retired by the VM's own verb, `sudo -n <short>-stow host-key --json`
-     (Stowage's steps; run again it changes nothing more), whose `known_hosts_line` is the VM's
-     own key: `vm.host_key_line`, `<vm.host> ssh-ed25519 <base64>` (the `vm.host` it was learnt under: a
-     line's host field is never read, the connection naming the key by its alias). The retirement is then
-     checked — the verb exits 0 whether or not sshd took its reload — by a connection accepting
-     that key alone answering, reading it again (`cat /etc/ssh/ssh_host_ed25519_key.pub`), tried for six
-     polls, a minute (`… when its six polls (a minute) ran out`), which also waits out sshd's
-     reload. A refusal of the verb (exit 3: a recovery or live boot, not run as root, the first
-     install not done, a host name a known_hosts line cannot hold — the line's host field is not
-     read), its failure (an installer without the verb is named: `has no host-key verb`, with the
-     hand upgrade) or a check that fails is a warning (`The VM's one-time host key was not
-     retired`; after the verb ran, it says the key's files are retired and sshd's reload is
-     pending, which the next update's retry finishes with no reboot), and `vm.seed_boot_id` is
-     set: the one-time key is accepted beside the VM's own until a later boot or an update whose
-     retry holds. A retry whose verb prints another key than state's `vm.host_key_line` (by the
-     key alone, whatever its host field) is an error that stops the update (`The VM's own host key
-     changed`), naming the fix. When the verb gave no key, the key is read alone through the one-time key
-     (`cat` as above); a failure of that too is a warning (`The VM's own host key was not read`):
-     the connection keeps accepting `known_hosts_line` alone, which the VM's next boot retires.
+     (Stowage's steps, sshd's reload checked; run again it changes nothing more), whose
+     `public_key` is the VM's own key: `vm.host_key_line`, `<vm.host> ssh-ed25519 <base64>` (the
+     `vm.host` it was learnt under: a line's host field is never read, the connection naming the
+     key by its alias; the verb's own host name, and its `known_hosts_line`, are not read
+     either). A retirement the verb says took (`"retired": true`) is then checked by a connection
+     accepting that key alone answering, reading it again (`cat
+     /etc/ssh/ssh_host_ed25519_key.pub`), tried for six polls, a minute (`… when its six polls
+     (a minute) ran out`): sshd's reload is a signal its unit does not wait out, so this lets the
+     next connection find its listener, and it is the one observation that the VM serves its own
+     key alone before state drops the one-time key from every connection. A reload not taken
+     (exit 1, `"retired": false` with its reason; the warning carries the installer's message and
+     fix: reload sshd on the VM, or reboot it, then apply a change), a check that fails (the
+     files retired, sshd not serving the VM's own key alone yet: the next update with a change
+     tries again, no reboot needed), a refusal of the verb (exit 3: a recovery or live boot, not
+     run as root, the first install not done) or its failure (an installer without the verb is
+     named: `has no host-key verb`, with the `vm.version` change that moves it on) is a warning
+     (`The VM's one-time host key was not retired`), and `vm.seed_boot_id` is set: the one-time key is accepted beside the VM's own
+     until a later boot or an update whose retry holds. When the verb gave no key (a refusal, a
+     failed step, no verb), the key is read alone through the one-time key (`cat` as above), so
+     the connection accepts both whatever the verb left; a failure of that too is a warning (`The
+     VM's own host key was not read`): the connection keeps accepting `known_hosts_line` alone,
+     which the VM's next boot retires. A retry whose verb prints another key than state's
+     `vm.host_key_line` (by the key alone) is an error that stops the update (`The VM's own host
+     key changed`), naming the line to give and the import.
 - **Read**: `status --json`; one that finds no `<short>-stow` on the VM (a release that renamed its installer) names the route to take the install over, as an update's read does: the VM's own key in `vm.known_hosts_line` (state's `vm.host_key_line`; with `vm.seed_boot_id` set, reboot the VM first, which retires its one-time key; else the key checked on its console), then `tofu state rm` and `tofu import` under the new name. It counts as missing when the run fails (any exit but ssh's 255: shells give a missing command 127, tcsh 1) and the VM's shell does not find `<short>-stow` either (`sh -c 'command -v <short>-stow'`, whatever the shell's language): a program the installer runs missing is not it. A check that itself fails is said (`could not be checked`). The first boot's wait stops at once on it too. No release installed and no first install running or failed removes
   the resource from state (the next apply installs again). The release the VM runs replaces
   `vm.version` in state, so a VM whose health gate fell back shows its real release and the next
