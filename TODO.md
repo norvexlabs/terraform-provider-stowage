@@ -15,12 +15,3 @@ installer's machine interface and decides nothing itself. A finished item is del
 7. **First release** (P5), on the maintainer's decision: a GPG key for the release
    (`GPG_FINGERPRINT`); a release workflow (GoReleaser on a pushed tag); registry submission by
    hand.
-
-## Should
-
-- **Blocked on Stowage — a verb on the VM that retires the one-time host key** and prints the VM's
-  own key (`sudo <short>-stow host-key --json` → `{known_hosts_line, fingerprint}`, refused on the
-  recovery or live system). `vm host-key` does it from the operator's machine over its own SSH
-  (no port, no `~/.ssh/config`), so the provider runs the steps Stowage's README documents
-  itself (the key's file and drop-in removed, the `.retired` mark, sshd reloaded, the recovery and
-  live systems refused): a copy of that rule, to drop once the VM's verb exists.

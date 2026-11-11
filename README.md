@@ -498,18 +498,19 @@ argument.
      an `install_failed`, or no release installed, is an error saving no state (apply again: the
      install runs again and finishes). Then `vm.channel`, when given, must be the channel the VM
      follows (the `vm` block's `channel` row), else an error saving no state.
-  5. `cat /etc/ssh/ssh_host_ed25519_key.pub` through the one-time key, which vouches for it:
-     `vm.host_key_line`. A failure is a warning (`The VM's own host key was not read`): the
-     connection keeps accepting `known_hosts_line` alone, which the VM's next boot retires.
-  6. The one-time key retired as `vm host-key` retires it, by the files Stowage's README names:
-     `sudo -n sh -c '…' sh <name>` — on Kairos's recovery or live system (`/run/cos/recovery_mode`,
-     `/run/cos/live_mode`) it changes nothing and exits 3, a failed retirement — removes `/run/<name>-seed-host-key` and
-     `/etc/ssh/sshd_config.d/01-<name>-seed-host-key.conf`, touches
-     `/oem/<name>-seed-host-key.retired` and reloads sshd; then a connection accepting the VM's own
-     key alone reads it again, tried for six polls, a minute (`… when its six polls (a minute) ran
-     out`). A failure is a warning (`The VM's
-     one-time host key was not retired`), and `vm.seed_boot_id` is set: the one-time key is
-     accepted beside the VM's own until a later boot.
+  5. The one-time key retired by the VM's own verb, `sudo -n <short>-stow host-key --json`
+     (Stowage's steps; run again it changes nothing more), whose `known_hosts_line` is the VM's
+     own key: `vm.host_key_line`, `<vm.host> ssh-ed25519 <base64>`. The retirement is then
+     proved — the verb exits 0 whether or not sshd took its reload — by a connection accepting
+     that key alone reading it again (`cat /etc/ssh/ssh_host_ed25519_key.pub`), tried for six
+     polls, a minute (`… when its six polls (a minute) ran out`), which also waits out sshd's
+     reload. A refusal of the verb (exit 3: a recovery or live boot, the first install not done),
+     its failure (an installer without the verb is named: `has no host-key verb`) or a proof that
+     fails is a warning (`The VM's one-time host key was not retired`), and `vm.seed_boot_id` is
+     set: the one-time key is accepted beside the VM's own until a later boot or an update whose
+     retry holds. When the verb gave no key, the key is read alone through the one-time key
+     (`cat` as above); a failure of that too is a warning (`The VM's own host key was not read`):
+     the connection keeps accepting `known_hosts_line` alone, which the VM's next boot retires.
 - **Read**: `status --json`; one that finds no `<short>-stow` on the VM (a release that renamed its installer) names the route to take the install over, as an update's read does: the VM's own key in `vm.known_hosts_line` (state's `vm.host_key_line`; with `vm.seed_boot_id` set, reboot the VM first, which retires its one-time key; else the key checked on its console), then `tofu state rm` and `tofu import` under the new name. It counts as missing when the run fails (any exit but ssh's 255: shells give a missing command 127, tcsh 1) and the VM's shell does not find `<short>-stow` either (`sh -c 'command -v <short>-stow'`, whatever the shell's language): a program the installer runs missing is not it. A check that itself fails is said (`could not be checked`). The first boot's wait stops at once on it too. No release installed and no first install running or failed removes
   the resource from state (the next apply installs again). The release the VM runs replaces
   `vm.version` in state, so a VM whose health gate fell back shows its real release and the next
@@ -525,10 +526,11 @@ argument.
      (`The VM reports no boot_id`: its reboot could not be followed). Then the keys,
      before anything else changes on the VM: when state has no `vm.host_key_line` yet (it could
      not be read at create; an imported state), the VM's own key is learnt under the
-     configuration's key as at create (steps 5 and 6: read, the one-time key retired and the
+     configuration's key as at create (step 5: the verb, the one-time key retired and the
      retirement proved, else `vm.seed_boot_id` set); when `vm.seed_boot_id` is set (a retirement
      that failed), it is null at once when the status shows a later boot (which retired the key),
-     left to the reboot of a release change, and else tried again — null on success, a warning
+     left to the reboot of a release change, and else tried again (the verb and its proof, the
+     key it gives the one state holds) — null on success, a warning
      (`The VM's one-time host key is still not retired`) on failure. Either is saved at once, with
      the configuration's connection, whatever fails after it. A release change whose own key could not be read is an error
      before anything else runs (`The VM's own host key is not known`): its reboot would retire
@@ -633,7 +635,8 @@ state's first apply also plans `registry` unknown (it records the provider's).
 - **Stowage 0.35.0 or later**: `status --json` listing every input key an install records, the
   settings its first install recorded (`registry`, `short_name`, `address`, `registry_ca`), the
   refusals' `absent`, `describe`'s `routes`, `k8s --image-pull-login`, and `vm seed`'s
-  `meta_data`, sizes, `disk_file`, `--await-secrets` and `--tls byo` are read as Stowage 0.35.0
+  `meta_data`, sizes, `disk_file`, `--await-secrets` and `--tls byo`, and the VM's `<short>-stow
+  host-key --json` are read as Stowage 0.35.0
   gives them. An installer of Stowage 0.34.0 speaks format 1 without them: its `describe` lists no
   `routes`, which is refused (`no routes: the installer predates the machine interface this
   provider reads`), before any verb; an install whose kept installer is one is refused at its

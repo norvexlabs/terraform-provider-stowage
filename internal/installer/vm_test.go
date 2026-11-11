@@ -6,13 +6,9 @@ import (
 	"context"
 	"errors"
 	"io"
-	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
-
-	"github.com/norvexlabs/terraform-provider-stowage/internal/target"
 )
 
 const edKey = "AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
@@ -265,40 +261,31 @@ func TestHasCtl(t *testing.T) {
 	}
 }
 
-// RetireScript under a real sh, its paths moved under a test directory: on the active system it
-// removes the key and its drop-in and marks the retirement; on the recovery or live system it
-// changes nothing and exits 3.
-func TestRetireScript(t *testing.T) {
+// RetireHostKey runs the VM's own verb as root and takes its key; a refusal is one, and a line of
+// another key type, or exit 3 without its object, is an error.
+func TestRetireHostKey(t *testing.T) {
 	t.Parallel()
-	for _, mode := range []string{"", "recovery_mode", "live_mode"} {
-		root := t.TempDir()
-		script := strings.NewReplacer("/run/", root+"/run/", "/etc/ssh/", root+"/etc/ssh/", "/oem/", root+"/oem/").Replace(RetireScript)
-		for _, d := range []string{"run/cos", "etc/ssh/sshd_config.d", "oem"} {
-			if err := os.MkdirAll(filepath.Join(root, d), 0o755); err != nil {
-				t.Fatal(err)
-			}
-		}
-		key, dropIn := filepath.Join(root, "run/notes-seed-host-key"), filepath.Join(root, "etc/ssh/sshd_config.d/01-notes-seed-host-key.conf")
-		for _, f := range []string{key, dropIn} {
-			if err := os.WriteFile(f, []byte("x"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if mode != "" {
-			if err := os.WriteFile(filepath.Join(root, "run/cos", mode), nil, 0o600); err != nil {
-				t.Fatal(err)
-			}
-		}
-		_, stderr, exit, err := target.Local{}.Run(context.Background(), []string{"env", "PATH=/usr/bin:/bin", "sh", "-c", script, "sh", "notes"}, nil)
-		_, keyErr := os.Stat(key)
-		_, markErr := os.Stat(filepath.Join(root, "oem/notes-seed-host-key.retired"))
-		switch {
-		case err != nil:
-			t.Fatal(err)
-		case mode == "" && (exit != 0 || !os.IsNotExist(keyErr) || markErr != nil):
-			t.Errorf("active: exit %d %s, key %v, mark %v", exit, stderr, keyErr, markErr)
-		case mode != "" && (exit != 3 || keyErr != nil || !os.IsNotExist(markErr)):
-			t.Errorf("%s: exit %d %s, key %v, mark %v", mode, exit, stderr, keyErr, markErr)
+	r := &vmRecorder{stdout: `{"format":1,"known_hosts_line":"notes ssh-ed25519 ` + edKey + `","fingerprint":"SHA256:x"}`}
+	v := VM{Runner: r, Short: "notes"}
+	key, err := v.RetireHostKey(context.Background())
+	if err != nil || key != "ssh-ed25519 "+edKey || !slices.Equal(r.argv, []string{"sudo", "-n", "notes-stow", "host-key", "--json"}) {
+		t.Fatalf("%q %v %q", key, err, r.argv)
+	}
+	r.exit, r.stdout = 3, `{"format":1,"refused":{"reason":"this is Kairos's recovery system or a live boot","fix":"run it again once the VM rebooted"}}`
+	var refused *RefusedError
+	if _, err := v.RetireHostKey(context.Background()); !errors.As(err, &refused) || !strings.Contains(refused.Reason, "recovery") {
+		t.Fatalf("refused: %v", err)
+	}
+	for name, c := range map[string]vmRecorder{
+		"exit 3 without its object": {exit: 3},
+		"a failure":                 {exit: 1, stderr: "the mark on /oem not written"},
+		"an rsa key":                {stdout: `{"format":1,"known_hosts_line":"notes ssh-rsa ` + edKey + `"}`},
+		"no format":                 {stdout: `{"known_hosts_line":"notes ssh-ed25519 ` + edKey + `"}`},
+		"data after":                {stdout: `{"format":1,"known_hosts_line":"notes ssh-ed25519 ` + edKey + `"} x`},
+	} {
+		c := c
+		if _, err := (VM{Runner: &c, Short: "notes"}).RetireHostKey(context.Background()); err == nil || errors.As(err, &refused) {
+			t.Errorf("%s: %v", name, err)
 		}
 	}
 }
@@ -329,5 +316,14 @@ func TestDescribePre035Hints(t *testing.T) {
 	}
 	if _, err := (K8s{Runner: &vmRecorder{stdout: old}, Name: "notes"}).Describe(context.Background()); !errors.Is(err, ErrPreRoutes) || !strings.Contains(err.Error(), "its own `k8s upgrade --version V`") {
 		t.Errorf("k8s: %v", err)
+	}
+}
+
+// An installer whose host-key verb is unknown (older than the provider reads) is named so.
+func TestRetireHostKeyUnknownVerb(t *testing.T) {
+	t.Parallel()
+	r := &vmRecorder{exit: 1, stderr: `Error: unknown command "host-key" for "notes-stow"`}
+	if _, err := (VM{Runner: r, Short: "notes"}).RetireHostKey(context.Background()); err == nil || !strings.Contains(err.Error(), "has no host-key verb") {
+		t.Fatalf("%v", err)
 	}
 }

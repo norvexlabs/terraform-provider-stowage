@@ -1,6 +1,7 @@
 package installer
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -265,33 +266,57 @@ func (v VM) Boot(ctx context.Context, name string) error {
 	return nil
 }
 
-// RetireScript retires a VM's one-time host key as `vm host-key` does, by the files Stowage's
-// README names: the key and its sshd drop-in removed, its retirement marked on the OEM partition
-// (no later boot serves it again), sshd reloaded. On Kairos's recovery or live system it changes
-// nothing and exits 3: the first boot is not done, and the active system serves the key until
-// then. Argument: the project's name.
-const RetireScript = `set -eu
-n=$1
-if [ -e /run/cos/recovery_mode ] || [ -e /run/cos/live_mode ]; then
-  echo "the VM answers from its recovery or live system: its first boot is not done, and the one-time key is kept" >&2
-  exit 3
-fi
-rm -f "/run/$n-seed-host-key" "/etc/ssh/sshd_config.d/01-$n-seed-host-key.conf"
-touch "/oem/$n-seed-host-key.retired"
-for u in ssh.service sshd.service; do systemctl try-reload-or-restart "$u" 2>/dev/null || true; done
-`
+// hostKeyResult is the VM's `<short>-stow host-key --json`: its own SSH host key as a known_hosts
+// line, under the VM's host name (its fingerprint is not read).
+type hostKeyResult struct {
+	Format         *int   `json:"format"`
+	KnownHostsLine string `json:"known_hosts_line"`
+}
 
-// RetireSeed runs RetireScript as root on the VM.
-func (v VM) RetireSeed(ctx context.Context, name string) error {
-	if !ValidName(name) {
-		return fmt.Errorf("%q is not a project's name", name)
-	}
-	_, stderr, exit, err := v.Runner.Run(ctx, []string{"sudo", "-n", "sh", "-c", RetireScript, "sh", name}, nil)
+// RetireHostKey runs `sudo -n <short>-stow host-key --json` on the VM: the VM's own ed25519 host
+// key, read, and the seed's one-time key retired by Stowage's own steps (run again, it changes
+// nothing more). Its refusal (exit 3: a recovery or live boot, no install done) is a
+// *RefusedError; its key is "ssh-ed25519 <base64>".
+func (v VM) RetireHostKey(ctx context.Context) (string, error) {
+	ctl, err := v.ctl()
 	if err != nil {
-		return fmt.Errorf("retiring the one-time host key: %w", err)
+		return "", err
 	}
-	if exit != 0 {
-		return &FailedError{Verb: "retiring the one-time host key", Exit: exit, Stderr: tail(stderr)}
+	stdout, stderr, exit, err := v.Runner.Run(ctx, []string{"sudo", "-n", ctl, "host-key", "--json"}, nil)
+	if err != nil {
+		return "", fmt.Errorf("host-key: %w", err)
 	}
-	return nil
+	switch exit {
+	case 0:
+	case 3:
+		r, err := ParseRefused("host-key --json", stdout, stderr)
+		if err != nil {
+			return "", err
+		}
+		return "", r
+	case 1:
+		if bytes.Contains(stderr, []byte("unknown command")) {
+			return "", &FailedError{Verb: "host-key", Exit: exit, Stderr: tail(stderr),
+				Cause: fmt.Errorf("the VM's %s has no host-key verb: its OS carries an installer older than this provider reads (Stowage %s or later)", ctl, MinStowage)}
+		}
+		return "", &FailedError{Verb: "host-key", Exit: exit, Stderr: tail(stderr)}
+	default:
+		return "", &FailedError{Verb: "host-key", Exit: exit, Stderr: tail(stderr)}
+	}
+	const doc = "host-key --json"
+	var h hostKeyResult
+	if err := decodeOne(doc, bytes.TrimSpace(stdout), &h); err != nil {
+		return "", err
+	}
+	if err := checkFormat(doc, h.Format); err != nil {
+		return "", err
+	}
+	k, err := target.ParseKnownHostsLine(h.KnownHostsLine)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", doc, err)
+	}
+	if k.Type != "ssh-ed25519" {
+		return "", fmt.Errorf("%s: a %s key, not the VM's ed25519 one", doc, k.Type)
+	}
+	return k.Type + " " + k.Key, nil
 }

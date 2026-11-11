@@ -36,7 +36,8 @@ type vmFake struct {
 	retired bool
 	// callConns[i] is the connection calls[i] was made over.
 	callConns []Connection
-	// retireNoop: the retire op exits 0 but sshd goes on serving the one-time key.
+	// retireNoop: the retire op exits 0 but sshd goes on serving the one-time key (its reload not
+	// taken).
 	retireNoop bool
 }
 
@@ -61,7 +62,7 @@ func vmOp(argv []string) string {
 		return "status"
 	case len(argv) > 4 && argv[0] == "sudo" && argv[2] == "systemctl":
 		return "boot"
-	case len(argv) > 4 && argv[0] == "sudo" && argv[2] == "sh" && argv[4] == installer.RetireScript:
+	case len(argv) == 5 && argv[0] == "sudo" && argv[3] == "host-key" && argv[4] == "--json":
 		return "retire"
 	case len(argv) > 3 && argv[0] == "sudo":
 		return argv[3]
@@ -95,7 +96,7 @@ func newVMFake() *vmFake {
 		"upgrade":  {stdout: `{"format":1,"result":"done","release":{"version":"1.1.0","revision":1}}`},
 		"rollback": {stdout: `{"format":1,"result":"done","release":{"version":"1.2.0","revision":1}}`},
 		"hostkey":  {stdout: "ssh-ed25519 " + ownKey + " root@notes\n"},
-		"retire":   {},
+		"retire":   {stdout: `{"format":1,"known_hosts_line":"notes ssh-ed25519 ` + ownKey + `","fingerprint":"SHA256:own"}`},
 		"probe":    {}, // the installer is found
 	}}
 }
@@ -268,14 +269,14 @@ func TestVMCreate(t *testing.T) {
 	})
 	state := h.create(config)
 	// A failed status is looked into (probe: the installer is there), then waited out.
-	want := []string{"describe", "describe", "boot", "status", "probe", "describe", "boot", "status", "describe", "install", "status", "status", "hostkey", "retire", "hostkey"}
+	want := []string{"describe", "describe", "boot", "status", "probe", "describe", "boot", "status", "describe", "install", "status", "status", "retire", "hostkey"}
 	if got := f.ops(); !slices.Equal(got, want) {
 		t.Errorf("ops\n%q\nwant\n%q", got, want)
 	}
 	if b := f.callsOf("boot")[0]; !slices.Equal(b.argv, []string{"sudo", "-n", "systemctl", "start", "notes.service"}) {
 		t.Errorf("boot %q", b.argv)
 	}
-	if r := f.callsOf("retire")[0]; r.argv[len(r.argv)-1] != "notes" {
+	if r := f.callsOf("retire")[0]; !slices.Equal(r.argv, []string{"sudo", "-n", "notes-stow", "host-key", "--json"}) {
 		t.Errorf("retire %q", r.argv)
 	}
 	in := f.callsOf("install")[0]
@@ -722,8 +723,9 @@ func TestVMFirstBootWaits(t *testing.T) {
 	}
 }
 
-// TestVMRetireNotHeld: a retirement that exits 0 while the VM still serves the one-time key is
-// a warning, the key accepted beside the VM's own; a VM without a boot id keeps it so.
+// TestVMRetireNotHeld: a retirement whose verb exits 0 while the VM still serves the one-time key
+// (sshd's reload not taken) is a warning, the key accepted beside the VM's own; a VM without a
+// boot id keeps it so.
 func TestVMRetireNotHeld(t *testing.T) {
 	t.Parallel()
 	h, f := newVMHarness(t)
@@ -765,6 +767,7 @@ func TestVMRetireNotHeld(t *testing.T) {
 func TestVMUpgradeReadsTheOwnKey(t *testing.T) {
 	t.Parallel()
 	h, f := newVMHarness(t)
+	f.then("retire", reply{exit: 1, stderr: "sudo: a password is required"})
 	f.then("hostkey", reply{exit: 1, stderr: "cat: permission denied"})
 	config := h.vmConfig("1.1.0", nil)
 	a := h.apply(nil, h.plan(nil, config).PlannedState, config)
@@ -774,6 +777,7 @@ func TestVMUpgradeReadsTheOwnKey(t *testing.T) {
 	state := a.NewState
 	// The key still cannot be read: the upgrade is refused before it runs.
 	f.reset()
+	f.set("retire", reply{exit: 1, stderr: "sudo: a password is required"})
 	f.set("hostkey", reply{exit: 1, stderr: "cat: permission denied"})
 	if got := errorsOf(h.update(state, h.vmConfig("1.2.0", nil)).Diagnostics); !strings.Contains(got, "The VM's own host key is not known") || len(f.callsOf("upgrade")) != 0 {
 		t.Errorf("no own key: %s %q", got, f.ops())
@@ -792,6 +796,7 @@ func TestVMUpgradeReadsTheOwnKey(t *testing.T) {
 	}
 	// An upgrade that falls back keeps the key it read: the reads after the reboot need it.
 	h2, f2 := newVMHarness(t)
+	f2.then("retire", reply{exit: 1, stderr: "sudo: a password is required"})
 	f2.then("hostkey", reply{exit: 1, stderr: "cat: permission denied"})
 	a = h2.apply(nil, h2.plan(nil, config).PlannedState, config)
 	f2.then("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", "")})
@@ -808,6 +813,7 @@ func TestVMUpdateLearnsTheKey(t *testing.T) {
 	t.Parallel()
 	noKey := func(t *testing.T) (*harness, *vmFake, *tfprotov6.DynamicValue) {
 		h, f := newVMHarness(t)
+		f.then("retire", reply{exit: 1, stderr: "sudo: a password is required"})
 		f.then("hostkey", reply{exit: 1, stderr: "cat: permission denied"})
 		cfg := h.vmConfig("1.1.0", nil)
 		a := h.apply(nil, h.plan(nil, cfg).PlannedState, cfg)
@@ -984,6 +990,7 @@ func TestVMKeySavedFirst(t *testing.T) {
 	t.Parallel()
 	noKey := func(t *testing.T) (*harness, *vmFake, *tfprotov6.DynamicValue) {
 		h, f := newVMHarness(t)
+		f.then("retire", reply{exit: 1, stderr: "sudo: a password is required"})
 		f.then("hostkey", reply{exit: 1, stderr: "cat: permission denied"})
 		cfg := h.vmConfig("1.1.0", nil)
 		a := h.apply(nil, h.plan(nil, cfg).PlannedState, cfg)
@@ -1031,18 +1038,6 @@ func TestVMRetireTriedAgain(t *testing.T) {
 	h.read(up.NewState)
 	if c := f.lastConn(); len(c.AlsoKnownHostsLines) != 0 {
 		t.Errorf("the one-time key is still accepted %+v", c)
-	}
-}
-
-// TestVMRetireProofCut: a retirement proof the resource's timeout cuts says so, not its own bound.
-func TestVMRetireProofCut(t *testing.T) {
-	t.Parallel()
-	h, f := newVMHarnessPoll(t, 100*time.Millisecond)
-	f.retireNoop = true
-	cfg := h.vmConfig("1.1.0", map[string]tftypes.Value{"timeouts": h.block("timeouts", map[string]tftypes.Value{"create": str("250ms")})})
-	a := h.apply(nil, h.plan(nil, cfg).PlannedState, cfg)
-	if got := diagText(a.Diagnostics); !strings.Contains(got, "the resource's timeouts block") || strings.Contains(got, "six polls") {
-		t.Errorf("got %s", got)
 	}
 }
 
@@ -1233,6 +1228,7 @@ func TestVMRetiredKeyDropped(t *testing.T) {
 func TestVMOneRetryPerApply(t *testing.T) {
 	t.Parallel()
 	h, f := newVMHarness(t)
+	f.then("retire", reply{exit: 1, stderr: "sudo: a password is required"})
 	f.then("hostkey", reply{exit: 1, stderr: "cat: permission denied"})
 	cfg := h.vmConfig("1.1.0", nil)
 	a := h.apply(nil, h.plan(nil, cfg).PlannedState, cfg)
@@ -1577,5 +1573,17 @@ func TestVMRegistryCADigest(t *testing.T) {
 	f.set("status", reply{stdout: vmStatusJSON("1.1.0", "", "")})
 	if got := asString(t, h.attrs(h.read(read).NewState)["registry_ca_digest"]); got != "sha256:bb" {
 		t.Fatalf("left out: %q", got)
+	}
+}
+
+// TestVMRetireProofCut: a retirement proof the resource's timeout cuts says so, not its own bound.
+func TestVMRetireProofCut(t *testing.T) {
+	t.Parallel()
+	h, f := newVMHarnessPoll(t, 100*time.Millisecond)
+	f.retireNoop = true
+	cfg := h.vmConfig("1.1.0", map[string]tftypes.Value{"timeouts": h.block("timeouts", map[string]tftypes.Value{"create": str("250ms")})})
+	a := h.apply(nil, h.plan(nil, cfg).PlannedState, cfg)
+	if got := diagText(a.Diagnostics); !strings.Contains(got, "the resource's timeouts block") || strings.Contains(got, "six polls") {
+		t.Errorf("got %s", got)
 	}
 }

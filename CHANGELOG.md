@@ -46,6 +46,9 @@ follow [SemVer](https://semver.org/).
   `--dry-run` on the target, so the installer's refusal is a plan error.
 - Reference documentation in `docs/`, generated from OpenTofu's own schema of the provider
   (`make docs`), never Terraform's.
+- The VM's one-time host key is retired by the VM's own `<short>-stow host-key` (Stowage 0.35.0),
+  no longer by a copy of its steps; the retirement is still proved by a connection accepting the
+  VM's own key alone.
 - A pull account's login keeps the Docker context in use, so the fetch reaches the daemon the
   machine's Docker client is set to.
 
