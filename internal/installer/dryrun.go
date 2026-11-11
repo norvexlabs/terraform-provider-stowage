@@ -67,14 +67,18 @@ func (d Docker) RemovePlanDir(ctx context.Context, dir string) error {
 // DryRunUpgrade runs the bootstrap script a plan fetched into dir (PlanDir's) `upgrade --dry-run
 // --no-input --json` on d's install, given c's inputs, secret inputs and ports: what the upgrade
 // would refuse, changing nothing. It runs in dir, so what the script extracts stays there; the
-// install is named by its absolute path, dir's parent's.
+// install is named by its absolute path in d's work directory as the apply names it (d.WorkDir,
+// absolute), so both give the installer the same spelling.
 func (d Docker) DryRunUpgrade(ctx context.Context, dir string, c Change) (*Result, error) {
 	if !strings.HasPrefix(dir, "/") || !planDirName.MatchString(pathpkg.Base(dir)) {
 		return nil, fmt.Errorf("upgrade --dry-run: %q is not a plan's directory", dir)
 	}
+	if !strings.HasPrefix(d.WorkDir, "/") {
+		return nil, fmt.Errorf("upgrade --dry-run: the work directory %q is not absolute", d.WorkDir)
+	}
 	in := d
 	in.WorkDir = dir
-	return in.upgrade(ctx, c, "./"+d.Name+".sh", pathpkg.Join(pathpkg.Dir(dir), d.Name), true)
+	return in.upgrade(ctx, c, "./"+d.Name+".sh", pathpkg.Join(d.WorkDir, d.Name), true)
 }
 
 // DryRunRollback runs the kept installer's `rollback --dry-run --json`: what the rollback would

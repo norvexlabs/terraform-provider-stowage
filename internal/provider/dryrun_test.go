@@ -90,7 +90,36 @@ func TestPlanDryRunRollback(t *testing.T) {
 	h.fake.reset()
 	h.fake.set("dry-rollback", reply{exit: 3, stdout: `{"format":1,"result":"nothing","refused":{"reason":"a rollback barrier after migration 4","fix":"restore a backup"}}`})
 	got := errorsOf(h.plan(up.NewState, h.dockerConfig(map[string]tftypes.Value{"allow_rollback": boolean(true), "plan_dry_run": boolean(true)})).Diagnostics)
-	if !strings.Contains(got, "a rollback barrier after migration 4") || !slices.Equal(h.fake.ops(), []string{"status", "dry-rollback"}) {
+	if !strings.Contains(got, "a rollback barrier after migration 4") || !slices.Equal(h.fake.ops(), []string{"status", "kept-describe", "dry-rollback"}) {
 		t.Fatalf("got %q, calls %q", got, h.fake.ops())
+	}
+}
+
+// The status, not state, chooses the step, as the apply's: a release status names previous with
+// allow_rollback off is the apply's refusal at plan; a re-run beside a release change is known
+// before anything is fetched; the release installed under another digest is the apply's error.
+func TestPlanDryRunAgreesWithTheApply(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	state := h.create(h.dockerConfig(nil))
+	h.fake.reset()
+	h.fake.set("status", reply{stdout: `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1,"installer":"` + image + `"},"channel":"stable",` +
+		`"previous":{"version":"2.0.0","revision":1,"installer":"` + image2 + `"},"inputs":[]}`})
+	got := errorsOf(h.plan(state, h.dockerConfig(map[string]tftypes.Value{"installer": str(image2), "plan_dry_run": boolean(true)})).Diagnostics)
+	if !strings.Contains(got, "a rollback needs allow_rollback") || len(h.fake.callsOf("dry-rollback")) != 0 {
+		t.Fatalf("status's previous without allow_rollback: %q %q", got, h.fake.ops())
+	}
+	h.fake.reset()
+	h.fake.set("status", reply{stdout: `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1,"installer":"` + image + `"},"channel":"stable","inputs":["ADMIN_EMAIL"]}`})
+	p := h.plan(state, h.dockerConfig(map[string]tftypes.Value{"installer": str(image2), "plan_dry_run": boolean(true),
+		"inputs": strMap(map[string]string{"ADMIN_EMAIL": "b@example.com"})}))
+	if !strings.Contains(diagText(p.Diagnostics), "No dry run of this plan") || slices.Contains(h.fake.ops(), "fetch") {
+		t.Fatalf("a re-run beside: %q %q", diagText(p.Diagnostics), h.fake.ops())
+	}
+	h.fake.reset()
+	h.fake.set("describe", reply{stdout: describe1}) // image2 carries the release installed
+	got = errorsOf(h.plan(state, h.dockerConfig(map[string]tftypes.Value{"installer": str(image2), "plan_dry_run": boolean(true)})).Diagnostics)
+	if !strings.Contains(got, "installer is another digest of the release installed") || len(h.fake.callsOf("dry-upgrade")) != 0 {
+		t.Fatalf("the same release: %q %q", got, h.fake.ops())
 	}
 }

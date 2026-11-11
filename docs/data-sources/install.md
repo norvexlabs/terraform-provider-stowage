@@ -63,10 +63,10 @@ Optional:
 
 - `host` (String) The host, reached by the system `ssh`; required in the `vm` block. Left out in the `docker` block, this machine.
 - `known_hosts_line` (String) The host's `known_hosts` line; required with `host`. That key alone is accepted.
-- `port` (Number) SSH port; left out, 22.
+- `port` (Number) SSH port (1–65535); left out, 22.
 - `private_key_file` (String) The private key's path; left out, ssh's agent and default keys.
 - `user` (String) SSH user; required with `host`.
-- `work_dir` (String) The directory holding the install directory `<name>/`, an absolute path; left out, the SSH user's home.
+- `work_dir` (String) The directory holding the install directory `<name>/`, an absolute, clean path; left out, the SSH user's home.
 
 
 <a id="nestedblock--vm"></a>
@@ -76,7 +76,7 @@ Optional:
 
 - `host` (String) The host, reached by the system `ssh`; required in the `vm` block. Left out in the `docker` block, this machine.
 - `known_hosts_line` (String) The host's `known_hosts` line; required with `host`. That key alone is accepted.
-- `port` (Number) SSH port; left out, 22.
+- `port` (Number) SSH port (1–65535); left out, 22.
 - `private_key_file` (String) The private key's path; left out, ssh's agent and default keys.
 - `user` (String) SSH user; required with `host`.
 

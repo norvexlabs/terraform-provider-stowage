@@ -3,11 +3,15 @@ package provider
 import (
 	"context"
 	"fmt"
+	pathpkg "path"
+	"strings"
 
+	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/path"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"github.com/norvexlabs/terraform-provider-stowage/internal/installer"
@@ -70,13 +74,14 @@ func (d *installDataSource) Schema(_ context.Context, _ datasource.SchemaRequest
 		return schema.StringAttribute{Computed: true, MarkdownDescription: desc}
 	}
 	conn := map[string]schema.Attribute{
-		"host":             str("The host, reached by the system `ssh`; required in the `vm` block. Left out in the `docker` block, this machine."),
-		"port":             schema.Int64Attribute{Optional: true, MarkdownDescription: "SSH port; left out, 22."},
+		"host": str("The host, reached by the system `ssh`; required in the `vm` block. Left out in the `docker` block, this machine."),
+		"port": schema.Int64Attribute{Optional: true, MarkdownDescription: "SSH port (1–65535); left out, 22.",
+			Validators: []validator.Int64{int64validator.Between(1, 65535)}},
 		"user":             str("SSH user; required with `host`."),
 		"private_key_file": str("The private key's path; left out, ssh's agent and default keys."),
 		"known_hosts_line": str("The host's `known_hosts` line; required with `host`. That key alone is accepted."),
 	}
-	docker := map[string]schema.Attribute{"work_dir": str("The directory holding the install directory `<name>/`, an absolute path; left out, the SSH user's home.")}
+	docker := map[string]schema.Attribute{"work_dir": str("The directory holding the install directory `<name>/`, an absolute, clean path; left out, the SSH user's home.")}
 	for k, v := range conn {
 		docker[k] = v
 	}
@@ -121,6 +126,16 @@ func (d *installDataSource) Read(ctx context.Context, req datasource.ReadRequest
 		resp.Diagnostics.AddError("The provider is not configured", "stowage_install needs the provider's configuration.")
 		return
 	}
+	if m.Docker != nil {
+		if w := m.Docker.WorkDir.ValueString(); known(m.Docker.WorkDir) && (!strings.HasPrefix(w, "/") || pathpkg.Clean(w) != w) {
+			resp.Diagnostics.AddAttributeError(path.Root("docker").AtName("work_dir"), "work_dir is not an absolute, clean path",
+				fmt.Sprintf("%q: give an absolute path with no . or .. element, no // and no trailing /, or leave work_dir out for the SSH user's home.", w))
+			return
+		}
+	}
+	// A read's bound, as the resource's.
+	ctx, cancel := context.WithTimeout(ctx, readTimeout)
+	defer cancel()
 	var st *installer.Status
 	var vmFields *installer.VMStatus
 	if m.Docker != nil {

@@ -59,6 +59,12 @@ func TestInstallDataSource(t *testing.T) {
 	if got := errorsOf(resp.Diagnostics); !strings.Contains(got, "Another project's install") {
 		t.Fatalf("another project: %q", got)
 	}
+	bt := typ.AttributeTypes["docker"].(tftypes.Object)
+	rel, _ := h.readData(map[string]tftypes.Value{"name": str("notes"), "short_name": str("notes"),
+		"docker": fill(bt, map[string]tftypes.Value{"host": str("app.example"), "user": str("ops"), "known_hosts_line": str(hostLine), "work_dir": str("srv")})})
+	if got := errorsOf(rel.Diagnostics); !strings.Contains(got, "work_dir is not an absolute, clean path") {
+		t.Fatalf("a relative work_dir: %q", got)
+	}
 	none, _ := h.readData(map[string]tftypes.Value{"name": str("notes"), "short_name": str("notes")})
 	if got := errorsOf(none.Diagnostics); !strings.Contains(got, "exactly one of the docker and vm blocks") {
 		t.Fatalf("no block: %q", got)
