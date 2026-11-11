@@ -63,48 +63,45 @@ func (r *installResource) planDryRun(ctx context.Context, req resource.ModifyPla
 		d.Short = st.ShortName // the kept installer as the apply finds it
 	}
 	running, err := d.KeptDescribe(ctx)
-	if err != nil || running == nil || running.Name != d.Name {
-		if err != nil {
-			addInstallerError(diags, "The plan's dry run: reading the installer the install keeps", err)
-		}
-		return // gone, or another project's: the apply says so
-	}
-	if len(heldMismatch(st, plan.Address.ValueString(), r.registry(), running.Registry, r.registryCA())) > 0 {
-		return // the apply refuses it before anything runs, naming each setting
+	if err != nil {
+		addInstallerError(diags, "The plan's dry run: reading the installer the install keeps", err)
+		return
 	}
 	secrets := stringMap(ctx, secretsWO, diags)
 	u := &update{r: r, plan: plan, state: state, secrets: secrets, diags: diags}
-	// What the running release takes whatever the new one is: a re-run, so no dry run (the
-	// upgrade runs on what it leaves), known before anything is fetched.
-	if certain, _ := u.split(ctx, running, running); !certain.Empty() && certainRerun(running, certain) {
-		if st.Previous != nil && st.Previous.Installer == plan.Installer.ValueString() {
-			rollbackAlone(diags, "inputs, secret inputs, TLS, domains or ports")
+	if !u.keptChecks(d, st, running) {
+		return // the apply's own errors, at plan
+	}
+	// The step as the apply chooses it (releaseStep). The new installer, when it must be read, is
+	// fetched into a plan's directory — but for a plan that re-runs the running release too, which
+	// is told first, before anything is fetched: no dry run of it.
+	var dir string
+	defer func() {
+		if dir == "" {
 			return
 		}
-		noDryRun(diags)
-		return
-	}
-	// The step as the apply chooses it (releaseStep), the new installer fetched into a plan's
-	// directory when it has to be read.
-	nd := d
-	var dir string
-	desired := plan.Installer.ValueString()
-	if !(st.Installed != nil && st.Installed.Installer == desired) && !(st.Previous != nil && st.Previous.Installer == desired) {
+		// Its own bound: the dry run's may have run out.
+		rm, done := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+		defer done()
+		if err := d.RemovePlanDir(rm, dir); err != nil {
+			diags.AddWarning("The plan's dry run left its directory", err.Error()+" (a later plan's dry run removes it after an hour)")
+		}
+	}()
+	fetchTo := func() (installer.Docker, bool) {
+		if certain, _ := u.split(ctx, running, running); certainRerun(plan, running, certain) {
+			noDryRun(diags)
+			return installer.Docker{}, false
+		}
+		var err error
 		if dir, err = d.PlanDir(ctx); err != nil {
 			addInstallerError(diags, "The plan's dry run", err)
-			return
+			return installer.Docker{}, false
 		}
-		defer func() {
-			// Its own bound: the dry run's may have run out.
-			rm, done := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
-			defer done()
-			if err := d.RemovePlanDir(rm, dir); err != nil {
-				diags.AddWarning("The plan's dry run left its directory", err.Error()+" (a later plan's dry run removes it after an hour)")
-			}
-		}()
+		nd := d
 		nd.WorkDir = dir
+		return nd, true
 	}
-	step, next := u.releaseStep(ctx, nd, st)
+	step, next := u.releaseStep(ctx, d, st, fetchTo)
 	if diags.HasError() {
 		return
 	}
@@ -112,7 +109,12 @@ func (r *installResource) planDryRun(ctx context.Context, req resource.ModifyPla
 	case stay:
 		return
 	case rollback:
-		if _, err := d.DryRunRollback(ctx); err != nil {
+		// As the apply: a rollback goes alone.
+		if rerun, _ := u.split(ctx, running, nil); !rerun.Empty() {
+			rollbackAlone(diags, "inputs, secret inputs, TLS, domains or ports")
+			return
+		}
+		if _, err := d.Without(running).DryRunRollback(ctx); err != nil {
 			addInstallerError(diags, "The plan's dry run of the rollback", err)
 		}
 		return
@@ -135,14 +137,23 @@ func (r *installResource) planDryRun(ctx context.Context, req resource.ModifyPla
 }
 
 // certainRerun says whether c, the plan's split against the running release alone, holds a
-// change any new release leaves to the re-run: TLS, domains, or an input or secret input the
-// running release declares (not a port, nor an input taken out, which the new release decides).
-func certainRerun(running *installer.Describe, c installer.Change) bool {
+// change any new release leaves to the re-run: TLS, domains, a secret input, an input the running
+// release declares that the plan gives (empty included), a port of a route it has.
+func certainRerun(plan *installModel, running *installer.Describe, c installer.Change) bool {
 	if c.TLS != "" || len(c.Domains) > 0 || len(c.SecretInputs) > 0 {
 		return true
 	}
-	for k, v := range c.Inputs {
-		if v != "" && running.Declares(k) {
+	for k := range c.Ports {
+		if running.HasRoute(k) {
+			return true
+		}
+	}
+	given := map[string]attr.Value{}
+	if known(plan.Inputs) {
+		given = plan.Inputs.Elements()
+	}
+	for k := range c.Inputs {
+		if _, ok := given[k]; ok && running.Declares(k) {
 			return true
 		}
 	}

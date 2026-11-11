@@ -123,3 +123,50 @@ func TestPlanDryRunAgreesWithTheApply(t *testing.T) {
 		t.Fatalf("the same release: %q %q", got, h.fake.ops())
 	}
 }
+
+// Round six: the rollback the status names goes alone, as at apply (a port of a route the running
+// release has is the re-run's); it runs without the inputs' variables, as the apply's; a
+// first-install setting the install holds otherwise is the apply's error at plan; a port of an
+// existing route beside an upgrade is told before anything is fetched; a release already
+// running asks nothing.
+func TestPlanDryRunRoundSix(t *testing.T) {
+	t.Parallel()
+	statusPrev := `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1,"installer":"` + image + `"},"channel":"stable",` +
+		`"previous":{"version":"2.0.0","revision":1,"installer":"` + image2 + `"},"inputs":["ADMIN_EMAIL"]}`
+	h := newHarness(t, nil)
+	state := h.create(h.dockerConfig(map[string]tftypes.Value{"ports": tftypes.NewValue(tftypes.Map{ElementType: tftypes.Number}, map[string]tftypes.Value{"web": num(8080)})}))
+	web := func(p int64) tftypes.Value {
+		return tftypes.NewValue(tftypes.Map{ElementType: tftypes.Number}, map[string]tftypes.Value{"web": num(p)})
+	}
+	h.fake.reset()
+	h.fake.set("status", reply{stdout: statusPrev})
+	got := errorsOf(h.plan(state, h.dockerConfig(map[string]tftypes.Value{"installer": str(image2), "plan_dry_run": boolean(true),
+		"allow_rollback": boolean(true), "ports": web(8081)})).Diagnostics)
+	if !strings.Contains(got, "a rollback goes alone") || len(h.fake.callsOf("dry-rollback")) != 0 {
+		t.Fatalf("a rollback with a port: %q %q", got, h.fake.ops())
+	}
+	h.fake.reset()
+	h.fake.set("status", reply{stdout: statusPrev})
+	h.plan(state, h.dockerConfig(map[string]tftypes.Value{"installer": str(image2), "plan_dry_run": boolean(true), "allow_rollback": boolean(true), "ports": web(8080)}))
+	if rb := h.fake.callsOf("dry-rollback"); len(rb) != 1 || !slices.Contains(rb[0].unset, "ADMIN_EMAIL") {
+		t.Fatalf("the rollback's environment: %q", rb)
+	}
+	h.fake.reset()
+	h.fake.set("status", reply{stdout: strings.Replace(statusPrev, `"inputs"`, `"address":"10.0.0.5","inputs"`, 1)})
+	got = errorsOf(h.plan(state, h.dockerConfig(map[string]tftypes.Value{"installer": str(image2), "plan_dry_run": boolean(true), "ports": web(8080)})).Diagnostics)
+	if !strings.Contains(got, "The install was made otherwise") {
+		t.Fatalf("a held setting: %q", got)
+	}
+	h.fake.reset()
+	h.fake.set("status", reply{stdout: strings.Replace(statusPrev, `"previous":{"version":"2.0.0","revision":1,"installer":"`+image2+`"}`, `"previous":null`, 1)})
+	p := h.plan(state, h.dockerConfig(map[string]tftypes.Value{"installer": str(image2), "plan_dry_run": boolean(true), "ports": web(8081)}))
+	if !strings.Contains(diagText(p.Diagnostics), "No dry run of this plan") || slices.Contains(h.fake.ops(), "fetch") || slices.Contains(h.fake.ops(), "plan-dir") {
+		t.Fatalf("a port of an existing route: %q %q", diagText(p.Diagnostics), h.fake.ops())
+	}
+	h.fake.reset()
+	h.fake.set("status", reply{stdout: status2})
+	p = h.plan(state, h.dockerConfig(map[string]tftypes.Value{"installer": str(image2), "plan_dry_run": boolean(true), "ports": web(8081)}))
+	if d := diagText(p.Diagnostics); d != "" || slices.Contains(h.fake.ops(), "plan-dir") {
+		t.Fatalf("a release already running: %q %q", d, h.fake.ops())
+	}
+}

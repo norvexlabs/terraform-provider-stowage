@@ -14,11 +14,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/resourcevalidator"
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
 
@@ -102,10 +104,7 @@ func (r *installResource) ValidateConfig(ctx context.Context, req resource.Valid
 	}
 	if m.Docker != nil {
 		validateSSH(path.Root("docker"), m.Docker.Host, m.Docker.User, m.Docker.KnownHostsLine, m.Docker.PrivateKeyFile, m.Docker.Port, true, &resp.Diagnostics)
-		if w := m.Docker.WorkDir.ValueString(); known(m.Docker.WorkDir) && (!strings.HasPrefix(w, "/") || pathpkg.Clean(w) != w) {
-			resp.Diagnostics.AddAttributeError(path.Root("docker").AtName("work_dir"), "work_dir is not an absolute, clean path",
-				fmt.Sprintf("%q: give an absolute path with no . or .. element, no // and no trailing /, or leave work_dir out for the SSH user's home (OpenTofu's working directory, locally).", w))
-		}
+		checkWorkDir(m.Docker.WorkDir, &resp.Diagnostics)
 	}
 	if m.VM != nil {
 		validateVM(&m, &resp.Diagnostics)
@@ -216,6 +215,17 @@ func workDir(d *dockerModel) string {
 	}
 	return d.WorkDir.ValueString()
 }
+
+// checkWorkDir refuses a docker.work_dir that is not an absolute, clean path.
+func checkWorkDir(v types.String, diags *diag.Diagnostics) {
+	if w := v.ValueString(); known(v) && (!strings.HasPrefix(w, "/") || pathpkg.Clean(w) != w) {
+		diags.AddAttributeError(path.Root("docker").AtName("work_dir"), "work_dir is not an absolute, clean path",
+			fmt.Sprintf("%q: give an absolute path with no . or .. element, no // and no trailing /, or leave work_dir out for the SSH user's home (OpenTofu's working directory, locally).", w))
+	}
+}
+
+// portValidators are an SSH port's, the resource's and the data source's.
+var portValidators = []validator.Int64{int64validator.Between(1, 65535)}
 
 // heldWorkDir is d's work directory as the install's directory resolved it: left out while
 // state's was left out too, the directory state's ID names (the home the create resolved), so
@@ -1045,23 +1055,10 @@ func (u *update) run(ctx context.Context, save func(*installModel) bool) {
 		addInstallerError(u.diags, "Reading the installer the install keeps", err)
 		return
 	}
-	if running == nil {
-		u.diags.AddError("No install to change", fmt.Sprintf("%s/%s is gone since it was read: apply again.", d.WorkDir, d.Name))
+	if !u.keptChecks(d, st, running) {
 		return
 	}
-	if running.Name != d.Name {
-		u.diags.AddError("Installer of another project", fmt.Sprintf("The installer kept in %s/%s describes the project %q, not %q.", d.WorkDir, d.Name, running.Name, d.Name))
-		return
-	}
-	// The configuration's first-install-only settings must be the install's, as no re-run is
-	// given them: an imported state's first apply, and a registry given over an install made
-	// without one (which the plan cannot tell from the release's own).
-	if bad := heldMismatch(st, plan.Address.ValueString(), u.r.registry(), running.Registry, u.r.registryCA()); len(bad) > 0 {
-		u.diags.AddError("The install was made otherwise",
-			fmt.Sprintf("The install %s/%s recorded other first-install settings, which a re-run cannot change: %s. Give the settings the install holds (status --json).", d.WorkDir, d.Name, strings.Join(bad, "; ")))
-		return
-	}
-	step, next := u.releaseStep(ctx, d, st)
+	step, next := u.releaseStep(ctx, d, st, nil)
 	if u.diags.HasError() {
 		return
 	}
@@ -1150,7 +1147,31 @@ func refuseSecretInputs(diags *diag.Diagnostics, given map[string]string, releas
 // installer, or the release that installer describes), rollback when the desired installer is the
 // previous release's and allow_rollback is set, else the new installer's upgrade, fetched and
 // described here (next). The installer refuses an older release.
-func (u *update) releaseStep(ctx context.Context, d installer.Docker, st *installer.Status) (releaseStep, *installer.Describe) {
+// keptChecks refuses what an update cannot run over: no install any more, a kept installer of
+// another project, first-install settings the install recorded otherwise (an imported state's
+// first apply, a registry the plan could not tell from the release's own). Each is an error in
+// diags; false then.
+func (u *update) keptChecks(d installer.Docker, st *installer.Status, running *installer.Describe) bool {
+	if running == nil {
+		u.diags.AddError("No install to change", fmt.Sprintf("%s/%s is gone since it was read: apply again.", d.WorkDir, d.Name))
+		return false
+	}
+	if running.Name != d.Name {
+		u.diags.AddError("Installer of another project", fmt.Sprintf("The installer kept in %s/%s describes the project %q, not %q.", d.WorkDir, d.Name, running.Name, d.Name))
+		return false
+	}
+	if bad := heldMismatch(st, u.plan.Address.ValueString(), u.r.registry(), running.Registry, u.r.registryCA()); len(bad) > 0 {
+		u.diags.AddError("The install was made otherwise",
+			fmt.Sprintf("The install %s/%s recorded other first-install settings, which a re-run cannot change: %s. Give the settings the install holds (status --json).", d.WorkDir, d.Name, strings.Join(bad, "; ")))
+		return false
+	}
+	return true
+}
+
+// releaseStep is the release change the update ends with. The new installer, when it must be
+// read, is fetched onto d, or, with fetchTo, onto the Docker fetchTo gives (false: none, the
+// step is stay).
+func (u *update) releaseStep(ctx context.Context, d installer.Docker, st *installer.Status, fetchTo func() (installer.Docker, bool)) (releaseStep, *installer.Describe) {
 	desired := u.plan.Installer.ValueString()
 	switch {
 	case st.Installed != nil && st.Installed.Installer == desired:
@@ -1164,6 +1185,12 @@ func (u *update) releaseStep(ctx context.Context, d installer.Docker, st *instal
 			return stay, nil
 		}
 		return rollback, nil
+	}
+	if fetchTo != nil {
+		var ok bool
+		if d, ok = fetchTo(); !ok {
+			return stay, nil
+		}
 	}
 	next := u.r.fetchDescribe(ctx, d, desired, u.diags)
 	if next == nil {

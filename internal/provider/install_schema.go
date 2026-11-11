@@ -4,7 +4,6 @@ import (
 	"context"
 
 	"github.com/hashicorp/terraform-plugin-framework-timeouts/resource/timeouts"
-	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -88,7 +87,7 @@ func sshAttributes(hostDesc string) map[string]schema.Attribute {
 		"port": schema.Int64Attribute{
 			Optional:            true,
 			MarkdownDescription: "SSH port; left out, 22.",
-			Validators:          []validator.Int64{int64validator.Between(1, 65535)},
+			Validators:          portValidators,
 		},
 		"user": schema.StringAttribute{
 			Optional:            true,
