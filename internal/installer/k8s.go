@@ -19,24 +19,28 @@ import (
 // the one the configuration names, or the environment's made absolute), else unset. The runner
 // leaves the input keys and HelmEnv out of its environment before it starts (EnvFilter): the
 // installer reads an input from the environment before an answers file, and helm's HELM_KUBE*
-// would reach another cluster than the kubeconfig's. Arguments: the directory, the kubeconfig (""
-// leaves none), the file names (space-separated, may be empty), then the program and its
-// arguments. Its own variables are named __stowage_*: an exported variable of another name passes
-// to the program unchanged.
+// would reach another cluster than the kubeconfig's. With a login user, the tar holds
+// `login-password` too (never named as a file flag), and the program runs with a Docker
+// configuration of its own holding that login (LoginScript): the one `--image-pull-login` writes
+// the cluster's pull Secret from. Arguments: the directory, the kubeconfig ("" leaves none), the
+// file names (space-separated, may be empty), the login's registry host and user ("" for none),
+// then the program and its arguments. Its own variables are named __stowage_*: an exported
+// variable of another name passes to the program unchanged.
 const K8sScript = `set -eu
 cd -- "$1"
-__stowage_kubeconfig=$2 __stowage_files=$3
-shift 3
+__stowage_kubeconfig=$2 __stowage_files=$3 __stowage_host=$4 __stowage_user=$5
+shift 5
 if [ -n "$__stowage_kubeconfig" ]; then KUBECONFIG=$__stowage_kubeconfig; export KUBECONFIG; else unset KUBECONFIG; fi
 __stowage_old=$(umask)
 umask 077
 __stowage_d=$(mktemp -d)
 trap 'rm -rf "$__stowage_d"' EXIT
 trap 'exit 130' HUP INT TERM
-if [ -n "$__stowage_files" ]; then
+` + LoginScript + `if [ -n "$__stowage_files" ] || [ -n "$__stowage_user" ]; then
   tar -xf - -C "$__stowage_d"
   for __stowage_f in $__stowage_files; do set -- "$@" "--$__stowage_f" "$__stowage_d/$__stowage_f"; done
 fi
+if [ -n "$__stowage_user" ]; then __stowage_login "$__stowage_host" "$__stowage_user" "$__stowage_d/login-password"; fi
 umask "$__stowage_old"
 __stowage_rc=0
 "$@" || __stowage_rc=$?
@@ -84,6 +88,9 @@ type K8s struct {
 	Context    string
 	Namespace  string
 	Release    string
+	// PullLogin, when set, is the login an install or upgrade writes the cluster's pull Secret
+	// from (`--image-pull-login`): the provider's pull account for the mirror's host.
+	PullLogin *Login
 }
 
 // Filtered is r leaving HelmEnv out of its programs' environment, when it can (EnvFilter: the
@@ -171,12 +178,26 @@ func (k K8s) Fetch(ctx context.Context, installer string, login *Login) error {
 
 // run runs the fetched bootstrap script with args, files on standard input.
 func (k K8s) run(ctx context.Context, files map[string]string, args ...string) ([]byte, []byte, int, error) {
-	names, stdin, err := filesInput(files)
+	return k.runLogin(ctx, nil, files, args...)
+}
+
+// runLogin is run with the program given login's Docker configuration (K8sScript), when set.
+func (k K8s) runLogin(ctx context.Context, login *Login, files map[string]string, args ...string) ([]byte, []byte, int, error) {
+	names, host, user, stdin, err := loginInput(files, login)
 	if err != nil {
 		return nil, nil, -1, err
 	}
-	argv := append([]string{"sh", "-c", K8sScript, "sh", k.Dir, k.Kubeconfig, names, "sh", "./" + k.Name + ".sh"}, args...)
+	argv := append([]string{"sh", "-c", K8sScript, "sh", k.Dir, k.Kubeconfig, names, host, user, "sh", "./" + k.Name + ".sh"}, args...)
 	return k.Runner.Run(ctx, argv, stdin)
+}
+
+// pull is the install's or upgrade's `--image-pull-login` and the login it runs with, when
+// PullLogin asks for it.
+func (k K8s) pull(args []string) ([]string, *Login) {
+	if k.PullLogin == nil {
+		return args, nil
+	}
+	return append(args, "--image-pull-login"), k.PullLogin
 }
 
 // scope is the release's flags: --namespace, --release and --kube-context, each when set.
@@ -208,29 +229,14 @@ func (k K8s) Describe(ctx context.Context) (*Describe, error) {
 }
 
 // Status runs the fetched bootstrap script's `k8s status --json`: nil when the namespace holds no
-// release of the name, which the installer refuses (exit 3) with nothing on standard output and
-// `no release <release> in <namespace>` on standard error. Another refusal is an error.
+// release of the name, which the installer refuses (exit 3) with `refused.absent`. Another refusal
+// is a *RefusedError.
 func (k K8s) Status(ctx context.Context) (*Status, error) {
 	stdout, stderr, exit, err := k.run(ctx, nil, k.verb("status", "--json")...)
 	if err != nil {
 		return nil, fmt.Errorf("k8s status: %w", err)
 	}
-	switch {
-	case exit == 0:
-		return ParseStatus(stdout)
-	case exit == 3 && len(strings.TrimSpace(string(stdout))) == 0 && k.noRelease(stderr):
-		return nil, nil
-	}
-	return nil, &FailedError{Verb: "k8s status", Exit: exit, Stderr: tail(stderr)}
-}
-
-// noRelease says whether stderr is the installer's refusal of a namespace without the release.
-func (k K8s) noRelease(stderr []byte) bool {
-	release, ns := k.ReleaseName(), k.Namespace
-	if ns == "" {
-		ns = k.Name
-	}
-	return strings.Contains(string(stderr), "no release "+release+" in "+ns+":")
+	return readStatus("k8s status", stdout, stderr, exit)
 }
 
 // k8sChange is c as an install's or an upgrade's flags: inputs by --set, secret inputs by an
@@ -260,7 +266,8 @@ func (k K8s) Install(ctx context.Context, in Install) (*Result, error) {
 			files[name] = v
 		}
 	}
-	stdout, stderr, exit, err := k.run(ctx, files, args...)
+	args, login := k.pull(args)
+	stdout, stderr, exit, err := k.runLogin(ctx, login, files, args...)
 	if err != nil {
 		return nil, fmt.Errorf("k8s install: %w", err)
 	}
@@ -294,7 +301,8 @@ func (k K8s) Give(ctx context.Context, given, registryCA string) (*Result, error
 	if registryCA != "" {
 		files["registry-ca"] = registryCA
 	}
-	stdout, stderr, exit, err := k.run(ctx, files, k.verb("upgrade", "--no-input", "--json")...)
+	args, login := k.pull(k.verb("upgrade", "--no-input", "--json"))
+	stdout, stderr, exit, err := k.runLogin(ctx, login, files, args...)
 	if err != nil {
 		return nil, fmt.Errorf("k8s upgrade --given: %w", err)
 	}
@@ -308,7 +316,8 @@ func (k K8s) Reapply(ctx context.Context, registryCA string) (*Result, error) {
 	if registryCA != "" {
 		files["registry-ca"] = registryCA
 	}
-	stdout, stderr, exit, err := k.run(ctx, files, k.verb("upgrade", "--no-input", "--json")...)
+	args, login := k.pull(k.verb("upgrade", "--no-input", "--json"))
+	stdout, stderr, exit, err := k.runLogin(ctx, login, files, args...)
 	if err != nil {
 		return nil, fmt.Errorf("k8s upgrade: %w", err)
 	}
@@ -325,7 +334,8 @@ func (k K8s) Upgrade(ctx context.Context, c Change, registryCA string) (*Result,
 	if registryCA != "" {
 		files["registry-ca"] = registryCA
 	}
-	stdout, stderr, exit, err := k.run(ctx, files, append(k.verb("upgrade", "--no-input", "--json"), args...)...)
+	args, login := k.pull(append(k.verb("upgrade", "--no-input", "--json"), args...))
+	stdout, stderr, exit, err := k.runLogin(ctx, login, files, args...)
 	if err != nil {
 		return nil, fmt.Errorf("k8s upgrade: %w", err)
 	}

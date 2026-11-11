@@ -44,13 +44,17 @@ func (c call) op() string {
 		return "fetch"
 	case installer.ToolsScript:
 		return "tools"
+	case installer.ResolveScript:
+		return "resolve"
+	case installer.RunLoginScript:
+		return "install" // vm seed, the one program run so
 	case installer.K8sScript:
-		// sh -c K8sScript sh <dir> <kubeconfig> <files> sh ./<name>.sh <args…>
+		// sh -c K8sScript sh <dir> <kubeconfig> <files> <host> <user> sh ./<name>.sh <args…>
 		switch {
-		case len(c.argv) > 10 && c.argv[9] == "k8s":
-			return "k8s-" + c.argv[10]
-		case len(c.argv) > 9:
-			return "k8s-" + c.argv[9]
+		case len(c.argv) > 12 && c.argv[11] == "k8s":
+			return "k8s-" + c.argv[12]
+		case len(c.argv) > 11:
+			return "k8s-" + c.argv[11]
 		}
 		return "?"
 	case installer.RunScript:
@@ -102,20 +106,24 @@ type fake struct {
 	conns   []Connection
 	replies map[string]reply
 	queue   map[string][]reply
+	// lenient answers a call whose context is done, but for a blocking reply: a test of a
+	// timeout then reaches the step it tests however slow the host is before it.
+	lenient bool
 }
 
-const describe1 = `{"format":1,"name":"notes","short_name":"notes","release":{"version":"1.2.0","revision":1},"channel":"stable","shapes":["docker"],"inputs":[{"key":"ADMIN_EMAIL"},{"key":"SMTP_PASSWORD","secret":true},{"key":"LEGACY"}],"first_install_only":["address","registry","registry_ca","channel"]}`
+const describe1 = `{"format":1,"name":"notes","short_name":"notes","release":{"version":"1.2.0","revision":1},"channel":"stable","shapes":["docker"],"inputs":[{"key":"ADMIN_EMAIL"},{"key":"SMTP_PASSWORD","secret":true},{"key":"LEGACY"}],"first_install_only":["address","registry","registry_ca","channel"],"routes":[{"name":"web","loopback_port":8080}],"l4_routes":[]}`
 
 func newFake() *fake {
 	return &fake{queue: map[string][]reply{}, replies: map[string]reply{
 		"fetch":         {},
+		"resolve":       {stdout: "/home/ops\n"},
 		"describe":      {stdout: describe1},
 		"kept-describe": {stdout: describe1},
 		"install":       {stdout: `{"format":1,"result":"done","release":{"version":"1.2.0","revision":1}}`},
 		"rerun":         {stdout: `{"format":1,"result":"done","release":{"version":"1.2.0","revision":1}}`},
 		"upgrade":       {stdout: `{"format":1,"result":"done","release":{"version":"2.0.0","revision":1}}`},
 		"rollback":      {stdout: `{"format":1,"result":"done","release":{"version":"1.1.0","revision":1}}`},
-		"new-status":    {exit: 3, stderr: "error: /srv/notes holds no install\n"},
+		"new-status":    {exit: 3, stdout: `{"format":1,"refused":{"reason":"/srv/notes holds no install","fix":"sh notes.sh installs it","absent":true}}`, stderr: "error: /srv/notes holds no install\n"},
 		"status":        {stdout: `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1,"installer":"` + image + `"},"channel":"stable","previous":null,"inputs":["ADMIN_EMAIL","SMTP_PASSWORD"]}`},
 		"uninstall":     {stdout: `{"format":1,"result":"done"}`},
 	}}
@@ -189,7 +197,7 @@ func (f *fake) run(ctx context.Context, argv []string, stdin []byte, unset []str
 	defer f.mu.Unlock()
 	c := call{argv: append([]string(nil), argv...), stdin: append([]byte(nil), stdin...), unset: unset}
 	f.calls = append(f.calls, c)
-	if err := ctx.Err(); err != nil {
+	if err := ctx.Err(); err != nil && !f.lenient {
 		return nil, nil, -1, err
 	}
 	r, ok := f.replies[c.op()]

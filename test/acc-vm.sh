@@ -71,7 +71,7 @@ INSTALLER=$REG/notes/notes-installer@$(digest_of notes/notes-installer:beta-1.0.
 
 step "the OpenTofu root: this provider by dev_overrides, the seed, the disk and ISO, Stowage's TrueNAS module, the install"
 ROOT=$WORK/root
-mkdir -p "$ROOT"
+mkdir -p "$ROOT" "$WORK/disks"
 cp "$PROV"/examples/resources/stowage_vm_seed/*.sh "$ROOT/"
 cat >"$WORK/tofurc" <<EOF
 provider_installation {
@@ -121,22 +121,14 @@ resource "stowage_vm_seed" "vm" {
   ssh_allow      = ["$MIRROR_IP/32"]
   tls            = "internal"
   inputs         = { ADMIN_EMAIL = "admin@notes.test" }
-}
-
-data "external" "disk" {
-  program = ["\${path.module}/fetch-disk.sh"]
-  query = {
-    image           = stowage_vm_seed.vm.disk["truenas"].image
-    dir             = "$WORK/disks"
-    ca_file         = "$MIRROR_CA"
-    registry_config = "$MIRROR_CONFIG/config.json"
-  }
+  disk_dir       = "$WORK/disks"
 }
 
 data "external" "seed" {
   program = ["\${path.module}/seed-iso.sh"]
   query = {
     user_data = stowage_vm_seed.vm.user_data
+    meta_data = stowage_vm_seed.vm.meta_data
     hostname  = "$H"
     dir       = "$WORK/seeds"
   }
@@ -152,9 +144,9 @@ module "vm" {
   insecure_skip_verify = ${TRUENAS_INSECURE_SKIP_VERIFY:-false}
   cpus                 = 2
   memory_mib           = 4096
-  disk_gib             = 16 + tonumber(data.external.disk.result.os_gib)
-  image                = data.external.disk.result.path
-  image_sha256         = data.external.disk.result.sha256
+  disk_gib             = stowage_vm_seed.vm.disk_file.disk_gib
+  image                = stowage_vm_seed.vm.disk_file.path
+  image_sha256         = stowage_vm_seed.vm.disk_file.sha256
   seed                 = data.external.seed.result.path
   seed_sha256          = data.external.seed.result.sha256
 }

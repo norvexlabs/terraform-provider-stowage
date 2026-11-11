@@ -55,11 +55,6 @@ func validateVM(m *installModel, diags *diag.Diagnostics) {
 		line = types.StringUnknown() // neither required nor parsed here
 	}
 	validateSSH(path.Root("vm"), v.Host, v.User, line, v.PrivateKeyFile, v.Port, false, diags)
-	if !m.SecretsWO.IsNull() {
-		diags.AddAttributeError(path.Root("secrets_wo"), "secrets_wo on a VM",
-			"A seed cannot make the VM's first boot wait for a secrets export: the boot installs with new secrets, and an install's re-run takes no --secrets. "+
-				"Make a VM again from a secrets export with `<short>-stow vm create --secrets FILE`, or install it from stowage_vm_seed without secrets_wo and `restore` a backup.")
-	}
 	if v.Version.IsNull() {
 		diags.AddAttributeError(path.Root("vm").AtName("version"), "vm.version is required", "Give the release the VM runs.")
 	}
@@ -105,7 +100,7 @@ func planVM(ctx context.Context, plan, state *installModel, resp *resource.Modif
 		if prev := previousVersion(ctx, state); prev != "" && prev == desired {
 			if !plan.AllowRollback.ValueBool() {
 				resp.Diagnostics.AddAttributeError(path.Root("allow_rollback"), "a rollback needs allow_rollback",
-					fmt.Sprintf("vm.version is now %s, the release the VM's last upgrade replaced (previous.version): reaching it is `rollback`, which reboots the VM into its passive system and restores the previous values. Set allow_rollback = true to roll back, or set vm.version back to %s.", prev, state.VM.Version.ValueString()))
+					fmt.Sprintf("vm.version is now %s, the release the VM's last upgrade replaced (previous.version): reaching it is `rollback`, which reboots the VM into its passive system, the previous release (every input keeps its value). Set allow_rollback = true to roll back, or set vm.version back to %s.", prev, state.VM.Version.ValueString()))
 			} else if changed := slices.DeleteFunc(remoteChange(plan, state), func(a string) bool { return a == "vm.version" }); len(changed) > 0 {
 				vmRollbackAlone(&resp.Diagnostics, strings.Join(changed, ", "))
 			}
@@ -235,6 +230,7 @@ func (r *installResource) rebooted(ctx context.Context, v installer.VM, before s
 // vm.version, so the next plan proposes the change back (a fallback shows its real release).
 func applyVMStatus(m *installModel, st *installer.VMStatus, read bool) {
 	applyStatus(m, &st.Status, false)
+	applyHeld(m, &st.Status, false)
 	if read && st.Installed != nil {
 		vm := *m.VM
 		vm.Version = types.StringValue(st.Installed.Version)
@@ -274,6 +270,11 @@ func (r *installResource) vmFill(m *installModel, state *installModel) {
 	} else {
 		m.Registry = types.StringValue(r.registry())
 	}
+	if state != nil && !state.RegistryCADigest.IsUnknown() && !imported(state) {
+		m.RegistryCADigest = state.RegistryCADigest
+	} else {
+		m.RegistryCADigest = r.providerCA()
+	}
 	m.SecretInputsWO, m.GivenWO, m.SecretsWO = types.MapNull(types.StringType), types.StringNull(), types.StringNull()
 }
 
@@ -283,9 +284,10 @@ func (r *installResource) createVM(ctx context.Context, req resource.CreateReque
 	timeout, diags := m.Timeouts.Create(ctx, createTimeout)
 	resp.Diagnostics.Append(diags...)
 	var secretsWO types.Map
-	var given types.String
+	var given, exported types.String
 	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("secret_inputs_wo"), &secretsWO)...)
 	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("given_wo"), &given)...)
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("secrets_wo"), &exported)...)
 	secrets := stringMap(ctx, secretsWO, &resp.Diagnostics)
 	if resp.Diagnostics.HasError() {
 		return
@@ -332,7 +334,9 @@ func (r *installResource) createVM(ctx context.Context, req resource.CreateReque
 	}
 	change := installer.Change{Inputs: stringMap(ctx, m.Inputs, &resp.Diagnostics), SecretInputs: secrets, TLS: m.TLS.ValueString(),
 		Domains: stringMap(ctx, m.Domains, &resp.Diagnostics), Ports: portMap(ctx, m.Ports, &resp.Diagnostics)}
-	if _, err := v.Install(ctx, installer.VMInstall{Change: change, Given: given.ValueString()}); err != nil {
+	// A secrets export goes to the first install a seed's --await-secrets left waiting for it; the
+	// installer refuses it on a VM whose first install ran.
+	if _, err := v.Install(ctx, installer.VMInstall{Change: change, Given: given.ValueString(), Secrets: exported.ValueString()}); err != nil {
 		addInstallerError(&resp.Diagnostics, "Installing "+desc.Name+" on the VM", err)
 		return
 	}
@@ -456,18 +460,24 @@ func (r *installResource) retire(ctx context.Context, m *installModel, v install
 	if err != nil {
 		return err
 	}
-	// A minute in production (Poll is 10 s), a few milliseconds in the tests.
-	check, cancel := context.WithTimeout(ctx, 6*r.data.Poll)
-	defer cancel()
-	bound := "its six polls (a minute)"
-	err = r.wait(check, "the VM did not answer under its own key alone", bound, func() (bool, error) {
-		_, err := ov.HostKey(check)
-		return err == nil, err
-	})
-	if err != nil && ctx.Err() != nil {
-		return fmt.Errorf("the VM did not answer under its own key alone when %s ran out", resourceTimeout)
+	// Six attempts a poll apart (a minute in production, Poll being 10 s), counted rather than
+	// timed, so a slow host never cuts an attempt that answered; within the resource's timeout.
+	var last error
+	for i := 0; i < 6; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+			case <-time.After(r.data.Poll):
+			}
+		}
+		if ctx.Err() != nil {
+			return fmt.Errorf("the VM did not answer under its own key alone when %s ran out", resourceTimeout)
+		}
+		if _, last = ov.HostKey(ctx); last == nil {
+			return nil
+		}
 	}
-	return err
+	return fmt.Errorf("the VM did not answer under its own key alone in its six polls (a minute); the last attempt: %w", last)
 }
 
 // vmUpdate applies a release change to a VM in DESIGN § 13's order, after the re-run of the
@@ -689,7 +699,7 @@ func (r *installResource) updateVM(ctx context.Context, req resource.UpdateReque
 	case st.Previous != nil && st.Previous.Version == desired:
 		if !plan.AllowRollback.ValueBool() {
 			resp.Diagnostics.AddAttributeError(path.Root("allow_rollback"), "a rollback needs allow_rollback",
-				fmt.Sprintf("vm.version is %s, the release the VM's last upgrade replaced: reaching it is `rollback`, which reboots the VM and restores the previous values. Set allow_rollback = true to roll back.", desired))
+				fmt.Sprintf("vm.version is %s, the release the VM's last upgrade replaced: reaching it is `rollback`, which reboots the VM into the previous release (every input keeps its value). Set allow_rollback = true to roll back.", desired))
 			return
 		}
 		step = rollback

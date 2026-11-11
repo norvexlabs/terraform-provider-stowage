@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	pathpkg "path"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework-timeouts/resource/timeouts"
@@ -19,6 +21,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/listplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/mapplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
@@ -31,7 +34,9 @@ import (
 // fetched and the registry read.
 const seedTimeout = 10 * time.Minute
 
-var diskType = map[string]attr.Type{"format": types.StringType, "image": types.StringType}
+var diskType = map[string]attr.Type{"format": types.StringType, "image": types.StringType, "os_gib": types.Int64Type, "disk_gib": types.Int64Type, "cloud_image": types.StringType}
+
+var diskFileType = map[string]attr.Type{"path": types.StringType, "format": types.StringType, "sha256": types.StringType, "disk_gib": types.Int64Type}
 
 type seedModel struct {
 	ID             types.String   `tfsdk:"id"`
@@ -59,6 +64,8 @@ type seedModel struct {
 	HTTPPort       types.Int64    `tfsdk:"http_port"`
 	HTTPSPort      types.Int64    `tfsdk:"https_port"`
 	Inputs         types.Map      `tfsdk:"inputs"`
+	AwaitSecrets   types.Bool     `tfsdk:"await_secrets"`
+	DiskDir        types.String   `tfsdk:"disk_dir"`
 	Name           types.String   `tfsdk:"name"`
 	ShortName      types.String   `tfsdk:"short_name"`
 	Version        types.String   `tfsdk:"version"`
@@ -69,6 +76,10 @@ type seedModel struct {
 	HostKeyPrivate types.String   `tfsdk:"host_key_private"`
 	Disk           types.Map      `tfsdk:"disk"`
 	Waiting        types.List     `tfsdk:"waiting"`
+	MetaData       types.String   `tfsdk:"meta_data"`
+	AppGiB         types.Int64    `tfsdk:"app_gib"`
+	DiskFile       types.Object   `tfsdk:"disk_file"`
+	AwaitTLS       types.Bool     `tfsdk:"await_tls"`
 	Timeouts       timeouts.Value `tfsdk:"timeouts"`
 }
 
@@ -155,14 +166,17 @@ func (r *seedResource) Schema(ctx context.Context, _ resource.SchemaRequest, res
 			"add_hosts":    smap("Host records, name → IP (`--add-host NAME=IP`)."),
 			"interfaces":   smap("NICs the release names, role → spec (`--interface ROLE=SPEC`)."),
 			"device":       str("`metal`: the disk the OS installs on (`--device`), wiped."),
-			"tls":          str("The front's TLS mode (`--tls`): `acme`, `dns-cloudflare` or `internal`. `byo` is refused: a seed carries no certificate (the refusal names what to do instead).", stringvalidator.OneOf(TLSModes...)),
+			"tls":          str("The front's TLS mode (`--tls`): `acme`, `dns-cloudflare`, `internal` or `byo`. With `byo` the VM's first install waits for the certificate, its key and CA, given over SSH by `stowage_install`'s `given_wo` (its `tls` section); the seed carries none (`await_tls`).", stringvalidator.OneOf(TLSModes...)),
 			"domains":      smap("Route → domain (`--domains route=host,…`)."),
 			"http_port":    port("The VM's HTTP port in a TLS mode (`--http-port`)."),
 			"https_port":   port("The VM's HTTPS port in a TLS mode (`--https-port`)."),
 			"inputs":       smap("Non-secret inputs (`--set KEY=VALUE`), in the cloud-config and in state. A secret input is refused by the installer: give it to `stowage_install`'s `secret_inputs_wo`, which goes over SSH once the VM answers."),
-			"name":         out("The project's name (`describe`'s).", false),
-			"short_name":   out("The installer's short name: the VM runs `<short_name>-stow`. Give it to `stowage_install`'s `vm.short_name`.", false),
-			"version":      out("The release the seed's disk boots first.", false),
+			"await_secrets": schema.BoolAttribute{Optional: true, PlanModifiers: []planmodifier.Bool{boolplanmodifier.RequiresReplace()},
+				MarkdownDescription: "The VM's first install waits for a decrypted `secrets export` (`--await-secrets`): a machine made again, given by `stowage_install`'s `secrets_wo` over SSH once the VM answers. Refused with `tls = \"byo\"` by the installer (the first install waits for one of them)."},
+			"disk_dir":   str("An existing directory on the machine running OpenTofu the `platform`'s disk is written into, decompressed (`--disk-dir`): `disk_file` names it, for a hypervisor resource that imports a local file. The file is the caller's: destroying the seed leaves it, and a file of that name already holding the disk is kept."),
+			"name":       out("The project's name (`describe`'s).", false),
+			"short_name": out("The installer's short name: the VM runs `<short_name>-stow`. Give it to `stowage_install`'s `vm.short_name`.", false),
+			"version":    out("The release the seed's disk boots first.", false),
 			"revision": schema.Int64Attribute{Computed: true, MarkdownDescription: "That release's package revision.",
 				PlanModifiers: []planmodifier.Int64{int64planmodifier.UseStateForUnknown()}},
 			"user_data":        out("The cloud-config for `platform`: a NoCloud seed's `user-data`, or a cloud's user data. It holds no secret input, but the one-time host key's private key.", true),
@@ -170,8 +184,16 @@ func (r *seedResource) Schema(ctx context.Context, _ resource.SchemaRequest, res
 			"fingerprint":      out("The one-time host key's SHA256 fingerprint, as ssh prints it.", false),
 			"host_key_private": out("The one-time host key's OpenSSH private key, which the VM serves until its install and the reboot after it.", true),
 			"disk": schema.MapAttribute{Computed: true, ElementType: types.ObjectType{AttrTypes: diskType},
-				MarkdownDescription: "Per platform the registry holds a disk for, the disk it boots: `format` and `image` (by digest).",
+				MarkdownDescription: "Per platform the registry holds a disk for, the disk it boots: `format`, `image` (by digest), `os_gib` (what Kairos takes of the VM's disk), `disk_gib` (the VM's disk size to create: `os_gib` plus `app_gib`) and, on a cloud the release publishes to, `cloud_image`, the name `ship --disks` registered its image under there (null otherwise; the ship registered it only when it had that cloud's settings: check it exists).",
 				PlanModifiers:       []planmodifier.Map{mapplanmodifier.UseStateForUnknown()}},
+			"meta_data": out("The NoCloud `meta-data` beside `user_data` (`instance-id`, `local-hostname`), for a hypervisor that builds its own seed ISO.", false),
+			"app_gib": schema.Int64Attribute{Computed: true, MarkdownDescription: "The app's space the release recommends, which each disk's `disk_gib` adds to `os_gib`.",
+				PlanModifiers: []planmodifier.Int64{int64planmodifier.UseStateForUnknown()}},
+			"disk_file": schema.ObjectAttribute{Computed: true, AttributeTypes: diskFileType,
+				MarkdownDescription: "With `disk_dir`: the `platform`'s disk as a file — `path` (absolute), `format`, `sha256` of its bytes and `disk_gib`; null otherwise.",
+				PlanModifiers:       []planmodifier.Object{objectplanmodifier.UseStateForUnknown()}},
+			"await_tls": schema.BoolAttribute{Computed: true, MarkdownDescription: "The VM's first install waits for a `byo` certificate given over SSH (`tls = \"byo\"`).",
+				PlanModifiers: []planmodifier.Bool{boolplanmodifier.UseStateForUnknown()}},
 			"waiting": schema.ListAttribute{Computed: true, ElementType: types.StringType,
 				MarkdownDescription: "The required secret inputs nothing gives, sorted: the VM's first install waits for them, which `stowage_install`'s `secret_inputs_wo` gives over SSH.",
 				PlanModifiers:       []planmodifier.List{listplanmodifier.UseStateForUnknown()}},
@@ -188,9 +210,13 @@ func (r *seedResource) ValidateConfig(ctx context.Context, req resource.Validate
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	// tls is checked by its validator; byo is named here, with what to do instead.
-	if known(m.TLS) && m.TLS.ValueString() == "byo" {
-		resp.Diagnostics.AddAttributeError(path.Root("tls"), "a seed carries no certificate", byoFix)
+	if d := m.DiskDir.ValueString(); known(m.DiskDir) && (!strings.HasPrefix(d, "/") || pathpkg.Clean(d) != d) {
+		resp.Diagnostics.AddAttributeError(path.Root("disk_dir"), "disk_dir is not an absolute, clean path",
+			fmt.Sprintf("%q: give an existing directory as an absolute path (the installer runs in a private directory removed afterwards, which a relative one would name).", d))
+	}
+	if known(m.TLS) && m.TLS.ValueString() == "byo" && m.AwaitSecrets.ValueBool() {
+		resp.Diagnostics.AddAttributeError(path.Root("await_secrets"), "await_secrets with tls byo",
+			"The first install waits for one of them: a secrets export (await_secrets) or a byo certificate (tls = \"byo\"). Give the certificate after the restore, by a re-run's given_wo.")
 	}
 	for k := range stringMap(ctx, m.Inputs, &resp.Diagnostics) {
 		if !installer.ValidInputKey(k) {
@@ -199,10 +225,6 @@ func (r *seedResource) ValidateConfig(ctx context.Context, req resource.Validate
 		}
 	}
 }
-
-// byoFix is what a VM in the byo mode does instead of seeding it.
-const byoFix = "The certificate and its key go over SSH once the VM answers, never in its cloud-config: seed the VM with another TLS mode it takes (internal, acme or dns-cloudflare), " +
-	"and give the certificate in stowage_install's given_wo (the installer's --given YAML, its tls section: cert, key, ca): the VM's first `install --given` takes it, which moves the front to byo."
 
 func (r *seedResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var m seedModel
@@ -267,7 +289,7 @@ func (r *seedResource) Create(ctx context.Context, req resource.CreateRequest, r
 		resp.Diagnostics.AddError("No Kairos shape", fmt.Sprintf("%s %s offers %v, not kairos: it has no VM to seed.", desc.Name, desc.Release.Version, desc.Shapes))
 		return
 	}
-	seed, err := d.Seed(ctx, args)
+	seed, err := d.Seed(ctx, args, r.seedLogin(host))
 	if err != nil {
 		addInstallerError(&resp.Diagnostics, "Seeding a VM of "+desc.Name, err)
 		return
@@ -283,13 +305,39 @@ func (r *seedResource) Create(ctx context.Context, req resource.CreateRequest, r
 	m.HostKeyPrivate = types.StringValue(seed.HostKeyPrivate)
 	disks := map[string]attr.Value{}
 	for p, dk := range seed.Disk {
-		disks[p] = types.ObjectValueMust(diskType, map[string]attr.Value{"format": types.StringValue(dk.Format), "image": types.StringValue(dk.Image)})
+		cloud := types.StringNull()
+		if dk.CloudImage != "" {
+			cloud = types.StringValue(dk.CloudImage)
+		}
+		disks[p] = types.ObjectValueMust(diskType, map[string]attr.Value{"format": types.StringValue(dk.Format), "image": types.StringValue(dk.Image),
+			"os_gib": types.Int64Value(dk.OSGiB), "disk_gib": types.Int64Value(dk.DiskGiB), "cloud_image": cloud})
 	}
 	m.Disk = types.MapValueMust(types.ObjectType{AttrTypes: diskType}, disks)
+	m.MetaData = types.StringValue(seed.MetaData)
+	m.AppGiB = types.Int64Value(seed.AppGiB)
+	m.AwaitTLS = types.BoolValue(seed.AwaitTLS)
+	m.DiskFile = types.ObjectNull(diskFileType)
+	if f := seed.DiskFile; f != nil {
+		m.DiskFile = types.ObjectValueMust(diskFileType, map[string]attr.Value{"path": types.StringValue(f.Path), "format": types.StringValue(f.Format),
+			"sha256": types.StringValue(f.SHA256), "disk_gib": types.Int64Value(f.DiskGiB)})
+	}
 	waiting, d2 := types.ListValueFrom(ctx, types.StringType, seed.Waiting)
 	resp.Diagnostics.Append(d2...)
 	m.Waiting = waiting
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
+}
+
+// seedLogin is the provider's pull account for the registry the seed reads its disks from: the
+// provider's registry (a mirror), else the installer's own (refHost); nil without an account.
+func (r *seedResource) seedLogin(refHost string) *installer.Login {
+	if r.data.Username == "" {
+		return nil
+	}
+	host := refHost
+	if r.data.Registry != "" {
+		host = registryHostOf(r.data.Registry)
+	}
+	return &installer.Login{Host: host, Username: r.data.Username, Password: r.data.Password}
 }
 
 // seedArgs is m as vm seed's flags, with the provider's registry and its CA.
@@ -313,6 +361,7 @@ func (r *seedResource) seedArgs(ctx context.Context, m *seedModel, diags *diag.D
 		Domains: stringMap(ctx, m.Domains, diags), Inputs: stringMap(ctx, m.Inputs, diags),
 		SSHPublicKey: m.SSHPublicKey.ValueString(),
 		Registry:     r.data.Registry, RegistryCA: r.data.RegistryCA,
+		AwaitSecrets: m.AwaitSecrets.ValueBool(), DiskDir: m.DiskDir.ValueString(),
 	}
 }
 

@@ -10,13 +10,15 @@ follow [SemVer](https://semver.org/).
 - `stowage_vm_seed`: a new Kairos VM's first-boot material (`vm seed --json` of an installer, run on
   the machine running OpenTofu), generated once: the cloud-config and the one-time SSH host key
   (both sensitive), its `known_hosts` line and fingerprint, the disk each platform boots, the
-  secret inputs the first install waits for. A seed with the `byo` TLS mode is refused at plan
-  time, naming what to do instead. An example makes a TrueNAS VM of it with Stowage's module.
+  secret inputs the first install waits for, the NoCloud meta-data, each disk's sizes and cloud
+  image name, and with `disk_dir` the disk written as a local file. Its first install can wait for
+  a secrets export (`await_secrets`) or a `byo` certificate (`tls = "byo"`), given over SSH by
+  `stowage_install`. An example makes a TrueNAS VM of it with Stowage's module.
 - `stowage_install` on a Kairos VM (`vm` block): its first install over SSH once the VM's first
   boot settled, pinned to the seed's one-time key, the secret inputs and given values on standard
   input, of the release the VM's OS carries (another `vm.version` is refused at create); then the
   VM's own host key read, the one-time key retired, and the VM's own key alone accepted from then
-  on. `secrets_wo` is refused on a VM: a seed cannot make its first boot wait. A change of inputs
+  on. `secrets_wo` goes to the VM's first install, for a seed that awaits it. A change of inputs
   re-runs the install; a new `vm.version` upgrades the VM and follows its reboot until the health
   gate judged it, a fallback or a kept failed boot being an error that saves the release the VM
   runs; `previous.version` with `allow_rollback` rolls it back. Read reports the release the VM
@@ -29,7 +31,17 @@ follow [SemVer](https://semver.org/).
 - An imported install's first apply records the provider's `registry` as a planned change, no
   longer an inconsistent result.
 - A failed `describe` names an installer older than Stowage 0.34.0 only when it exits 1 (an
-  unknown command), on Docker and on the VM.
+  unknown command), on Docker and on the VM; an installer of Stowage 0.34.0 is refused at its
+  `describe`, naming Stowage 0.35.0, the release the provider reads.
+- `kubernetes.image_pull_login`: the cluster's pull Secret for the mirror written from the
+  provider's pull account at every install and upgrade (opt-in).
+- `registry_ca_digest`: the registry CA an install keeps; a plan giving the provider another CA
+  is a first-install-only error on Docker and the VM.
+- A create over an install already in the directory, and an imported install's first apply,
+  refuse a configuration whose address, registry or registry CA is not the install's; a read
+  records the install's own, so the next plan shows a drift as an error.
+- A pull account's login keeps the Docker context in use, so the fetch reaches the daemon the
+  machine's Docker client is set to.
 
 - `stowage_install` on a Docker host, reached over SSH with its host key pinned or on the machine
   running OpenTofu: create (the installer fetched on the target by digest, its `describe` read,
@@ -58,10 +70,15 @@ follow [SemVer](https://semver.org/).
 - Import of a Docker install by the installer it keeps: `[<host>:]<work_dir>/<name>/<short>-stow`.
 - A create waits, within its timeout, for a first install still in progress.
 - Read removes from state an input the install does not record, so the next plan gives it again;
-  an input the running release does not declare (one only a newer release declares, after a
-  rollback) stays.
+  an input only a newer release declares, which the install keeps after a rollback, stays.
+- A port for a route the running release has goes to the re-run even when an upgrade follows; the
+  upgrade takes those of the routes the new release adds.
+- `work_dir` is an absolute, clean path; left out, the home is resolved at create, so naming it
+  later changes nothing.
+- A plan changing what the target applies shows the release read back as unknown, as the target
+  may run another than state says; an input moved to `secret_inputs_wo` without a new version is
+  refused at plan.
 - `short_name` attribute; `status --json` must carry its `format`; `update` timeout (default 30m).
-- The VM target's schema (not yet installed).
 - `stowage_install` on Kubernetes: the provider's `kubernetes` block, named as the helm
   provider's (`host` with a token, a client certificate or an `exec` credential plugin, or
   `config_path` and `config_context`), reaches the cluster, never in state; a kubeconfig is written

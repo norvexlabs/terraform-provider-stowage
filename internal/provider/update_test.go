@@ -15,7 +15,8 @@ const (
 	image2 = "registry.example.com/notes/notes-installer@" + digest2
 	// describe2 is the release 2.0.0's offer: it adds NEW_KEY and the secret NEW_TOKEN.
 	describe2 = `{"format":1,"name":"notes","short_name":"notes","release":{"version":"2.0.0","revision":1},"channel":"stable","shapes":["docker"],
-		"inputs":[{"key":"ADMIN_EMAIL"},{"key":"SMTP_PASSWORD","secret":true},{"key":"NEW_KEY"},{"key":"NEW_TOKEN","secret":true}]}`
+		"inputs":[{"key":"ADMIN_EMAIL"},{"key":"SMTP_PASSWORD","secret":true},{"key":"NEW_KEY"},{"key":"NEW_TOKEN","secret":true}],
+		"routes":[{"name":"web","loopback_port":8080},{"name":"api","loopback_port":9000}]}`
 	status2 = `{"format":1,"name":"notes","installed":{"version":"2.0.0","revision":1,"installer":"` + image2 + `"},"channel":"stable",
 		"previous":{"version":"1.2.0","revision":1,"installer":"` + image + `"},"inputs":["ADMIN_EMAIL","NEW_KEY"]}`
 )
@@ -59,8 +60,15 @@ func TestUpdateInputsReRunTheRunningRelease(t *testing.T) {
 	planned, _ := p.PlannedState.Unmarshal(h.typ)
 	vals := map[string]tftypes.Value{}
 	_ = planned.As(&vals)
-	if vals["status"].IsKnown() || !vals["version"].IsKnown() {
-		t.Fatalf("a re-run plans status unknown, the release kept: status %v version %v", vals["status"], vals["version"])
+	// What the apply reads back is unknown: the install may run another release than state says
+	// (changed outside OpenTofu since the last refresh).
+	for _, a := range []string{"status", "version", "revision", "channel", "previous"} {
+		if vals[a].IsKnown() {
+			t.Fatalf("a re-run plans %s known: %v", a, vals[a])
+		}
+	}
+	if !vals["installer"].IsKnown() {
+		t.Fatal("a re-run plans the installer unknown")
 	}
 	a := h.apply(state, p.PlannedState, config)
 	if d := errorsOf(a.Diagnostics); d != "" {
@@ -342,7 +350,9 @@ func TestCreateWaitsForTheFirstInstall(t *testing.T) {
 		t.Fatal("a failed install left state")
 	}
 
+	// Every call before the wait answers however late (lenient): the timeout is the wait's.
 	h = newHarness(t, nil)
+	h.fake.lenient = true
 	h.fake.set("status", installing)
 	config = h.dockerConfig(map[string]tftypes.Value{"timeouts": h.block("timeouts", map[string]tftypes.Value{"create": str("20ms")})})
 	a = h.apply(nil, h.plan(nil, config).PlannedState, config)
@@ -352,6 +362,7 @@ func TestCreateWaitsForTheFirstInstall(t *testing.T) {
 
 	// A status read the create timeout cuts says the same, not the read's own error.
 	h = newHarness(t, nil)
+	h.fake.lenient = true
 	h.fake.set("status", reply{block: true})
 	config = h.dockerConfig(map[string]tftypes.Value{"timeouts": h.block("timeouts", map[string]tftypes.Value{"create": str("50ms")})})
 	a = h.apply(nil, h.plan(nil, config).PlannedState, config)
@@ -499,13 +510,13 @@ func TestUpdateRefusals(t *testing.T) {
 	}{
 		"no install": {func(f *fake) { f.set("status", reply{exit: 100, stderr: "stowage-provider: no install directory"}) }, change, "holds no install", false},
 		"kept installer of another project": {func(f *fake) {
-			f.set("kept-describe", reply{stdout: `{"format":1,"name":"atlas","short_name":"atlas","release":{"version":"1"}}`})
+			f.set("kept-describe", reply{stdout: `{"format":1,"name":"atlas","short_name":"atlas","release":{"version":"1"},"routes":[]}`})
 		}, change, `describes the project "atlas"`, false},
 		"new installer of another project": {func(f *fake) {
-			f.set("describe", reply{stdout: `{"format":1,"name":"atlas","short_name":"atlas","release":{"version":"1"}}`})
+			f.set("describe", reply{stdout: `{"format":1,"name":"atlas","short_name":"atlas","release":{"version":"1"},"routes":[]}`})
 		}, map[string]tftypes.Value{"installer": str(image2)}, `describes the project "atlas"`, false},
 		"no docker shape": {func(f *fake) {
-			f.set("describe", reply{stdout: `{"format":1,"name":"notes","short_name":"notes","release":{"version":"2"},"shapes":["kubernetes"]}`})
+			f.set("describe", reply{stdout: `{"format":1,"name":"notes","short_name":"notes","release":{"version":"2"},"shapes":["kubernetes"],"routes":[]}`})
 		}, map[string]tftypes.Value{"installer": str(image2)}, "offers kubernetes, not docker", false},
 		"fetch fails": {func(f *fake) { f.set("fetch", reply{exit: 1, stderr: "manifest unknown"}) }, map[string]tftypes.Value{"installer": str(image2)}, "manifest unknown", false},
 		// previous names the desired installer at apply, not at plan: still allow_rollback's.
@@ -703,10 +714,15 @@ func TestInputMovedToSecretInputsIsNotEmptied(t *testing.T) {
 	if len(rerun) != 1 || contains(rerun[0].argv, "--set") || untarAll(t, rerun[0].stdin)["answers"] != "ADMIN_EMAIL: \"b@example.com\"\n" {
 		t.Fatalf("re-run %q", rerun)
 	}
-	// Moved without a new version, its value would never be sent: refused before anything runs.
+	// Moved without a new version, its value would never be sent: refused at plan, and at apply
+	// (a plan made before the check).
 	h.fake.reset()
-	got := errorsOf(h.update(state, h.dockerConfig(map[string]tftypes.Value{
-		"secret_inputs_wo": strMap(map[string]string{"ADMIN_EMAIL": "b@example.com"})})).Diagnostics)
+	moved := h.dockerConfig(map[string]tftypes.Value{"secret_inputs_wo": strMap(map[string]string{"ADMIN_EMAIL": "b@example.com"})})
+	if got := errorsOf(h.plan(state, moved).Diagnostics); !strings.Contains(got, "an input moved to secret_inputs_wo") {
+		t.Fatalf("plan: %q", got)
+	}
+	unchanged := h.plan(state, h.dockerConfig(nil))
+	got := errorsOf(h.apply(state, unchanged.PlannedState, moved).Diagnostics)
 	if !strings.Contains(got, "an input moved to secret_inputs_wo") || slices.Contains(h.fake.ops(), "rerun") {
 		t.Fatalf("got %q, calls %q", got, h.fake.ops())
 	}
@@ -757,10 +773,31 @@ func TestUpdateRefusesASecretInInputs(t *testing.T) {
 func TestCreateOverAnExistingInstall(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t, map[string]tftypes.Value{"registry": str("mirror.lan/notes"), "registry_ca": str("-----BEGIN CERTIFICATE-----\n")})
-	h.fake.set("new-status", reply{stdout: `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1},"installing":true,"install_failed":"provision hook exited 1"}`})
+	held := `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1},"installing":true,"install_failed":"provision hook exited 1",
+		"registry":"mirror.lan/notes","address":"127.0.0.2","registry_ca":"sha256:b93f51c3ac1bdd90edcce2019d2452a328cbf97443f3744cc7ec63033a5b2c16"}`
 	config := h.dockerConfig(map[string]tftypes.Value{"address": str("127.0.0.2"), "secrets_wo": str("export-" + secretVal),
 		"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})})
 	p := h.plan(nil, config)
+	// The install recorded other first-install settings than the configuration's: refused,
+	// each named, before anything runs (a re-run is never given them).
+	for field, want := range map[string]string{
+		`"address":"127.0.0.2"`:         `address is "127.0.0.2", and the install holds "127.0.0.3"`,
+		`"registry":"mirror.lan/notes"`: `the install pulls from "ghcr.io/acme/notes"`,
+		`"registry_ca":"` + "sha256:b93f51c3ac1bdd90edcce2019d2452a328cbf97443f3744cc7ec63033a5b2c16" + `"`: "and the install keeps none",
+	} {
+		other := map[string]string{`"address":"127.0.0.2"`: `"address":"127.0.0.3"`, `"registry":"mirror.lan/notes"`: `"registry":"ghcr.io/acme/notes"`}[field]
+		if other == "" {
+			other = `"registry_ca":""`
+		}
+		h.fake.reset()
+		h.fake.set("new-status", reply{stdout: strings.Replace(held, field, other, 1)})
+		got := errorsOf(h.apply(nil, p.PlannedState, config).Diagnostics)
+		if !strings.Contains(got, want) || slices.Contains(h.fake.ops(), "install") {
+			t.Errorf("%s: got %q, calls %q", field, got, h.fake.ops())
+		}
+	}
+	h.fake.reset()
+	h.fake.set("new-status", reply{stdout: held})
 	a := h.apply(nil, p.PlannedState, config)
 	if d := errorsOf(a.Diagnostics); d != "" {
 		t.Fatal(d)
@@ -775,7 +812,7 @@ func TestCreateOverAnExistingInstall(t *testing.T) {
 	}
 	// A fresh directory gets them.
 	h.fake.reset()
-	h.fake.set("new-status", reply{exit: 3})
+	h.fake.set("new-status", reply{exit: 3, stdout: `{"format":1,"refused":{"reason":"/srv/notes holds no install","fix":"x","absent":true}}`})
 	h.apply(nil, p.PlannedState, config)
 	install = h.fake.callsOf("install")[0]
 	if f := flags(install.argv); f["--address"] != "127.0.0.2" || f["--registry"] != "mirror.lan/notes" || install.argv[5] != "registry-ca secrets" {

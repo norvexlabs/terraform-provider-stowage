@@ -3,10 +3,12 @@ package installer
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/norvexlabs/terraform-provider-stowage/internal/target"
+	"github.com/norvexlabs/terraform-provider-stowage/internal/testutil"
 )
 
 type oneReply struct {
@@ -41,11 +43,11 @@ func TestK8sStatusNoRelease(t *testing.T) {
 		gone     bool
 		hasError bool
 	}{
-		"the default release": {K8s{Name: "notes"}, oneReply{exit: 3, stderr: "error: no release notes in notes: `notes-stow k8s install` installs 1.0.0\n"}, true, false},
-		"a named release":     {K8s{Name: "notes", Namespace: "prod", Release: "n2"}, oneReply{exit: 3, stderr: "error: no release n2 in prod: …\n"}, true, false},
-		"another release's":   {K8s{Name: "notes", Namespace: "prod", Release: "n2"}, oneReply{exit: 3, stderr: "error: no release notes in prod: …\n"}, false, true},
-		"another refusal":     {K8s{Name: "notes"}, oneReply{exit: 3, stderr: "error: Secret notes-stowage was written by another tool\n"}, false, true},
-		"output with exit 3":  {K8s{Name: "notes"}, oneReply{exit: 3, stdout: "{}", stderr: "error: no release notes in notes: …\n"}, false, true},
+		"no release (absent)": {K8s{Name: "notes"}, oneReply{exit: 3, stdout: `{"format":1,"refused":{"reason":"no release notes in notes","fix":"notes-stow k8s install","absent":true}}`, stderr: "error: no release notes in notes\n"}, true, false},
+		"another refusal":     {K8s{Name: "notes"}, oneReply{exit: 3, stdout: `{"format":1,"refused":{"reason":"Secret notes-stowage was written by another tool","fix":""}}`}, false, true},
+		"no refusal object":   {K8s{Name: "notes"}, oneReply{exit: 3, stderr: "error: no release notes in notes: …\n"}, false, true},
+		"a malformed object":  {K8s{Name: "notes"}, oneReply{exit: 3, stdout: "{}"}, false, true},
+		"an unknown format":   {K8s{Name: "notes"}, oneReply{exit: 3, stdout: `{"format":2,"refused":{"reason":"x","absent":true}}`}, false, true},
 	} {
 		r := c.r
 		c.k.Runner = &r
@@ -57,7 +59,7 @@ func TestK8sStatusNoRelease(t *testing.T) {
 	k := K8s{Runner: &oneReply{}, Name: "notes", Namespace: "prod", Context: "kind-a", Dir: "/run", Kubeconfig: "/run/kubeconfig"}
 	_, _ = k.Status(context.Background())
 	argv := k.Runner.(*oneReply).argv
-	if got := strings.Join(argv[4:], " "); got != "/run /run/kubeconfig  sh ./notes.sh k8s status --namespace prod --kube-context kind-a --json" {
+	if got := strings.Join(argv[4:], " "); got != "/run /run/kubeconfig    sh ./notes.sh k8s status --namespace prod --kube-context kind-a --json" {
 		t.Fatalf("argv %q", got)
 	}
 }
@@ -96,16 +98,53 @@ func TestK8sScript(t *testing.T) {
 		t.Fatal(err)
 	}
 	prog := []string{"sh", "-c", `printf '%s|%s|' "$PWD" "${KUBECONFIG-unset}"; cat "$2"`, "prog"}
-	out, stderr, exit, err := target.Local{}.Run(context.Background(), append([]string{"sh", "-c", K8sScript, "sh", dir, "/k/config", "given"}, prog...), stdin)
+	out, stderr, exit, err := target.Local{}.Run(context.Background(), append([]string{"sh", "-c", K8sScript, "sh", dir, "/k/config", "given", "", ""}, prog...), stdin)
 	if err != nil || exit != 0 {
 		t.Fatalf("%v %d %s", err, exit, stderr)
 	}
 	if want := dir + "|/k/config|project: notes\n"; string(out) != want {
 		t.Fatalf("got %q, want %q", out, want)
 	}
-	out, _, _, _ = target.Local{}.Run(context.Background(), append([]string{"sh", "-c", K8sScript, "sh", dir, "", ""}, "sh", "-c", `printf '%s' "${KUBECONFIG-unset}"`), nil)
+	out, _, _, _ = target.Local{}.Run(context.Background(), append([]string{"sh", "-c", K8sScript, "sh", dir, "", "", "", ""}, "sh", "-c", `printf '%s' "${KUBECONFIG-unset}"`), nil)
 	if string(out) != "unset" {
 		t.Fatalf("no kubeconfig given: KUBECONFIG %q", out)
+	}
+}
+
+// With a login, K8sScript runs the program with a Docker configuration of its own holding it,
+// the password read from the tar, never an argument; the configuration keeps the Docker context
+// in use and its contexts, and is gone after the run.
+func TestK8sScriptLogin(t *testing.T) {
+	t.Parallel()
+	dir, bin, home := t.TempDir(), t.TempDir(), t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".docker", "contexts", "meta"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fake := "#!/bin/sh\ncase $1 in\ncontext) echo rootless ;;\n*) echo \"$*\" >> " + filepath.Join(dir, "log") + " ;;\nesac\n"
+	testutil.WriteExecutable(t, filepath.Join(bin, "docker"), fake)
+	stdin, err := tarFiles(map[string]string{"given": "g", "login-password": "s3cret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prog := []string{"sh", "-c", `cat "$DOCKER_CONFIG/config.json"; ls "$DOCKER_CONFIG/contexts"; printf '|%s' "$*"; echo "$DOCKER_CONFIG" > dc`, "prog"}
+	argv := append([]string{"env", "-u", "DOCKER_CONFIG", "PATH=" + bin + ":/usr/bin:/bin", "HOME=" + home, "sh", "-c", K8sScript, "sh", dir, "", "given", "mirror.lan", "puller"}, prog...)
+	out, stderr, exit, err := target.Local{}.Run(context.Background(), argv, stdin)
+	if err != nil || exit != 0 {
+		t.Fatalf("%v %d %s", err, exit, stderr)
+	}
+	want := `{"auths":{"mirror.lan":{"auth":"cHVsbGVyOnMzY3JldA=="}},"currentContext":"rootless"}` + "\nmeta\n|--given "
+	if !strings.HasPrefix(string(out), want) || strings.Contains(string(out), "s3cret") || strings.Contains(string(out), "login-password") {
+		t.Fatalf("got %q, want %q…", out, want)
+	}
+	if log, _ := os.ReadFile(filepath.Join(dir, "log")); len(log) != 0 {
+		t.Fatalf("docker called beyond context show: %q", log)
+	}
+	dc, _ := os.ReadFile(filepath.Join(dir, "dc"))
+	if _, err := os.Stat(strings.TrimSpace(string(dc))); !os.IsNotExist(err) {
+		t.Fatalf("the login's configuration %s is left: %v", dc, err)
+	}
+	if _, _, _, _, err := loginInput(nil, &Login{Host: `a"b`, Username: "u", Password: "p"}); err == nil {
+		t.Fatal("a host that is no registry host is taken")
 	}
 }
 

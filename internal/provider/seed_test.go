@@ -11,7 +11,9 @@ import (
 )
 
 const seedJSON = `{"format":1,"platform":"truenas","user_data":"#cloud-config\nssh_keys: …\n","known_hosts_line":"vm-seed-host-key ssh-ed25519 ` + edKey + `",
-"fingerprint":"SHA256:abc","host_key_private":"-----BEGIN OPENSSH PRIVATE KEY-----\nx\n","disk":{"truenas":{"format":"qcow2","image":"registry.example.com/notes/notes-disk@` + digest + `"}},"waiting":["API_KEY"]}`
+"fingerprint":"SHA256:abc","host_key_private":"-----BEGIN OPENSSH PRIVATE KEY-----\nx\n","disk":{"truenas":{"format":"qcow2","image":"registry.example.com/notes/notes-disk@` + digest + `","os_gib":23,"disk_gib":43},
+"aws":{"format":"raw","image":"registry.example.com/notes/notes-disk@` + digest + `","os_gib":23,"disk_gib":43,"cloud_image":"notes-0123456789ab"}},"waiting":["API_KEY"],
+"meta_data":"instance-id: app\nlocal-hostname: app\n","app_gib":20,"disk_file":{"path":"/disks/notes.qcow2","format":"qcow2","sha256":"ab12","disk_gib":43},"await_secrets":true}`
 
 // seedHarness drives stowage_vm_seed through the protocol; the fake's "install" op is the
 // fetched installer's run that is neither describe nor upgrade: vm seed.
@@ -95,6 +97,7 @@ func TestSeedCreate(t *testing.T) {
 	s := newSeedHarness(t, map[string]tftypes.Value{"username": str("pull"), "password": str(secretVal), "registry": str("mirror.example/notes")})
 	a := s.create(s.config(map[string]tftypes.Value{
 		"hostname": str("app"), "ssh_public_key": str("ssh-ed25519 AAAA me"), "inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@b"}),
+		"await_secrets": boolean(true), "disk_dir": str("/disks"),
 	}))
 	if d := errorsOf(a.Diagnostics); d != "" {
 		t.Fatal(d)
@@ -108,7 +111,7 @@ func TestSeedCreate(t *testing.T) {
 		}
 	}
 	seed := s.fake.callsOf("install")[0]
-	for _, want := range []string{"vm", "seed", "--json", "--platform=truenas", "--hostname=app", "--registry=mirror.example/notes", "ADMIN_EMAIL=a@b"} {
+	for _, want := range []string{"vm", "seed", "--json", "--platform=truenas", "--hostname=app", "--registry=mirror.example/notes", "ADMIN_EMAIL=a@b", "--await-secrets", "--disk-dir=/disks"} {
 		if !slices.Contains(seed.argv, want) {
 			t.Errorf("vm seed's argv lacks %q: %q", want, seed.argv)
 		}
@@ -124,6 +127,18 @@ func TestSeedCreate(t *testing.T) {
 	var disk map[string]tftypes.Value
 	if err := st["disk"].As(&disk); err != nil || disk["truenas"].IsNull() {
 		t.Errorf("disk %v %v", st["disk"], err)
+	}
+	var aws, file map[string]tftypes.Value
+	_ = disk["aws"].As(&aws)
+	_ = st["disk_file"].As(&file)
+	if asString(t, aws["cloud_image"]) != "notes-0123456789ab" || asString(t, st["meta_data"]) != "instance-id: app\nlocal-hostname: app\n" ||
+		asString(t, file["path"]) != "/disks/notes.qcow2" || asString(t, file["sha256"]) != "ab12" {
+		t.Errorf("aws %v, meta_data %v, disk_file %v", aws, st["meta_data"], file)
+	}
+	var tr map[string]tftypes.Value
+	_ = disk["truenas"].As(&tr)
+	if !tr["cloud_image"].IsNull() {
+		t.Errorf("a disk with no cloud image: %v", tr["cloud_image"])
 	}
 	// Every argument replaces the seed: its key is generated once.
 	p := s.plan(a.NewState, s.config(map[string]tftypes.Value{"hostname": str("app2"), "ssh_public_key": str("ssh-ed25519 AAAA me"), "inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@b"})}))
@@ -142,10 +157,19 @@ func TestSeedCreate(t *testing.T) {
 func TestSeedRefusals(t *testing.T) {
 	t.Parallel()
 	s := newSeedHarness(t, nil)
-	if got := errorsOf(s.validate(s.config(map[string]tftypes.Value{"tls": str("byo")}))); !strings.Contains(got, "a seed carries no certificate") || !strings.Contains(got, "given_wo") {
+	if got := errorsOf(s.validate(s.config(map[string]tftypes.Value{"tls": str("byo")}))); got != "" {
 		t.Errorf("byo: %s", got)
 	}
-	s.fake.set("install", reply{exit: 3, stderr: "error: API_KEY: a seed carries no secret input and no TLS material; they go after the boot, over SSH\n"})
+	for _, d := range []string{".", "disks", "/disks/", "/a/../b"} {
+		if got := errorsOf(s.validate(s.config(map[string]tftypes.Value{"disk_dir": str(d)}))); !strings.Contains(got, "disk_dir is not an absolute, clean path") {
+			t.Errorf("disk_dir %q: %s", d, got)
+		}
+	}
+	if got := errorsOf(s.validate(s.config(map[string]tftypes.Value{"tls": str("byo"), "await_secrets": boolean(true)}))); !strings.Contains(got, "await_secrets with tls byo") {
+		t.Errorf("byo with await_secrets: %s", got)
+	}
+	s.fake.set("install", reply{exit: 3, stdout: `{"format":1,"refused":{"reason":"API_KEY: a seed carries no secret input and no TLS material; they go after the boot, over SSH"}}`,
+		stderr: "error: API_KEY: a seed carries no secret input and no TLS material; they go after the boot, over SSH\n"})
 	a := s.create(s.config(map[string]tftypes.Value{"inputs": strMap(map[string]string{"API_KEY": "x"})}))
 	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "a seed carries no secret input") {
 		t.Errorf("a refused seed: %s", got)

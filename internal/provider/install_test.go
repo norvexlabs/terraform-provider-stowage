@@ -52,7 +52,10 @@ func TestSchemaValidation(t *testing.T) {
 		"host as an option":     {h.dockerConfig(map[string]tftypes.Value{"docker": ssh(map[string]tftypes.Value{"host": str("-oProxyCommand=x")})}), "ssh would misread"},
 		"local with user":       {fill(h.typ, map[string]tftypes.Value{"installer": str(image), "docker": h.block("docker", map[string]tftypes.Value{"user": str("ops")})}), "user without host"},
 		"port out of range":     {h.dockerConfig(map[string]tftypes.Value{"docker": ssh(map[string]tftypes.Value{"port": num(0)})}), "between 1 and 65535"},
-		"empty work_dir":        {h.dockerConfig(map[string]tftypes.Value{"docker": ssh(map[string]tftypes.Value{"work_dir": str(" ")})}), "work_dir is empty"},
+		"empty work_dir":        {h.dockerConfig(map[string]tftypes.Value{"docker": ssh(map[string]tftypes.Value{"work_dir": str(" ")})}), "work_dir is not an absolute, clean path"},
+		"relative work_dir":     {h.dockerConfig(map[string]tftypes.Value{"docker": ssh(map[string]tftypes.Value{"work_dir": str("srv")})}), "work_dir is not an absolute, clean path"},
+		"a trailing slash":      {h.dockerConfig(map[string]tftypes.Value{"docker": ssh(map[string]tftypes.Value{"work_dir": str("/srv/")})}), "work_dir is not an absolute, clean path"},
+		"a .. element":          {h.dockerConfig(map[string]tftypes.Value{"docker": ssh(map[string]tftypes.Value{"work_dir": str("/srv/../opt")})}), "work_dir is not an absolute, clean path"},
 		"bad input key":         {h.dockerConfig(map[string]tftypes.Value{"inputs": strMap(map[string]string{"A=B": "x"})}), "not an input key"},
 		"input given twice": {h.dockerConfig(map[string]tftypes.Value{"inputs": strMap(map[string]string{"K": "x"}),
 			"secret_inputs_wo": strMap(map[string]string{"K": "y"}), "secret_inputs_wo_version": num(1)}), "input given twice"},
@@ -255,7 +258,7 @@ func TestUnknownFormatIsRefused(t *testing.T) {
 func TestInstallerOfAnotherProject(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t, nil)
-	h.fake.replies["describe"] = reply{stdout: `{"format":1,"name":"other","short_name":"other","release":{"version":"1"}}`}
+	h.fake.replies["describe"] = reply{stdout: `{"format":1,"name":"other","short_name":"other","release":{"version":"1"},"routes":[]}`}
 	config := h.dockerConfig(nil)
 	p := h.plan(nil, config)
 	if got := errorsOf(h.apply(nil, p.PlannedState, config).Diagnostics); !strings.Contains(got, `describes the project "other"`) {

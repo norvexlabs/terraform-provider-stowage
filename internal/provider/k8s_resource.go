@@ -117,6 +117,38 @@ func sortedTrue(m map[string]bool) []string {
 	return out
 }
 
+// registryHostOf is the host of a registry prefix (`<host>/<path>`): the one a login names.
+func registryHostOf(prefix string) string {
+	host, _, _ := strings.Cut(prefix, "/")
+	return host
+}
+
+// pullLogin is the provider's pull account for the host of the registry m's release pulls from:
+// the one state records (the provider's at the install), else the provider's.
+func (r *installResource) pullLogin(m *installModel) *installer.Login {
+	reg := r.registry()
+	if known(m.Registry) && m.Registry.ValueString() != "" {
+		reg = m.Registry.ValueString()
+	}
+	return &installer.Login{Host: registryHostOf(reg), Username: r.data.Username, Password: r.data.Password}
+}
+
+// planPullLogin refuses image_pull_login without what it needs: the provider's pull account and
+// a mirror (the provider's registry, or the one state records).
+func (r *installResource) planPullLogin(plan, state *installModel, diags *diag.Diagnostics) {
+	if plan.Kubernetes == nil || !plan.Kubernetes.ImagePullLogin.ValueBool() || r.data == nil {
+		return
+	}
+	p := path.Root("kubernetes").AtName("image_pull_login")
+	if r.data.Username == "" && !r.data.UsernameUnknown {
+		diags.AddAttributeError(p, "image_pull_login needs the pull account", "Give the provider's username and password: the cluster's pull Secret is written from them.")
+	}
+	held := state != nil && known(state.Registry) && state.Registry.ValueString() != ""
+	if r.data.RegistryKnown && r.data.Registry == "" && !held {
+		diags.AddAttributeError(p, "image_pull_login needs a mirror", "Give the provider's registry, the mirror the cluster pulls from: the release's own registry takes no pull Secret from the provider.")
+	}
+}
+
 // k8sDriver is the driver of m's release for the project name, with no runner or directory yet.
 func k8sDriver(m *installModel, name string) installer.K8s {
 	return installer.K8s{Name: name, Namespace: m.Kubernetes.Namespace.ValueString(), Release: m.Kubernetes.Release.ValueString()}
@@ -194,6 +226,9 @@ func (r *installResource) k8sStart(ctx context.Context, m *installModel, name st
 	run := &k8sRun{r: r, dir: dir}
 	run.k = k8sDriver(m, name)
 	run.k.Runner = installer.Filtered(runner)
+	if m.Kubernetes.ImagePullLogin.ValueBool() {
+		run.k.PullLogin = r.pullLogin(m)
+	}
 	b := r.data.Kubernetes
 	if b == nil {
 		b = &k8sConnModel{}
@@ -504,6 +539,7 @@ func (r *installResource) k8sCreate(ctx context.Context, m *installModel, in ins
 	}
 	m.ID = types.StringValue(k8sID(k))
 	m.Registry = types.StringValue(r.registry())
+	m.RegistryCADigest = r.providerCA()
 	m.ShortName = types.StringValue(desc.ShortName)
 	st, u := r.k8sTrust(st, name, m.Installer)
 	applyStatus(m, st, false)
@@ -943,6 +979,13 @@ func (r *installResource) k8sUpdate(ctx context.Context, plan, state *installMod
 	}
 	short := running.ShortName
 	base := state // what the final read falls back to: the state saved last
+	if rerun.Empty() && step == stay && plan.Kubernetes.ImagePullLogin.ValueBool() && !state.Kubernetes.ImagePullLogin.ValueBool() {
+		// image_pull_login turned on, nothing else: the release applied again writes the Secret.
+		if _, err := cur.Reapply(ctx, r.registryCA()); err != nil {
+			addInstallerError(diags, "Writing the cluster's pull Secret", err)
+			return
+		}
+	}
 	if !rerun.Empty() {
 		if _, err := cur.Reconfigure(ctx, rerun, r.registryCA()); err != nil {
 			addInstallerError(diags, "Reconfiguring "+name, err)
@@ -954,7 +997,7 @@ func (r *installResource) k8sUpdate(ctx context.Context, plan, state *installMod
 				return
 			}
 			partial.Installer = types.StringValue(runningRef)
-			k8sFill(partial, cur, short, r.registry(), state)
+			k8sFill(partial, cur, short, r.registry(), r.providerCA(), state)
 			// The release as the reconfiguration left it; the read before it, when this one fails.
 			var after *untrustedRun
 			now, err := cur.Status(ctx)
@@ -998,7 +1041,7 @@ func (r *installResource) k8sUpdate(ctx context.Context, plan, state *installMod
 		}
 	}
 	final := *plan
-	k8sFill(&final, cur, short, r.registry(), state)
+	k8sFill(&final, cur, short, r.registry(), r.providerCA(), state)
 	r.k8sFinal(ctx, after, &final, base, name, diags, plan.Installer, state.Installer)
 	save(&final)
 }
@@ -1038,10 +1081,13 @@ func stillUntrusted(diags *diag.Diagnostics, m *installModel, k installer.K8s, u
 
 // k8sFill sets what an update's state holds whatever the status: the ID, the short name, the
 // registry (an imported state's is the provider's now), no write-only value.
-func k8sFill(m *installModel, k installer.K8s, short, registry string, state *installModel) {
+func k8sFill(m *installModel, k installer.K8s, short, registry string, ca types.String, state *installModel) {
 	m.ID = types.StringValue(k8sID(k))
 	m.ShortName = types.StringValue(short)
-	m.Registry = state.Registry
+	m.Registry, m.RegistryCADigest = state.Registry, state.RegistryCADigest
+	if imported(state) || m.RegistryCADigest.IsUnknown() {
+		m.RegistryCADigest = ca
+	}
 	if imported(state) {
 		m.Registry = types.StringValue(registry)
 	}
@@ -1061,7 +1107,7 @@ func (r *installResource) k8sReleaseStep(ctx context.Context, run *k8sRun, u *up
 	case st.Previous != nil && st.Previous.Installer == desired:
 		if !u.plan.AllowRollback.ValueBool() {
 			u.diags.AddAttributeError(path.Root("allow_rollback"), "a rollback needs allow_rollback",
-				fmt.Sprintf("installer is %s, the release the last upgrade replaced: reaching it is k8s rollback, which takes the previous values back. Set allow_rollback = true to roll back.", desired))
+				fmt.Sprintf("installer is %s, the release the last upgrade replaced: reaching it is k8s rollback, which takes the previous release back. Set allow_rollback = true to roll back.", desired))
 			return stay, nil, installer.K8s{}
 		}
 		return rollback, nil, installer.K8s{}

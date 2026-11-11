@@ -21,7 +21,7 @@ const digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef012345678
 func TestParseDescribe(t *testing.T) {
 	t.Parallel()
 	d, err := ParseDescribe([]byte(`{"format":1,"name":"notes","short_name":"notes","release":{"version":"1.2.0","revision":2},"channel":"stable",
-		"shapes":["docker"],"inputs":[{"key":"ADMIN_EMAIL","required":true,"default":"a@b"}],"first_install_only":["address"],"a_later_field":{"x":1}}`))
+		"shapes":["docker"],"inputs":[{"key":"ADMIN_EMAIL","required":true,"default":"a@b"}],"first_install_only":["address"],"a_later_field":{"x":1},"routes":[]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,16 +30,17 @@ func TestParseDescribe(t *testing.T) {
 		t.Fatalf("got %+v", d)
 	}
 	for doc, want := range map[string]string{
-		`{"name":"notes","release":{"version":"1"}}`:                                   "predates the machine interface; use an installer made by Stowage " + MinStowage,
-		`{"format":2,"name":"notes","release":{"version":"1"}}`:                        "format 2 is newer than this provider reads (format 1): upgrade terraform-provider-stowage",
-		`{"format":0,"name":"notes","release":{"version":"1"}}`:                        "format 0 is unknown",
-		`{"format":1,"name":"notes","short_name":"n","release":{"version":"1"}} {}`:    "data after",
-		`{"format":"1","name":"notes"}`:                                                "cannot unmarshal",
-		`{"format":1,"release":{"version":"1"}}`:                                       "no name",
-		`{"format":1,"name":"notes","short_name":"n","release":{}}`:                    "release has no version",
-		`{"format":1,"name":"notes","release":{"version":"1"}}`:                        `short_name "" is not`,
-		`{"format":1,"name":"notes","short_name":"../x","release":{"version":"1"}}`:    `short_name "../x" is not`,
-		`{"format":1,"name":"notes","short_name":".hidden","release":{"version":"1"}}`: `short_name ".hidden" is not`,
+		`{"name":"notes","release":{"version":"1"}}`:                                               "predates the machine interface; use an installer made by Stowage " + MinStowage,
+		`{"format":2,"name":"notes","release":{"version":"1"}}`:                                    "format 2 is newer than this provider reads (format 1): upgrade terraform-provider-stowage",
+		`{"format":0,"name":"notes","release":{"version":"1"}}`:                                    "format 0 is unknown",
+		`{"format":1,"name":"notes","short_name":"n","release":{"version":"1"},"routes":[]} {}`:    "data after",
+		`{"format":1,"name":"notes","short_name":"n","release":{"version":"1"}}`:                   "no routes: the installer predates the machine interface this provider reads; use one made by Stowage " + MinStowage,
+		`{"format":"1","name":"notes"}`:                                                            "cannot unmarshal",
+		`{"format":1,"release":{"version":"1"}}`:                                                   "no name",
+		`{"format":1,"name":"notes","short_name":"n","release":{},"routes":[]}`:                    "release has no version",
+		`{"format":1,"name":"notes","release":{"version":"1"}}`:                                    `short_name "" is not`,
+		`{"format":1,"name":"notes","short_name":"../x","release":{"version":"1"},"routes":[]}`:    `short_name "../x" is not`,
+		`{"format":1,"name":"notes","short_name":".hidden","release":{"version":"1"},"routes":[]}`: `short_name ".hidden" is not`,
 	} {
 		_, err := ParseDescribe([]byte(doc))
 		if err == nil || !strings.Contains(err.Error(), want) {
@@ -316,8 +317,8 @@ func TestScriptsUnderSh(t *testing.T) {
 	work, bin := t.TempDir(), t.TempDir()
 	log := filepath.Join(bin, "log")
 	writeExe(t, filepath.Join(bin, "docker"), `case $1 in
-login) echo "login $* pw=$(cat) cfg=$DOCKER_CONFIG" >> `+log+` ;;
-run) echo "run $*" >> `+log+`; echo 'echo bootstrap "$@"' ;;
+login) echo "login $*" >> `+log+` ;;
+run) echo "run $* cfg=$DOCKER_CONFIG $(cat "$DOCKER_CONFIG/config.json")" >> `+log+`; echo 'echo bootstrap "$@"' ;;
 esac
 `)
 	d := Docker{Runner: envRunner{bin}, WorkDir: work, Name: "notes"}
@@ -328,10 +329,13 @@ esac
 	}
 	got, _ := os.ReadFile(log)
 	lines := strings.Split(strings.TrimSpace(string(got)), "\n")
-	if len(lines) != 2 || !strings.HasPrefix(lines[0], "login login --username pull --password-stdin registry.example.com pw=pw-SECRET cfg=") || lines[1] != "run run --rm "+img {
+	// The login is the configuration's own auths entry, never docker login (a credential helper
+	// would keep it), and the password is on no command line.
+	wantCfg := `{"auths":{"registry.example.com":{"auth":"cHVsbDpwdy1TRUNSRVQ="}}}`
+	if len(lines) != 1 || !strings.HasPrefix(lines[0], "run run --rm "+img+" cfg=") || !strings.HasSuffix(lines[0], " "+wantCfg) {
 		t.Fatalf("docker calls %q", lines)
 	}
-	cfg := strings.TrimPrefix(lines[0][strings.Index(lines[0], "cfg="):], "cfg=")
+	cfg := strings.Fields(strings.TrimPrefix(lines[0][strings.Index(lines[0], "cfg="):], "cfg="))[0]
 	if _, err := os.Stat(cfg); !os.IsNotExist(err) {
 		t.Fatalf("the login's configuration %s is left: %v", cfg, err)
 	}
@@ -440,7 +444,7 @@ func TestVerbArgv(t *testing.T) {
 	if _, err := d.Rollback(ctx); err != nil || !slices.Equal(f.argv[9:], []string{"rollback", "--json"}) || f.argv[8] != "dir" {
 		t.Fatalf("rollback %q %v", f.argv, err)
 	}
-	f.out = `{"format":1,"name":"notes","short_name":"nt","release":{"version":"1"}}`
+	f.out = `{"format":1,"name":"notes","short_name":"nt","release":{"version":"1"},"routes":[]}`
 	if desc, err := d.KeptDescribe(ctx); err != nil || desc.ShortName != "nt" || f.argv[8] != "" || !slices.Equal(f.argv[9:], []string{"describe", "--json"}) {
 		t.Fatalf("kept describe %q %v", f.argv, err)
 	}
@@ -487,10 +491,11 @@ func TestNotInstalledMark(t *testing.T) {
 	}
 }
 
-// A create reads the install directory with the fetched installer first: exit 3 is no install.
+// A create reads the install directory with the fetched installer first: a refusal saying absent
+// is no install; another refusal is an error, never taken for none.
 func TestFetchedStatus(t *testing.T) {
 	t.Parallel()
-	f := &recorder{exit: 3, errOut: "error: /srv/notes holds no install\n"}
+	f := &recorder{exit: 3, out: `{"format":1,"refused":{"reason":"/srv/notes holds no install","fix":"x","absent":true}}`, errOut: "error: /srv/notes holds no install\n"}
 	d := Docker{Runner: f, WorkDir: "/srv", Name: "notes"}
 	ctx := context.Background()
 	if s, err := d.FetchedStatus(ctx); s != nil || err != nil {
@@ -504,8 +509,25 @@ func TestFetchedStatus(t *testing.T) {
 	if s, err := d.FetchedStatus(ctx); err != nil || s == nil || !s.Installing {
 		t.Fatalf("an install: %+v %v", s, err)
 	}
+	f.exit, f.out = 3, `{"format":1,"refused":{"reason":"the install's .env is not readable","fix":"x"}}`
+	var refused *RefusedError
+	if s, err := d.FetchedStatus(ctx); s != nil || !errors.As(err, &refused) || refused.Absent {
+		t.Fatalf("another refusal: %+v %v", s, err)
+	}
 	f.exit, f.out = 1, ""
 	if _, err := d.FetchedStatus(ctx); err == nil || !strings.Contains(err.Error(), "status failed (exit 1)") {
 		t.Fatalf("a failure: %v", err)
+	}
+}
+
+// A kept installer of Stowage 0.34.0 (no routes) is refused naming the hand upgrade that moves
+// the install on.
+func TestKeptDescribePre035(t *testing.T) {
+	t.Parallel()
+	f := &recorder{out: `{"format":1,"name":"notes","short_name":"notes","release":{"version":"1"}}`}
+	d := Docker{Runner: f, WorkDir: "/srv", Name: "notes", Short: "notes"}
+	_, err := d.KeptDescribe(context.Background())
+	if !errors.Is(err, ErrPreRoutes) || !strings.Contains(err.Error(), "/srv/notes/notes-stow upgrade --version V --dir /srv/notes") {
+		t.Fatalf("got %v", err)
 	}
 }

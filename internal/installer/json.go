@@ -18,7 +18,7 @@ func ValidShortName(s string) bool { return projectName.MatchString(s) }
 const Format = 1
 
 // MinStowage is the first Stowage release whose installers speak Format.
-const MinStowage = "0.34.0"
+const MinStowage = "0.35.0"
 
 // FormatError is an installer speaking a format this provider does not read.
 type FormatError struct {
@@ -92,6 +92,39 @@ type Describe struct {
 	Shapes           []string `json:"shapes"`
 	Inputs           []Input  `json:"inputs"`
 	FirstInstallOnly []string `json:"first_install_only"`
+	// StowageVersion is the Stowage release that built the installer ("" when its manifest
+	// records none).
+	StowageVersion string `json:"stowage_version"`
+	// Registry is the prefix the release's images are pulled from when no mirror is given.
+	Registry string `json:"registry"`
+	// Routes are the front's routes, the names --ports takes; L4Routes the host ports no flag
+	// moves.
+	Routes   []Route   `json:"routes"`
+	L4Routes []L4Route `json:"l4_routes"`
+}
+
+// Route is a front route as describe lists it: its name, and the loopback port it binds when
+// --ports gives none (0 when the release gives none).
+type Route struct {
+	Name         string `json:"name"`
+	LoopbackPort int64  `json:"loopback_port"`
+}
+
+// L4Route is an l4 route: a host port published as it is.
+type L4Route struct {
+	Name     string `json:"name"`
+	Protocol string `json:"protocol"`
+	Port     int64  `json:"port"`
+}
+
+// HasRoute says whether the release's front has the route name.
+func (d *Describe) HasRoute(name string) bool {
+	for _, r := range d.Routes {
+		if r.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // Declares says whether the release declares the input key.
@@ -130,6 +163,13 @@ type Status struct {
 	Inputs *Keys `json:"inputs"`
 	// Helm is Kubernetes's: the release's latest revision and its status, as helm lists it.
 	Helm *HelmStatus `json:"helm"`
+	// What the first install recorded: the image prefix the install pulls from (Docker,
+	// Kubernetes, the VM), and on Docker and the VM the kept installer's short name, the loopback
+	// address and the registry CA's digest (`sha256:<hex>`, "" when the install keeps none).
+	Registry   string `json:"registry"`
+	ShortName  string `json:"short_name"`
+	Address    string `json:"address"`
+	RegistryCA string `json:"registry_ca"`
 }
 
 // HelmStatus is a helm release's latest revision and its status (deployed, failed, …).
@@ -163,6 +203,41 @@ type Result struct {
 type Refusal struct {
 	Reason string `json:"reason"`
 	Fix    string `json:"fix"`
+	// Absent: the refusal is that no install is there (no install in the directory, no helm
+	// release in the namespace, no first install on the VM).
+	Absent bool `json:"absent"`
+}
+
+// refusedDoc is the object a read (status --json, vm seed --json) prints on standard output with
+// exit 3.
+type refusedDoc struct {
+	Format  *int     `json:"format"`
+	Refused *Refusal `json:"refused"`
+}
+
+// ParseRefused reads the refusal a read prints with exit 3: doc names the read. A refusal
+// without its object, or one with no reason, breaks the machine interface.
+func ParseRefused(doc string, stdout, stderr []byte) (*RefusedError, error) {
+	verb := strings.TrimSuffix(doc, " --json")
+	breach := func(why error) error {
+		return &FailedError{Verb: verb, Exit: 3, Stderr: tail(stderr),
+			Cause: fmt.Errorf("%w: the installer breaks the machine interface, whose exit 3 ends with one refusal object alone on standard output", why)}
+	}
+	out := bytes.TrimSpace(stdout)
+	if len(out) == 0 {
+		return nil, breach(fmt.Errorf("%s: no refusal object", doc))
+	}
+	var r refusedDoc
+	if err := decodeOne(doc, out, &r); err != nil {
+		return nil, breach(err)
+	}
+	if err := checkFormat(doc, r.Format); err != nil {
+		return nil, err
+	}
+	if r.Refused == nil || r.Refused.Reason == "" {
+		return nil, breach(fmt.Errorf("%s: exit 3 without a refusal", doc))
+	}
+	return &RefusedError{Verb: verb, Refusal: *r.Refused}, nil
 }
 
 // decodeOne decodes exactly one JSON value from b into v: trailing data is an error, unknown
@@ -177,6 +252,10 @@ func decodeOne(doc string, b []byte, v any) error {
 	}
 	return nil
 }
+
+// ErrPreRoutes is a describe without routes: an installer of Stowage 0.34.0, whose machine
+// interface lacks what this provider reads.
+var ErrPreRoutes = fmt.Errorf("no routes: the installer predates the machine interface this provider reads; use one made by Stowage %s or later", MinStowage)
 
 // ParseDescribe reads `describe --json`.
 func ParseDescribe(b []byte) (*Describe, error) {
@@ -196,6 +275,10 @@ func ParseDescribe(b []byte) (*Describe, error) {
 	}
 	if err := d.Release.check(doc, "release"); err != nil {
 		return nil, err
+	}
+	if d.Routes == nil {
+		// Every installer of Stowage 0.35.0 or later lists them, [] for none.
+		return nil, fmt.Errorf("%s: %w", doc, ErrPreRoutes)
 	}
 	return &d, nil
 }
@@ -220,6 +303,26 @@ func ParseStatus(b []byte) (*Status, error) {
 		return nil, err
 	}
 	return &s, nil
+}
+
+// readStatus maps a `status --json` run to its status: exit 0 the status; exit 3 its refusal's
+// object, nil when the refusal says no install is there (absent), else a *RefusedError; any
+// other exit a *FailedError.
+func readStatus(verb string, stdout, stderr []byte, exit int) (*Status, error) {
+	switch exit {
+	case 0:
+		return ParseStatus(stdout)
+	case 3:
+		r, err := ParseRefused(verb+" --json", stdout, stderr)
+		if err != nil {
+			return nil, err
+		}
+		if r.Absent {
+			return nil, nil
+		}
+		return nil, r
+	}
+	return nil, &FailedError{Verb: verb, Exit: exit, Stderr: tail(stderr)}
 }
 
 // RefusedError is exit 3: a rule said no before anything changed. Fix is advice for the

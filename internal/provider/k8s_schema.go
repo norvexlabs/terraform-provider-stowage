@@ -33,8 +33,9 @@ type k8sExecModel struct {
 
 // k8sModel is the resource's kubernetes block: the release's namespace and name.
 type k8sModel struct {
-	Namespace types.String `tfsdk:"namespace"`
-	Release   types.String `tfsdk:"release"`
+	Namespace      types.String `tfsdk:"namespace"`
+	Release        types.String `tfsdk:"release"`
+	ImagePullLogin types.Bool   `tfsdk:"image_pull_login"`
 }
 
 func k8sBlock() schema.SingleNestedBlock {
@@ -46,6 +47,9 @@ func k8sBlock() schema.SingleNestedBlock {
 				MarkdownDescription: "The release's namespace; required in this block. First-install only."},
 			"release": schema.StringAttribute{Optional: true,
 				MarkdownDescription: "The helm release's name; left out, the project's name (the installer's default). First-install only."},
+			"image_pull_login": schema.BoolAttribute{Optional: true,
+				MarkdownDescription: "Writes the cluster's pull Secret for the mirror from the provider's pull account (`k8s install|upgrade --image-pull-login`), at every install and upgrade, so an authenticated mirror serves the cluster's nodes. " +
+					"Opt-in: the account's credential is then readable by whoever reads the release's Secrets. Needs the provider's `username`, `password` and `registry` (the mirror; the release's own registry is refused by the installer)."},
 		},
 	}
 }

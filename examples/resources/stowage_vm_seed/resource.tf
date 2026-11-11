@@ -18,29 +18,23 @@ resource "stowage_vm_seed" "notes" {
   dns     = ["192.0.2.1"]
   tls     = "internal"
   inputs  = { ADMIN_EMAIL = "ops@example.com" }
+  # The disk written here as a file (disk_file), for the module to upload.
+  disk_dir = pathexpand("~/.cache/notes/disks")
 }
 
-# The disk as a file, pulled from the registry the seed names (oras, zstd).
-data "external" "disk" {
-  program = ["${path.module}/fetch-disk.sh"]
-  query = {
-    image = stowage_vm_seed.notes.disk["truenas"].image
-    dir   = pathexpand("~/.cache/notes/disks")
-  }
-}
-
-# The NoCloud seed ISO of its user-data.
+# The NoCloud seed ISO of its user-data and meta-data.
 data "external" "seed" {
   program = ["${path.module}/seed-iso.sh"]
   query = {
     user_data = stowage_vm_seed.notes.user_data
+    meta_data = stowage_vm_seed.notes.meta_data
     hostname  = "notes"
     dir       = pathexpand("~/.cache/notes/seeds")
   }
 }
 
 module "vm" {
-  source = "git::https://github.com/norvexlabs/stowage.git//internal/install/tofu/truenas?ref=v0.34.0"
+  source = "git::https://github.com/norvexlabs/stowage.git//internal/install/tofu/truenas?ref=v0.35.0"
 
   name           = "notes"
   pool           = "tank"
@@ -48,10 +42,10 @@ module "vm" {
   nic_attach     = "br0"
   cpus           = 2
   memory_mib     = 4096
-  # The app's 20 GiB, and what Kairos takes of the disk.
-  disk_gib     = 20 + tonumber(data.external.disk.result.os_gib)
-  image        = data.external.disk.result.path
-  image_sha256 = data.external.disk.result.sha256
+  # The app's space the release recommends, and what Kairos takes of the disk.
+  disk_gib     = stowage_vm_seed.notes.disk_file.disk_gib
+  image        = stowage_vm_seed.notes.disk_file.path
+  image_sha256 = stowage_vm_seed.notes.disk_file.sha256
   seed         = data.external.seed.result.path
   seed_sha256  = data.external.seed.result.sha256
 }

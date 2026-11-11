@@ -1,10 +1,14 @@
 package provider
 
 import (
+	"cmp"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"maps"
+	pathpkg "path"
 	"slices"
 	"strconv"
 	"strings"
@@ -98,8 +102,9 @@ func (r *installResource) ValidateConfig(ctx context.Context, req resource.Valid
 	}
 	if m.Docker != nil {
 		validateSSH(path.Root("docker"), m.Docker.Host, m.Docker.User, m.Docker.KnownHostsLine, m.Docker.PrivateKeyFile, m.Docker.Port, true, &resp.Diagnostics)
-		if known(m.Docker.WorkDir) && strings.TrimSpace(m.Docker.WorkDir.ValueString()) == "" {
-			resp.Diagnostics.AddAttributeError(path.Root("docker").AtName("work_dir"), "work_dir is empty", "Give a directory, or leave work_dir out for the SSH user's home.")
+		if w := m.Docker.WorkDir.ValueString(); known(m.Docker.WorkDir) && (!strings.HasPrefix(w, "/") || pathpkg.Clean(w) != w) {
+			resp.Diagnostics.AddAttributeError(path.Root("docker").AtName("work_dir"), "work_dir is not an absolute, clean path",
+				fmt.Sprintf("%q: give an absolute path with no . or .. element, no // and no trailing /, or leave work_dir out for the SSH user's home (OpenTofu's working directory, locally).", w))
 		}
 	}
 	if m.VM != nil {
@@ -212,6 +217,18 @@ func workDir(d *dockerModel) string {
 	return d.WorkDir.ValueString()
 }
 
+// heldWorkDir is d's work directory as the install's directory resolved it: left out while
+// state's was left out too, the directory state's ID names (the home the create resolved), so
+// leaving it out and naming that directory are the same; else as given (an absolute, clean path,
+// or "." for a home not resolved).
+func heldWorkDir(state *installModel, d *dockerModel) string {
+	w := workDir(d)
+	if id := state.ID.ValueString(); w == "." && workDir(state.Docker) == "." && known(state.ID) && strings.HasPrefix(id, "/") {
+		return pathpkg.Dir(id)
+	}
+	return w
+}
+
 func targetKind(m *installModel) string {
 	switch {
 	case m.Docker != nil:
@@ -240,8 +257,16 @@ func firstInstallOnlyFix(diags *diag.Diagnostics, p path.Path, name, was, now, f
 }
 
 func (r *installResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
-	if req.Plan.Raw.IsNull() || req.State.Raw.IsNull() {
-		return // a destroy, or a create
+	if req.Plan.Raw.IsNull() {
+		return // a destroy
+	}
+	if req.State.Raw.IsNull() {
+		var plan installModel
+		resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+		if !resp.Diagnostics.HasError() {
+			r.planPullLogin(&plan, nil, &resp.Diagnostics)
+		}
+		return // a create
 	}
 	var plan, state installModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -255,7 +280,7 @@ func (r *installResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 	}
 	// Left out is the home directory (workDir): taking work_dir out is a change too.
 	if plan.Docker != nil && state.Docker != nil && !plan.Docker.WorkDir.IsUnknown() {
-		firstInstallOnly(&resp.Diagnostics, path.Root("docker").AtName("work_dir"), "docker.work_dir", workDir(state.Docker), workDir(plan.Docker))
+		firstInstallOnly(&resp.Diagnostics, path.Root("docker").AtName("work_dir"), "docker.work_dir", heldWorkDir(&state, state.Docker), heldWorkDir(&state, plan.Docker))
 	}
 	// An imported state does not know the first install's address: the installer refuses a
 	// re-run given one, and none is given after the first install.
@@ -278,9 +303,15 @@ func (r *installResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 		}
 	}
 	r.k8sModifyPlan(ctx, &plan, &state, resp)
+	r.planPullLogin(&plan, &state, &resp.Diagnostics)
+	planMovedSecrets(ctx, req, &plan, &state, &resp.Diagnostics)
 	r.planRollback(ctx, &plan, &state, &resp.Diagnostics)
 	planVM(ctx, &plan, &state, resp)
 	planRemovals(ctx, &plan, &state, &resp.Diagnostics)
+	if r.data != nil && r.data.RegistryCAKnown && !imported(&state) && plan.Kubernetes == nil {
+		firstInstallOnlyFix(&resp.Diagnostics, path.Root("registry_ca_digest"), "the provider's registry_ca", state.RegistryCADigest.ValueString(), caDigest(r.data.RegistryCA),
+			"The install keeps the registry CA its first install was given (status --json registry_ca), which a re-run cannot change: give the provider that CA again (an empty one for none).")
+	}
 	if r.data != nil && r.data.RegistryKnown && known(state.Registry) {
 		firstInstallOnly(&resp.Diagnostics, path.Root("registry"), "the provider's registry", state.Registry.ValueString(), r.data.Registry)
 	}
@@ -291,12 +322,11 @@ func (r *installResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 		if imported(&state) {
 			unknowns = append(unknowns, "registry") // the first apply records the provider's
 		}
-	case plan.VM != nil && len(remoteChange(&plan, &state)) > 0:
-		// The update reads the release after its run, and the VM may run another than state
-		// says (a refresh skipped).
-		unknowns = []string{"version", "revision", "channel", "status", "previous"}
 	case len(remoteChange(&plan, &state)) > 0:
-		unknowns = []string{"status"} // a re-run may finish a first install that failed
+		// The update reads the release after its run, and the target may run another than state
+		// says (changed outside OpenTofu, a refresh skipped); a re-run may finish a first
+		// install that failed.
+		unknowns = []string{"version", "revision", "channel", "status", "previous"}
 	}
 	if imported(&state) {
 		unknowns = append(unknowns, "registry") // the first apply records the provider's
@@ -358,7 +388,7 @@ func previousInstaller(ctx context.Context, m *installModel) string {
 }
 
 // planRollback refuses, at plan time, a change of the release back to the previous one without
-// allow_rollback: a rollback restores the previous values, so a variable edit never makes one.
+// allow_rollback: a rollback takes the previous release back, so a variable edit never makes one.
 func (r *installResource) planRollback(ctx context.Context, plan, state *installModel, diags *diag.Diagnostics) {
 	if !known(plan.Installer) || plan.Installer.Equal(state.Installer) {
 		return
@@ -371,7 +401,7 @@ func (r *installResource) planRollback(ctx context.Context, plan, state *install
 			return
 		}
 		diags.AddAttributeError(path.Root("allow_rollback"), "a rollback needs allow_rollback",
-			fmt.Sprintf("installer is now %s, the release the install's last upgrade replaced (previous.installer): reaching it is the kept installer's rollback, which restores the previous values. Set allow_rollback = true to roll back, or set installer back to %s.", prev, state.Installer.ValueString()))
+			fmt.Sprintf("installer is now %s, the release the install's last upgrade replaced (previous.installer): reaching it is the kept installer's rollback, which takes the previous release back (every input keeps its value). Set allow_rollback = true to roll back, or set installer back to %s.", prev, state.Installer.ValueString()))
 	}
 }
 
@@ -441,7 +471,11 @@ func (r *installResource) docker(m *installModel, short string) (installer.Docke
 	if err != nil {
 		return installer.Docker{}, err
 	}
-	return installer.Docker{Runner: run, WorkDir: workDir(d), Name: name, Short: short}, nil
+	dir := workDir(d)
+	if id := m.ID.ValueString(); dir == "." && known(m.ID) && strings.HasPrefix(id, "/") {
+		dir = pathpkg.Dir(id) // the home the create resolved: every ID built from it is state's
+	}
+	return installer.Docker{Runner: run, WorkDir: dir, Name: name, Short: short}, nil
 }
 
 func addInstallerError(diags *diag.Diagnostics, summary string, err error) {
@@ -524,6 +558,16 @@ func (r *installResource) Create(ctx context.Context, req resource.CreateRequest
 	}
 	d = d.Without(desc)
 	d.Short = desc.ShortName
+	id := d.WorkDir + "/" + d.Name
+	if d.WorkDir == "." {
+		// Left out: the home, resolved once before anything runs, which a later plan compares.
+		home, err := d.Resolve(ctx)
+		if err != nil {
+			addInstallerError(&resp.Diagnostics, "Reading the work directory", err)
+			return
+		}
+		id = pathpkg.Join(home, d.Name)
+	}
 	// An install already in the directory (a create that failed or timed out after the install
 	// began, or one a destroy kept with its data) is run again, as the installer's re-run, which
 	// refuses the settings only a first install takes: they are the ones it recorded.
@@ -538,10 +582,15 @@ func (r *installResource) Create(ctx context.Context, req resource.CreateRequest
 				fmt.Sprintf("%s/%s holds an install of %q, not %q: give another docker.work_dir.", d.WorkDir, d.Name, existing.Name, d.Name))
 			return
 		}
+		if bad := heldMismatch(existing, in.Address, in.Registry, desc.Registry, in.RegistryCA); len(bad) > 0 {
+			resp.Diagnostics.AddError("The install there was made otherwise",
+				fmt.Sprintf("%s/%s already holds an install of %s whose first install recorded other settings, which a re-run cannot change: %s. Give the settings the install holds (status --json), or another docker.work_dir.", d.WorkDir, d.Name, d.Name, strings.Join(bad, "; ")))
+			return
+		}
 		resp.Diagnostics.AddWarning("An install is already there",
 			fmt.Sprintf("%s/%s already holds an install of %s: the create runs the installer again on it (its re-run), which finishes a first install left unfinished; "+
 				"an install of another release there is refused by the installer: set installer to the one it runs (status --json installed.installer), apply, then change installer to upgrade it. "+
-				"The settings only a first install takes (describe's first_install_only: address, the provider's registry and registry_ca; and secrets_wo) are not given: the install keeps the ones it recorded, and they are not compared with the configuration.", d.WorkDir, d.Name, d.Name))
+				"The settings only a first install takes (describe's first_install_only: address, the provider's registry and registry_ca; and secrets_wo) are not given: the install keeps the ones it recorded, which the configuration's match.", d.WorkDir, d.Name, d.Name))
 		withoutFirstInstallOnly(&in, desc.FirstInstallOnly)
 	}
 	if _, err := d.Install(ctx, in); err != nil {
@@ -558,12 +607,109 @@ func (r *installResource) Create(ctx context.Context, req resource.CreateRequest
 			fmt.Sprintf("status --json reports the first install failed: %s. Apply again: the install runs again on %s/%s and finishes it.", st.InstallFailed, d.WorkDir, d.Name))
 		return
 	}
-	m.ID = types.StringValue(d.WorkDir + "/" + d.Name)
+	m.ID = types.StringValue(id)
 	m.Registry = types.StringValue(r.registry())
 	m.ShortName = types.StringValue(desc.ShortName)
 	applyStatus(&m, st, false)
+	applyHeld(&m, st, false)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }
+
+// providerCA is the provider's registry CA's digest as state records it: null for none.
+func (r *installResource) providerCA() types.String {
+	if d := caDigest(r.registryCA()); d != "" {
+		return types.StringValue(d)
+	}
+	return types.StringNull()
+}
+
+// planMovedSecrets refuses at plan an input taken out of inputs and given in secret_inputs_wo
+// (a write-only value the configuration holds at plan) with another value, without a new
+// secret_inputs_wo_version: its value would never be sent, as the apply refuses too.
+func planMovedSecrets(ctx context.Context, req resource.ModifyPlanRequest, plan, state *installModel, diags *diag.Diagnostics) {
+	if !plan.SecretInputsWOVersion.Equal(state.SecretInputsWOVersion) || !known(plan.Inputs) && !plan.Inputs.IsNull() {
+		return
+	}
+	var secretsWO types.Map
+	diags.Append(req.Config.GetAttribute(ctx, path.Root("secret_inputs_wo"), &secretsWO)...)
+	if !known(secretsWO) {
+		return
+	}
+	was, now := stringMap(ctx, state.Inputs, diags), stringMap(ctx, plan.Inputs, diags)
+	for _, k := range mapKeys(secretsWO) {
+		v := secretsWO.Elements()[k]
+		sv, ok := v.(types.String)
+		if !ok || !known(sv) {
+			continue
+		}
+		old, had := was[k]
+		if _, still := now[k]; had && !still && sv.ValueString() != old {
+			diags.AddAttributeError(path.Root("secret_inputs_wo_version"), "an input moved to secret_inputs_wo",
+				fmt.Sprintf("%s is taken out of inputs and given in secret_inputs_wo: change secret_inputs_wo_version in the same apply, so its value is sent (else the install keeps the one inputs gave).", k))
+		}
+	}
+}
+
+// caDigest is `sha256:<hex>` of a registry CA as the installer is given it (the file's bytes),
+// as status --json reports the one an install keeps; "" for none.
+func caDigest(pem string) string {
+	if pem == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(pem))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// heldMismatch names each first-install-only setting the configuration means that the install st
+// recorded otherwise: a re-run is never given them, so they would be silently not applied. Left
+// out, each means its default: the address 127.0.0.1, the release's own registry (defaultRegistry,
+// describe's), no registry CA.
+func heldMismatch(st *installer.Status, address, registry, defaultRegistry, registryCA string) []string {
+	var out []string
+	if want := cmp.Or(address, defaultAddress); st.Address != "" && st.Address != want {
+		out = append(out, fmt.Sprintf("address is %q, and the install holds %q", want, st.Address))
+	}
+	if want := cmp.Or(registry, defaultRegistry); want != "" && st.Registry != "" && st.Registry != want {
+		out = append(out, fmt.Sprintf("the provider's registry is %q, and the install pulls from %q", want, st.Registry))
+	}
+	if d := caDigest(registryCA); d != st.RegistryCA {
+		out = append(out, fmt.Sprintf("the provider's registry_ca is %s, and the install keeps %s", cmp.Or(d, "none"), cmp.Or(st.RegistryCA, "none")))
+	}
+	return out
+}
+
+// applyHeld puts into m what status says the install recorded at its first install, for a later
+// plan to compare: the registry CA's digest (on a VM, whose status leaves it out when it cannot
+// read it, only when given) and the kept installer's short name; on a read (read), the loopback
+// address and the registry where state's differ from the install's, so the plan shows the
+// change, a first-install-only error. An apply never changes those two: the plan holds them.
+func applyHeld(m *installModel, st *installer.Status, read bool) {
+	switch {
+	case st.RegistryCA != "":
+		m.RegistryCADigest = types.StringValue(st.RegistryCA)
+	case m.VM == nil:
+		m.RegistryCADigest = types.StringNull()
+	}
+	if st.ShortName != "" && m.VM == nil {
+		m.ShortName = types.StringValue(st.ShortName)
+	}
+	if !read {
+		return
+	}
+	switch {
+	case st.Address == "":
+	case known(m.Address) && m.Address.ValueString() != st.Address:
+		m.Address = types.StringValue(st.Address)
+	case m.Address.IsNull() && st.Address != defaultAddress:
+		m.Address = types.StringValue(st.Address)
+	}
+	if known(m.Registry) && m.Registry.ValueString() != "" && st.Registry != "" && m.Registry.ValueString() != st.Registry {
+		m.Registry = types.StringValue(st.Registry)
+	}
+}
+
+// defaultAddress is the loopback address an install binds when --address gives none.
+const defaultAddress = "127.0.0.1"
 
 // withoutFirstInstallOnly leaves out of in the settings a re-run refuses: those describe names
 // first-install only that the provider gives, and the secrets export (a re-run keeps the
@@ -740,6 +886,7 @@ func (r *installResource) Read(ctx context.Context, req resource.ReadRequest, re
 		return
 	}
 	applyStatus(&m, st, true)
+	applyHeld(&m, st, true)
 	resp.Diagnostics.Append(dropUnrecorded(ctx, &m, st)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }
@@ -779,6 +926,10 @@ func remoteChange(plan, state *installModel) []string {
 		"domains":                  plan.Domains.Equal(state.Domains),
 		"ports":                    plan.Ports.Equal(state.Ports),
 		"vm.version":               plan.VM == nil || state.VM == nil || plan.VM.Version.Equal(state.VM.Version),
+		// Turned on, the release is applied again to write the pull Secret; turned off, the
+		// Secret stays (nothing removes it) and nothing runs.
+		"kubernetes.image_pull_login": plan.Kubernetes == nil || state.Kubernetes == nil ||
+			!plan.Kubernetes.ImagePullLogin.ValueBool() || state.Kubernetes.ImagePullLogin.ValueBool(),
 	} {
 		if !eq {
 			changed = append(changed, name)
@@ -803,6 +954,7 @@ func (r *installResource) Update(ctx context.Context, req resource.UpdateRequest
 		// delete_data, allow_rollback, timeouts): the target has nothing to do.
 		plan.ID, plan.Registry, plan.Version, plan.Revision = state.ID, state.Registry, state.Version, state.Revision
 		plan.Channel, plan.Status, plan.Previous, plan.ShortName = state.Channel, state.Status, state.Previous, state.ShortName
+		plan.RegistryCADigest = state.RegistryCADigest
 		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 		return
 	}
@@ -868,6 +1020,14 @@ func (u *update) run(ctx context.Context, save func(*installModel) bool) {
 		u.diags.AddError("No install to change", fmt.Sprintf("%s/%s holds no install: an import names an install directory that exists; otherwise `tofu state rm` this resource and apply to install again.", d.WorkDir, d.Name))
 		return
 	}
+	if st.ShortName != "" && st.ShortName != d.Short {
+		// The kept installer is <short>-stow by the short name the install records (a rollback
+		// across a rename keeps the older release's).
+		if d, err = u.r.docker(plan, st.ShortName); err != nil {
+			u.diags.AddError("Cannot reach the Docker target", err.Error())
+			return
+		}
+	}
 	running, err := d.KeptDescribe(ctx)
 	if err != nil {
 		addInstallerError(u.diags, "Reading the installer the install keeps", err)
@@ -880,6 +1040,15 @@ func (u *update) run(ctx context.Context, save func(*installModel) bool) {
 	if running.Name != d.Name {
 		u.diags.AddError("Installer of another project", fmt.Sprintf("The installer kept in %s/%s describes the project %q, not %q.", d.WorkDir, d.Name, running.Name, d.Name))
 		return
+	}
+	if imported(state) {
+		// The first apply of an imported state: the configuration's first-install-only settings
+		// must be the install's, as no re-run is given them.
+		if bad := heldMismatch(st, plan.Address.ValueString(), u.r.registry(), running.Registry, u.r.registryCA()); len(bad) > 0 {
+			u.diags.AddError("The install was made otherwise",
+				fmt.Sprintf("The imported install %s/%s recorded other first-install settings, which a re-run cannot change: %s. Give the settings the install holds (status --json).", d.WorkDir, d.Name, strings.Join(bad, "; ")))
+			return
+		}
 	}
 	step, next := u.releaseStep(ctx, d, st)
 	if u.diags.HasError() {
@@ -921,6 +1090,7 @@ func (u *update) run(ctx context.Context, save func(*installModel) bool) {
 			// The status read before the re-run: the release is the same, and the final read follows.
 			fillUpdate(partial, d, short)
 			applyStatus(partial, st, false)
+			applyHeld(partial, st, false)
 			if !save(partial) || u.diags.HasError() {
 				return
 			}
@@ -943,6 +1113,7 @@ func (u *update) run(ctx context.Context, save func(*installModel) bool) {
 	final := *plan
 	final.ID = types.StringValue(d.WorkDir + "/" + d.Name)
 	final.Registry = state.Registry
+	final.RegistryCADigest = state.RegistryCADigest
 	if imported(state) {
 		final.Registry = types.StringValue(u.r.registry())
 	}
@@ -978,7 +1149,7 @@ func (u *update) releaseStep(ctx context.Context, d installer.Docker, st *instal
 	case st.Previous != nil && st.Previous.Installer == desired:
 		if !u.plan.AllowRollback.ValueBool() {
 			u.diags.AddAttributeError(path.Root("allow_rollback"), "a rollback needs allow_rollback",
-				fmt.Sprintf("installer is %s, the release the install's last upgrade replaced: reaching it is the kept installer's rollback, which restores the previous values. Set allow_rollback = true to roll back.", desired))
+				fmt.Sprintf("installer is %s, the release the install's last upgrade replaced: reaching it is the kept installer's rollback, which takes the previous release back (every input keeps its value). Set allow_rollback = true to roll back.", desired))
 			return stay, nil
 		}
 		return rollback, nil
@@ -1064,8 +1235,8 @@ func (u *update) split(ctx context.Context, running, next *installer.Describe) (
 		old, ok := oldPorts[k]
 		switch {
 		case ok && old == v:
-		case upgrading && !ok && !imported(state):
-			up.Ports[k] = v
+		case upgrading && !running.HasRoute(k) && next.HasRoute(k):
+			up.Ports[k] = v // a route the new release adds: the upgrade binds it
 		default:
 			rerun.Ports[k] = v
 		}
@@ -1080,6 +1251,7 @@ func (u *update) partial(ctx context.Context, rerun installer.Change) *installMo
 	m.Installer = u.state.Installer
 	m.ID = u.state.ID
 	m.Registry = u.state.Registry
+	m.RegistryCADigest = u.state.RegistryCADigest
 	if imported(u.state) {
 		m.Registry = types.StringValue(u.r.registry())
 	}
@@ -1143,12 +1315,17 @@ func (u *update) settled(ctx context.Context, d installer.Docker, m *installMode
 		return
 	}
 	applyStatus(m, st, false)
+	applyHeld(m, st, false)
 }
 
 // keepComputed sets m's values read from the target to state's, when the read after an update
 // failed: a null status is not installed, a null channel empty.
 func keepComputed(m, state *installModel) {
 	m.Version, m.Revision, m.Channel, m.Status, m.Previous = state.Version, state.Revision, state.Channel, state.Status, state.Previous
+	m.RegistryCADigest = state.RegistryCADigest
+	if m.RegistryCADigest.IsUnknown() {
+		m.RegistryCADigest = types.StringNull()
+	}
 	if m.Status.IsNull() {
 		m.Status = types.StringValue("not installed")
 	}

@@ -25,12 +25,14 @@ import (
 )
 
 const (
-	describeK8s  = `{"format":1,"name":"notes","short_name":"notes","release":{"version":"1.2.0","revision":1},"channel":"stable","shapes":["docker","kubernetes"],"inputs":[{"key":"ADMIN_EMAIL"},{"key":"SMTP_PASSWORD","secret":true},{"key":"LEGACY"}],"first_install_only":["registry","registry_ca","channel"]}`
-	describeK8s2 = `{"format":1,"name":"notes","short_name":"notes","release":{"version":"2.0.0","revision":1},"channel":"stable","shapes":["kubernetes"],"inputs":[{"key":"ADMIN_EMAIL"},{"key":"SMTP_PASSWORD","secret":true},{"key":"NEW_KEY"},{"key":"NEW_TOKEN","secret":true}]}`
+	describeK8s  = `{"format":1,"name":"notes","short_name":"notes","release":{"version":"1.2.0","revision":1},"channel":"stable","shapes":["docker","kubernetes"],"inputs":[{"key":"ADMIN_EMAIL"},{"key":"SMTP_PASSWORD","secret":true},{"key":"LEGACY"}],"first_install_only":["registry","registry_ca","channel"],"routes":[]}`
+	describeK8s2 = `{"format":1,"name":"notes","short_name":"notes","release":{"version":"2.0.0","revision":1},"channel":"stable","shapes":["kubernetes"],"inputs":[{"key":"ADMIN_EMAIL"},{"key":"SMTP_PASSWORD","secret":true},{"key":"NEW_KEY"},{"key":"NEW_TOKEN","secret":true}],"routes":[]}`
 	statusK8s    = `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1,"installer":"` + image + `"},"channel":"stable","previous":null,"inputs":["ADMIN_EMAIL","SMTP_PASSWORD"],"helm":{"revision":1,"status":"deployed"}}`
 	statusK8s2   = `{"format":1,"name":"notes","installed":{"version":"2.0.0","revision":1,"installer":"` + image2 + `"},"channel":"stable","previous":{"version":"1.2.0","revision":1,"installer":"` + image + `"},"inputs":["ADMIN_EMAIL","NEW_KEY"],"helm":{"revision":2,"status":"deployed"}}`
 	noRelease    = "error: no release notes in notes: `notes-stow k8s install --namespace notes --release notes` installs 1.2.0\n"
-	k8sToken     = "tok-NEVER-ON-A-COMMAND-LINE"
+	// noReleaseJSON is the refusal's object k8s status --json prints with it.
+	noReleaseJSON = `{"format":1,"refused":{"reason":"no release notes in notes","fix":"notes-stow k8s install --namespace notes --release notes installs 1.2.0","absent":true}}`
+	k8sToken      = "tok-NEVER-ON-A-COMMAND-LINE"
 )
 
 // k8sProvider is a provider configuration whose kubernetes block reaches the cluster by host and
@@ -148,7 +150,7 @@ func TestK8sProviderBlock(t *testing.T) {
 func TestK8sCreate(t *testing.T) {
 	t.Parallel()
 	h := k8sHarness(t, map[string]tftypes.Value{"registry": str("mirror.lan/notes"), "registry_ca": str("-----BEGIN CERTIFICATE-----\nX\n")})
-	h.fake.then("k8s-status", reply{exit: 3, stderr: noRelease})
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 	state := h.create(h.k8sConfig(map[string]tftypes.Value{
 		"inputs":           strMap(map[string]string{"ADMIN_EMAIL": "ops@example.com"}),
 		"secret_inputs_wo": strMap(map[string]string{"SMTP_PASSWORD": secretVal}), "secret_inputs_wo_version": num(1),
@@ -207,7 +209,7 @@ func TestK8sCreate(t *testing.T) {
 		t.Fatalf("read: %s %q", errorsOf(r.Diagnostics), got)
 	}
 	// A namespace without the release: the resource is gone.
-	h.fake.then("k8s-status", reply{exit: 3, stderr: noRelease})
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 	if r := h.read(state); errorsOf(r.Diagnostics) != "" || !h.attrsNull(r.NewState) {
 		t.Fatalf("read of a gone release: %s", errorsOf(r.Diagnostics))
 	}
@@ -240,7 +242,7 @@ func TestK8sCreateRefusals(t *testing.T) {
 		}, "Another project's release"},
 		"another installer runs": {func(f *fake) { f.set("k8s-status", reply{stdout: statusK8s2}) }, "The release runs another installer"},
 		"the install refused": {func(f *fake) {
-			f.then("k8s-status", reply{exit: 3, stderr: noRelease})
+			f.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 			f.set("k8s-install", reply{exit: 3, stdout: `{"format":1,"result":"nothing","refused":{"reason":"a Secret notes-stowage another tool wrote","fix":"delete it"}}`})
 		}, "a Secret notes-stowage another tool wrote"},
 	} {
@@ -279,7 +281,7 @@ func TestK8sCreateOverTheRelease(t *testing.T) {
 func TestK8sUpdate(t *testing.T) {
 	t.Parallel()
 	h := k8sHarness(t, nil)
-	h.fake.then("k8s-status", reply{exit: 3, stderr: noRelease})
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 	state := h.create(h.k8sConfig(map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com", "LEGACY": "x"})}))
 
 	// A changed input and a removed one: the running release applied again with them given.
@@ -353,7 +355,7 @@ func TestK8sUpdate(t *testing.T) {
 func TestK8sUpgradeFailureSavesTheReconfiguration(t *testing.T) {
 	t.Parallel()
 	h := k8sHarness(t, nil)
-	h.fake.then("k8s-status", reply{exit: 3, stderr: noRelease})
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 	state := h.create(h.k8sConfig(map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})}))
 	h.fake.reset()
 	h.fake.then("k8s-describe", reply{stdout: describeK8s}, reply{stdout: describeK8s2})
@@ -371,7 +373,7 @@ func TestK8sUpgradeFailureSavesTheReconfiguration(t *testing.T) {
 func TestK8sPlanRefusals(t *testing.T) {
 	t.Parallel()
 	h := k8sHarness(t, nil)
-	h.fake.then("k8s-status", reply{exit: 3, stderr: noRelease})
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 	state := h.create(h.k8sConfig(nil))
 	for name, c := range map[string]struct {
 		config tftypes.Value
@@ -399,7 +401,7 @@ func TestK8sPlanRefusals(t *testing.T) {
 func TestK8sDelete(t *testing.T) {
 	t.Parallel()
 	h := k8sHarness(t, nil)
-	h.fake.then("k8s-status", reply{exit: 3, stderr: noRelease})
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 	state := h.create(h.k8sConfig(map[string]tftypes.Value{"deletion_protection": boolean(false), "delete_data": boolean(true)}))
 	h.fake.reset()
 	if d := errorsOf(h.destroy(state).Diagnostics); d != "" {
@@ -532,7 +534,7 @@ func TestK8sSecretVersionGivesSecrets(t *testing.T) {
 	with := func(v int64) tftypes.Value {
 		return h.k8sConfig(map[string]tftypes.Value{"secret_inputs_wo": strMap(map[string]string{"SMTP_PASSWORD": "new-" + secretVal}), "secret_inputs_wo_version": num(v)})
 	}
-	h.fake.then("k8s-status", reply{exit: 3, stderr: noRelease})
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 	state := h.create(with(1))
 	h.fake.reset()
 	a := h.update(state, with(2))
@@ -612,7 +614,7 @@ func TestK8sCreateOverABusyFailedOrUnknownRelease(t *testing.T) {
 	}
 	// A create whose release is left failed once settled is an error, and saves no state.
 	h := k8sHarness(t, nil)
-	h.fake.then("k8s-status", reply{exit: 3, stderr: noRelease})
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 	h.fake.set("k8s-status", reply{stdout: helm("failed")})
 	config := h.k8sConfig(nil)
 	p := h.plan(nil, config)
@@ -651,7 +653,7 @@ func TestK8sImportedReleaseWithoutInstaller(t *testing.T) {
 func TestK8sReadShowsHelmStatus(t *testing.T) {
 	t.Parallel()
 	h := k8sHarness(t, nil)
-	h.fake.then("k8s-status", reply{exit: 3, stderr: noRelease})
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 	state := h.create(h.k8sConfig(nil))
 	for helm, want := range map[string]string{
 		"failed":          "failed: helm's latest revision (2) of the release is failed",
@@ -671,7 +673,7 @@ func TestK8sReadShowsHelmStatus(t *testing.T) {
 func TestK8sReadWithAnUnknownCluster(t *testing.T) {
 	t.Parallel()
 	h := k8sHarness(t, nil)
-	h.fake.then("k8s-status", reply{exit: 3, stderr: noRelease})
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 	state := h.create(h.k8sConfig(nil))
 	conn := h.ptyp.AttributeTypes["kubernetes"].(tftypes.Object)
 	cfg := h.dv(h.ptyp, fill(h.ptyp, map[string]tftypes.Value{"kubernetes": fill(conn, map[string]tftypes.Value{
@@ -711,7 +713,7 @@ func TestK8sRelativeKubeconfig(t *testing.T) {
 func TestK8sPartialStateShowsHelmStatus(t *testing.T) {
 	t.Parallel()
 	h := k8sHarness(t, nil)
-	h.fake.then("k8s-status", reply{exit: 3, stderr: noRelease})
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 	state := h.create(h.k8sConfig(map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})}))
 	h.fake.reset()
 	// Deployed before the reconfiguration, failed after it: the state saved is the latter.
@@ -730,7 +732,7 @@ func TestK8sPartialStateShowsHelmStatus(t *testing.T) {
 func TestK8sRefusesAnInputTheEnvironmentGives(t *testing.T) {
 	t.Setenv("HTTPS_PROXY", "http://proxy.lan:3128")
 	h := k8sHarness(t, nil)
-	h.fake.then("k8s-status", reply{exit: 3, stderr: noRelease})
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 	config := h.k8sConfig(map[string]tftypes.Value{"inputs": strMap(map[string]string{"HTTPS_PROXY": "http://app.lan"})})
 	p := h.plan(nil, config)
 	if got := errorsOf(h.apply(nil, p.PlannedState, config).Diagnostics); !strings.Contains(got, "HTTPS_PROXY comes from the environment") || len(h.fake.callsOf("k8s-install")) != 0 {
@@ -742,7 +744,7 @@ func TestK8sRefusesAnInputTheEnvironmentGives(t *testing.T) {
 func TestK8sReadUninstalledRelease(t *testing.T) {
 	t.Parallel()
 	h := k8sHarness(t, nil)
-	h.fake.then("k8s-status", reply{exit: 3, stderr: noRelease})
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 	state := h.create(h.k8sConfig(nil))
 	h.fake.set("k8s-status", reply{stdout: `{"format":1,"name":"notes","installed":null,"previous":{"version":"1.2.0","revision":1,"installer":"` + image + `"},"helm":{"revision":3,"status":"uninstalled"}}`})
 	r := h.read(state)
@@ -772,7 +774,7 @@ func TestK8sCreateOverTheReleaseGivesGivenWO(t *testing.T) {
 func TestK8sUpdateRefusesABusyRelease(t *testing.T) {
 	t.Parallel()
 	h := k8sHarness(t, nil)
-	h.fake.then("k8s-status", reply{exit: 3, stderr: noRelease})
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 	state := h.create(h.k8sConfig(nil))
 	h.fake.reset()
 	h.fake.set("k8s-status", reply{stdout: strings.Replace(statusK8s, `"status":"deployed"`, `"status":"pending-rollback"`, 1)})
@@ -833,7 +835,7 @@ func TestK8sScriptCache(t *testing.T) {
 func TestK8sCreateTimeoutDuringARead(t *testing.T) {
 	t.Parallel()
 	h := k8sHarness(t, nil)
-	h.fake.then("k8s-status", reply{exit: 3, stderr: noRelease})
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 	h.fake.set("k8s-status", reply{block: true})
 	config := h.k8sConfig(map[string]tftypes.Value{"timeouts": h.block("timeouts", map[string]tftypes.Value{"create": str("50ms")})})
 	a := h.apply(nil, h.plan(nil, config).PlannedState, config)
@@ -856,7 +858,7 @@ func TestK8sRecordedInstallerIsChecked(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			h := k8sHarness(t, nil)
-			h.fake.then("k8s-status", reply{exit: 3, stderr: noRelease})
+			h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 			state := h.create(h.k8sConfig(nil))
 			h.fake.reset()
 			h.fake.set("k8s-status", reply{stdout: strings.Replace(statusK8s, `"installer":"`+image+`"`, `"installer":`+strconv.Quote(ref), 1)})
@@ -884,7 +886,7 @@ func TestK8sRunEnvInputs(t *testing.T) {
 		"given_wo's key": {map[string]tftypes.Value{"given_wo": str("project: notes\ninputs:\n  LANG: fr_FR.UTF-8\n")}, "LANG comes from the environment"},
 	} {
 		h := k8sHarness(t, nil)
-		h.fake.then("k8s-status", reply{exit: 3, stderr: noRelease})
+		h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 		config := h.k8sConfig(c.extra)
 		p := h.plan(nil, config)
 		if got := errorsOf(h.apply(nil, p.PlannedState, config).Diagnostics); !strings.Contains(got, c.want) || len(h.fake.callsOf("k8s-install")) != 0 {
@@ -897,7 +899,7 @@ func TestK8sRunEnvInputs(t *testing.T) {
 func TestK8sFinalReadFailureKeepsThePartial(t *testing.T) {
 	t.Parallel()
 	h := k8sHarness(t, nil)
-	h.fake.then("k8s-status", reply{exit: 3, stderr: noRelease})
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 	state := h.create(h.k8sConfig(map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})}))
 	h.fake.reset()
 	// Deployed before the reconfiguration (as state says), failed after it (the partial): the
@@ -970,7 +972,7 @@ func TestK8sScriptCacheChecksAndEvicts(t *testing.T) {
 func TestK8sReadKeepsAnUntrustedInstallerOut(t *testing.T) {
 	t.Parallel()
 	h := k8sHarness(t, nil)
-	h.fake.then("k8s-status", reply{exit: 3, stderr: noRelease})
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 	state := h.create(h.k8sConfig(map[string]tftypes.Value{"deletion_protection": boolean(false)}))
 	evil := "evil.example/notes/notes-installer@" + digest2
 	h.fake.set("k8s-status", reply{stdout: strings.Replace(statusK8s, `"installer":"`+image+`"`, `"installer":"`+evil+`"`, 1)})
@@ -1008,7 +1010,7 @@ func TestK8sReadKeepsAnUntrustedInstallerOut(t *testing.T) {
 func TestK8sUntrustedPreviousIsLeftOut(t *testing.T) {
 	t.Parallel()
 	h := k8sHarness(t, nil)
-	h.fake.then("k8s-status", reply{exit: 3, stderr: noRelease})
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 	state := h.create(h.k8sConfig(nil))
 	evil := "evil.example/notes/notes-installer@" + digest2
 	h.fake.set("k8s-status", reply{stdout: strings.Replace(statusK8s2, `"previous":{"version":"1.2.0","revision":1,"installer":"`+image+`"}`, `"previous":{"version":"1.2.0","revision":1,"installer":"`+evil+`"}`, 1)})
@@ -1048,7 +1050,7 @@ func TestK8sCreateOverAnUntrustedRelease(t *testing.T) {
 func TestK8sReadAnotherProject(t *testing.T) {
 	t.Parallel()
 	h := k8sHarness(t, nil)
-	h.fake.then("k8s-status", reply{exit: 3, stderr: noRelease})
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 	state := h.create(h.k8sConfig(nil))
 	h.fake.set("k8s-status", reply{stdout: strings.Replace(strings.Replace(statusK8s, `"name":"notes"`, `"name":"wiki"`, 1), `,"installer":"`+image+`"`, ``, 1)})
 	if got := errorsOf(h.read(state).Diagnostics); !strings.Contains(got, "Another project's release") {
@@ -1062,7 +1064,7 @@ func TestK8sReadAnotherProject(t *testing.T) {
 func TestK8sCreateLeavesAnUntrustedRelease(t *testing.T) {
 	t.Parallel()
 	h := k8sHarness(t, nil)
-	h.fake.then("k8s-status", reply{exit: 3, stderr: noRelease})
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 	h.fake.set("k8s-status", reply{stdout: strings.Replace(statusK8s, `"installer":"`+image+`"`, `"installer":"evil.example/notes/notes-installer@`+digest2+`"`, 1)})
 	config := h.k8sConfig(nil)
 	p := h.plan(nil, config)
@@ -1092,7 +1094,7 @@ func TestDriftIsKubernetesOnly(t *testing.T) {
 func TestK8sPartialStopsOverAnUntrustedRelease(t *testing.T) {
 	t.Parallel()
 	h := k8sHarness(t, nil)
-	h.fake.then("k8s-status", reply{exit: 3, stderr: noRelease})
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 	state := h.create(h.k8sConfig(map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})}))
 	h.fake.reset()
 	evil := "evil.example/notes/notes-installer@" + digest2
@@ -1124,7 +1126,7 @@ func TestK8sInstallFailedIsNotDrift(t *testing.T) {
 func TestK8sDriftWithAnUnknownCluster(t *testing.T) {
 	t.Parallel()
 	h := k8sHarness(t, nil)
-	h.fake.then("k8s-status", reply{exit: 3, stderr: noRelease})
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 	state := h.create(h.k8sConfig(nil))
 	h.fake.set("k8s-status", reply{stdout: strings.Replace(statusK8s, `"installer":"`+image+`"`, `"installer":"evil.example/notes/notes-installer@`+digest2+`"`, 1)})
 	drifted := h.read(state).NewState
@@ -1155,12 +1157,12 @@ func TestK8sDriftKeepsTheStatus(t *testing.T) {
 func TestK8sDriftCheckedAgain(t *testing.T) {
 	t.Parallel()
 	h := k8sHarness(t, map[string]tftypes.Value{"registry": str("evil.example/notes")})
-	h.fake.then("k8s-status", reply{exit: 3, stderr: noRelease})
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 	state := h.create(h.k8sConfig(map[string]tftypes.Value{"deletion_protection": boolean(false)}))
 	_ = state
 	// The state as a refresh before the registry was set would have left it.
 	h2 := k8sHarness(t, nil)
-	h2.fake.then("k8s-status", reply{exit: 3, stderr: noRelease})
+	h2.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 	st2 := h2.create(h2.k8sConfig(map[string]tftypes.Value{"deletion_protection": boolean(false)}))
 	h2.fake.set("k8s-status", reply{stdout: strings.Replace(statusK8s, `"installer":"`+image+`"`, `"installer":"evil.example/notes/notes-installer@`+digest2+`"`, 1)})
 	drifted := h2.read(st2).NewState
@@ -1177,7 +1179,7 @@ func TestK8sDriftCheckedAgain(t *testing.T) {
 func TestK8sPartialReadFailureStops(t *testing.T) {
 	t.Parallel()
 	h := k8sHarness(t, nil)
-	h.fake.then("k8s-status", reply{exit: 3, stderr: noRelease})
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 	state := h.create(h.k8sConfig(map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})}))
 	h.fake.reset()
 	h.fake.then("k8s-status", reply{stdout: statusK8s})
@@ -1196,7 +1198,7 @@ func TestK8sPartialReadFailureStops(t *testing.T) {
 func TestK8sCreateInstallFailedIsNotDrift(t *testing.T) {
 	t.Parallel()
 	h := k8sHarness(t, nil)
-	h.fake.then("k8s-status", reply{exit: 3, stderr: noRelease})
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 	h.fake.set("k8s-status", reply{stdout: strings.Replace(statusK8s, `"previous":null`, `"previous":null,"install_failed":`+strconv.Quote(strings.TrimPrefix(driftPrefix, "failed: ")+"x"), 1)})
 	state := h.create(h.k8sConfig(nil))
 	if got := asString(t, h.attrs(state)["status"]); strings.HasPrefix(got, driftPrefix) {
@@ -1220,7 +1222,7 @@ func TestK8sDriftRefQuoted(t *testing.T) {
 func TestK8sPartialBusyStops(t *testing.T) {
 	t.Parallel()
 	h := k8sHarness(t, nil)
-	h.fake.then("k8s-status", reply{exit: 3, stderr: noRelease})
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 	state := h.create(h.k8sConfig(map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})}))
 	h.fake.reset()
 	h.fake.then("k8s-status", reply{stdout: statusK8s})
@@ -1251,12 +1253,68 @@ func TestK8sFinalReadFailureClearsTheDrift(t *testing.T) {
 func TestK8sDriftOfAnotherProjectWithAnUnknownInstaller(t *testing.T) {
 	t.Parallel()
 	h := k8sHarness(t, nil)
-	h.fake.then("k8s-status", reply{exit: 3, stderr: noRelease})
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 	state := h.create(h.k8sConfig(nil))
 	h.fake.set("k8s-status", reply{stdout: strings.Replace(statusK8s, `"installer":"`+image+`"`, `"installer":"registry.example.com/atlas/atlas-installer@`+digest2+`"`, 1)})
 	drifted := h.read(state).NewState
 	config := h.k8sConfig(map[string]tftypes.Value{"installer": tftypes.NewValue(tftypes.String, tftypes.UnknownValue)})
 	if got := errorsOf(h.plan(drifted, config).Diagnostics); !strings.Contains(got, "not this project's installer by digest") {
 		t.Fatalf("plan: %q", got)
+	}
+}
+
+// image_pull_login runs the install and the upgrade with --image-pull-login, the pull account's
+// login on standard input for the mirror's host (never an argument), and is refused at plan
+// without the account or a mirror.
+func TestK8sImagePullLogin(t *testing.T) {
+	t.Parallel()
+	h := k8sHarness(t, map[string]tftypes.Value{"registry": str("mirror.lan/notes"), "username": str("puller"), "password": str("pw-" + secretVal)})
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
+	login := h.block("kubernetes", map[string]tftypes.Value{"namespace": str("notes"), "image_pull_login": boolean(true)})
+	state := h.create(h.k8sConfig(map[string]tftypes.Value{"kubernetes": login}))
+	install := h.fake.callsOf("k8s-install")[0]
+	if !contains(install.argv, "--image-pull-login") || install.argv[7] != "mirror.lan" || install.argv[8] != "puller" ||
+		untarAll(t, install.stdin)["login-password"] != "pw-"+secretVal || strings.Contains(strings.Join(install.argv, " "), secretVal) {
+		t.Fatalf("install %q", install.argv)
+	}
+	h.fake.reset()
+	h.fake.then("k8s-describe", reply{stdout: describeK8s}, reply{stdout: describeK8s2})
+	h.fake.then("k8s-status", reply{stdout: statusK8s})
+	h.fake.set("k8s-status", reply{stdout: statusK8s2})
+	if d := errorsOf(h.update(state, h.k8sConfig(map[string]tftypes.Value{"kubernetes": login, "installer": str(image2)})).Diagnostics); d != "" {
+		t.Fatal(d)
+	}
+	ups := h.fake.callsOf("k8s-upgrade")
+	if len(ups) == 0 {
+		t.Fatalf("no upgrade: %q", h.fake.ops())
+	}
+	for _, up := range ups {
+		if !contains(up.argv, "--image-pull-login") || up.argv[7] != "mirror.lan" {
+			t.Fatalf("upgrade %q", up.argv)
+		}
+	}
+	// Without it, no login and no flag.
+	h.fake.reset()
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
+	plain := h.create(h.k8sConfig(nil))
+	if install := h.fake.callsOf("k8s-install")[0]; contains(install.argv, "--image-pull-login") || install.argv[8] != "" {
+		t.Fatalf("install without image_pull_login %q", install.argv)
+	}
+	// Turned on alone, the release is applied again with it, which writes the Secret.
+	h.fake.reset()
+	if d := errorsOf(h.update(plain, h.k8sConfig(map[string]tftypes.Value{"kubernetes": login})).Diagnostics); d != "" {
+		t.Fatal(d)
+	}
+	if ups := h.fake.callsOf("k8s-upgrade"); len(ups) != 1 || !contains(ups[0].argv, "--image-pull-login") {
+		t.Fatalf("turned on: %q", h.fake.ops())
+	}
+	for name, cfg := range map[string]map[string]tftypes.Value{
+		"no account": {"registry": str("mirror.lan/notes")},
+		"no mirror":  {"username": str("puller"), "password": str("pw")},
+	} {
+		o := k8sHarness(t, cfg)
+		if got := errorsOf(o.plan(nil, o.k8sConfig(map[string]tftypes.Value{"kubernetes": login})).Diagnostics); !strings.Contains(got, "image_pull_login needs") {
+			t.Errorf("%s: got %q", name, got)
+		}
 	}
 }

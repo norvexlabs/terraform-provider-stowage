@@ -6,9 +6,13 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/norvexlabs/terraform-provider-stowage/internal/target"
 )
 
 const edKey = "AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
@@ -145,20 +149,23 @@ func TestVMInstallKeepsSecretsOffTheCommandLine(t *testing.T) {
 func TestParseSeed(t *testing.T) {
 	t.Parallel()
 	good := `{"format":1,"platform":"truenas","user_data":"#cloud-config\n","known_hosts_line":"vm-seed-host-key ssh-ed25519 ` + edKey + `",
-"fingerprint":"SHA256:x","host_key_private":"-----BEGIN OPENSSH PRIVATE KEY-----\n","disk":{"truenas":{"format":"qcow2","image":"r/notes-disk@sha256:1"}},"waiting":["B","A"]}`
+"fingerprint":"SHA256:x","host_key_private":"-----BEGIN OPENSSH PRIVATE KEY-----\n","disk":{"truenas":{"format":"qcow2","image":"r/notes-disk@sha256:1","os_gib":23,"disk_gib":43},"aws":{"format":"raw","image":"r/notes-disk@sha256:2","os_gib":23,"disk_gib":43,"cloud_image":"notes-0123456789ab"}},
+"waiting":["B","A"],"meta_data":"instance-id: app\n","app_gib":20,"disk_file":{"path":"/d/notes.qcow2","format":"qcow2","sha256":"ab","disk_gib":43},"await_secrets":true}`
 	s, err := ParseSeed([]byte(good))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.Disk["truenas"].Format != "qcow2" || !slices.Equal(s.Waiting, []string{"A", "B"}) {
+	if s.Disk["truenas"].Format != "qcow2" || s.Disk["truenas"].DiskGiB != 43 || s.Disk["aws"].CloudImage != "notes-0123456789ab" || !slices.Equal(s.Waiting, []string{"A", "B"}) ||
+		s.MetaData != "instance-id: app\n" || s.AppGiB != 20 || s.DiskFile == nil || s.DiskFile.Path != "/d/notes.qcow2" || !s.AwaitSecrets || s.AwaitTLS {
 		t.Errorf("parsed %+v", s)
 	}
 	for name, c := range map[string]struct{ old, new, want string }{
-		"no user data":   {`"user_data":"#cloud-config\n"`, `"user_data":""`, "no user_data"},
-		"no private key": {`"host_key_private":"-----BEGIN OPENSSH PRIVATE KEY-----\n"`, `"host_key_private":""`, "no host_key_private"},
-		"a marker line":  {`"known_hosts_line":"vm-seed-host-key`, `"known_hosts_line":"@revoked vm-seed-host-key`, "marker"},
-		"disk no image":  {`"image":"r/notes-disk@sha256:1"`, `"image":""`, "no format or image"},
-		"format 2":       {`"format":1`, `"format":2`, "newer"},
+		"no user data":         {`"user_data":"#cloud-config\n"`, `"user_data":""`, "no user_data"},
+		"no private key":       {`"host_key_private":"-----BEGIN OPENSSH PRIVATE KEY-----\n"`, `"host_key_private":""`, "no host_key_private"},
+		"a marker line":        {`"known_hosts_line":"vm-seed-host-key`, `"known_hosts_line":"@revoked vm-seed-host-key`, "marker"},
+		"disk no image":        {`"image":"r/notes-disk@sha256:1"`, `"image":""`, "no format or image"},
+		"a relative disk file": {`"path":"/d/notes.qcow2"`, `"path":"d/notes.qcow2"`, "disk_file has no absolute path"},
+		"format 2":             {`"format":1`, `"format":2`, "newer"},
 	} {
 		in := strings.Replace(good, c.old, c.new, 1)
 		if in == good {
@@ -175,12 +182,12 @@ func TestSeedArgs(t *testing.T) {
 	a := SeedArgs{Platform: "truenas", Hostname: "app", Channel: "beta", IPv6: true, HTTPSPort: 8443,
 		SSHAllow: []string{"192.0.2.0/24"}, Hosts: map[string]string{"db": "192.0.2.5"}, Interfaces: map[string]string{"edge": "static,address=192.0.2.10/24"},
 		Domains: map[string]string{"app": "app.example"}, Inputs: map[string]string{"ADMIN_EMAIL": "a@b"},
-		SSHPublicKey: "ssh-ed25519 AAAA me", Registry: "mirror.example/notes", RegistryCA: "PEM"}
+		SSHPublicKey: "ssh-ed25519 AAAA me", Registry: "mirror.example/notes", RegistryCA: "PEM", AwaitSecrets: true, DiskDir: "/disks"}
 	args, files, err := a.argv()
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"vm", "seed", "--json", "--platform=truenas", "--hostname=app", "--channel=beta", "--registry=mirror.example/notes", "--ipv6",
+	want := []string{"vm", "seed", "--json", "--platform=truenas", "--hostname=app", "--channel=beta", "--registry=mirror.example/notes", "--disk-dir=/disks", "--ipv6", "--await-secrets",
 		"--https-port=8443", "--ssh-allow=192.0.2.0/24", "--add-host=db=192.0.2.5", "--interface=edge=static,address=192.0.2.10/24",
 		"--domains=app=app.example", "--set", "ADMIN_EMAIL=a@b"}
 	if !slices.Equal(args, want) {
@@ -203,19 +210,31 @@ func TestSeedArgs(t *testing.T) {
 
 func TestSeedRun(t *testing.T) {
 	t.Parallel()
-	r := &vmRecorder{exit: 3, stderr: "fetching…\nerror: --platform aws: the raw disk is not in r (offers truenas)\n"}
+	r := &vmRecorder{exit: 3, stdout: `{"format":1,"refused":{"reason":"--platform aws: the raw disk is not in r","fix":"give --platform truenas"}}`,
+		stderr: "fetching…\nerror: --platform aws: the raw disk is not in r (offers truenas)\n"}
 	d := Docker{Runner: r, WorkDir: "/w", Name: "notes"}
-	_, err := d.Seed(context.Background(), SeedArgs{Platform: "aws"})
+	_, err := d.Seed(context.Background(), SeedArgs{Platform: "aws"}, nil)
 	var refused *RefusedError
-	if !errors.As(err, &refused) || refused.Reason != "--platform aws: the raw disk is not in r (offers truenas)" {
+	if !errors.As(err, &refused) || refused.Reason != "--platform aws: the raw disk is not in r" || refused.Fix != "give --platform truenas" {
 		t.Errorf("a refused seed: %v", err)
 	}
-	if !slices.Equal(r.argv[6:9], []string{"sh", "./notes.sh", "vm"}) {
+	r.stdout = ""
+	if _, err := d.Seed(context.Background(), SeedArgs{Platform: "aws"}, nil); errors.As(err, &refused) || err == nil {
+		t.Errorf("exit 3 without its object is taken for a refusal: %v", err)
+	}
+	if r.argv[2] != RunLoginScript || !slices.Equal(r.argv[4:11], []string{"/w", "", "", "", "sh", "./notes.sh", "vm"}) {
 		t.Errorf("argv %q", r.argv)
 	}
+	// With a login: its host and user, the password in the tar, never an argument.
+	r.exit, r.stdout = 0, ""
+	_, _ = d.Seed(context.Background(), SeedArgs{Platform: "aws"}, &Login{Host: "mirror.lan", Username: "puller", Password: "pw-s3cr3t"})
+	if r.argv[6] != "mirror.lan" || r.argv[7] != "puller" || strings.Contains(strings.Join(r.argv, " "), "pw-s3cr3t") || !bytes.Contains(r.stdin, []byte("pw-s3cr3t")) {
+		t.Errorf("a login: %q", r.argv)
+	}
+	r.exit, r.stdout = 3, `{"format":1,"refused":{"reason":"x"}}`
 	r.exit, r.stderr = 1, "boom"
 	var failed *FailedError
-	if _, err := d.Seed(context.Background(), SeedArgs{Platform: "aws"}); !errors.As(err, &failed) {
+	if _, err := d.Seed(context.Background(), SeedArgs{Platform: "aws"}, nil); !errors.As(err, &failed) {
 		t.Errorf("a failed seed: %v", err)
 	}
 }
@@ -243,5 +262,59 @@ func TestHasCtl(t *testing.T) {
 	r.exit, r.stderr = 1, `unknown command "describe"`
 	if _, err := v.Describe(context.Background()); err == nil || !strings.Contains(err.Error(), "made by Stowage before") {
 		t.Errorf("exit 1: %v", err)
+	}
+}
+
+// RetireScript under a real sh, its paths moved under a test directory: on the active system it
+// removes the key and its drop-in and marks the retirement; on the recovery or live system it
+// changes nothing and exits 3.
+func TestRetireScript(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{"", "recovery_mode", "live_mode"} {
+		root := t.TempDir()
+		script := strings.NewReplacer("/run/", root+"/run/", "/etc/ssh/", root+"/etc/ssh/", "/oem/", root+"/oem/").Replace(RetireScript)
+		for _, d := range []string{"run/cos", "etc/ssh/sshd_config.d", "oem"} {
+			if err := os.MkdirAll(filepath.Join(root, d), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		key, dropIn := filepath.Join(root, "run/notes-seed-host-key"), filepath.Join(root, "etc/ssh/sshd_config.d/01-notes-seed-host-key.conf")
+		for _, f := range []string{key, dropIn} {
+			if err := os.WriteFile(f, []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if mode != "" {
+			if err := os.WriteFile(filepath.Join(root, "run/cos", mode), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		_, stderr, exit, err := target.Local{}.Run(context.Background(), []string{"env", "PATH=/usr/bin:/bin", "sh", "-c", script, "sh", "notes"}, nil)
+		_, keyErr := os.Stat(key)
+		_, markErr := os.Stat(filepath.Join(root, "oem/notes-seed-host-key.retired"))
+		switch {
+		case err != nil:
+			t.Fatal(err)
+		case mode == "" && (exit != 0 || !os.IsNotExist(keyErr) || markErr != nil):
+			t.Errorf("active: exit %d %s, key %v, mark %v", exit, stderr, keyErr, markErr)
+		case mode != "" && (exit != 3 || keyErr != nil || !os.IsNotExist(markErr)):
+			t.Errorf("%s: exit %d %s, key %v, mark %v", mode, exit, stderr, keyErr, markErr)
+		}
+	}
+}
+
+// An uninstall the kept installer refuses as absent (no install there) is nothing to do; another
+// refusal stays one.
+func TestUninstallAbsent(t *testing.T) {
+	t.Parallel()
+	r := &vmRecorder{exit: 3, stdout: `{"format":1,"result":"nothing","refused":{"reason":"/srv/notes holds no install","absent":true}}`}
+	d := Docker{Runner: r, WorkDir: "/srv", Name: "notes", Short: "notes"}
+	if res, err := d.Uninstall(context.Background(), false); err != nil || res.Result != "nothing" {
+		t.Fatalf("absent: %+v %v", res, err)
+	}
+	r.stdout = `{"format":1,"result":"nothing","refused":{"reason":"another run holds the lock"}}`
+	var refused *RefusedError
+	if _, err := d.Uninstall(context.Background(), false); !errors.As(err, &refused) {
+		t.Fatalf("another refusal: %v", err)
 	}
 }

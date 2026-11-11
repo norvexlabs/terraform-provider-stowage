@@ -75,7 +75,7 @@ func vmStatusJSON(version, boot string, extra string) string {
 	return fmt.Sprintf(`{"format":1,"name":"notes","os":{"version":%q,"revision":1},"installed":{"version":%q,"revision":1},"previous":null,"channel":"stable","inputs":["ADMIN_EMAIL"],"boot":"active","boot_id":%q%s}`, version, version, boot, extra)
 }
 
-const vmDescribe = `{"format":1,"name":"notes","short_name":"notes","release":{"version":"1.1.0","revision":1},"channel":"","shapes":["docker","kairos"],"inputs":[{"key":"ADMIN_EMAIL"},{"key":"API_KEY","secret":true}],"first_install_only":["address","registry","registry_ca","channel"]}`
+const vmDescribe = `{"format":1,"name":"notes","short_name":"notes","release":{"version":"1.1.0","revision":1},"channel":"","shapes":["docker","kairos"],"inputs":[{"key":"ADMIN_EMAIL"},{"key":"API_KEY","secret":true}],"first_install_only":["address","registry","registry_ca","channel"],"routes":[]}`
 
 // describeOf is vmDescribe of another release, with more inputs.
 func describeOf(version string, extraInputs string) string {
@@ -612,6 +612,24 @@ func TestVMRerun(t *testing.T) {
 	}
 }
 
+// secrets_wo goes to the VM's first install, a file on standard input (never an argument), for a
+// seed whose first install awaits it; a re-run never gets it.
+func TestVMCreateGivesTheSecretsExport(t *testing.T) {
+	t.Parallel()
+	h, f := newVMHarness(t)
+	state := h.create(h.vmConfig("1.1.0", map[string]tftypes.Value{"secrets_wo": str("export-" + secretVal)}))
+	in := f.callsOf("install")
+	if len(in) != 1 || !slices.Contains(in[0].argv, "secrets") || untarAll(t, in[0].stdin)["secrets"] != "export-"+secretVal ||
+		strings.Contains(strings.Join(in[0].argv, " "), secretVal) {
+		t.Fatalf("install %q", in)
+	}
+	f.reset()
+	h.update(state, h.vmConfig("1.1.0", map[string]tftypes.Value{"secrets_wo": str("export-" + secretVal), "inputs": strMap(map[string]string{"ADMIN_EMAIL": "c@d"})}))
+	if in := f.callsOf("install"); len(in) != 1 || in[0].stdin != nil && untarAll(t, in[0].stdin)["secrets"] != "" {
+		t.Fatalf("a re-run given the export: %q", in)
+	}
+}
+
 func TestVMValidation(t *testing.T) {
 	t.Parallel()
 	h, _ := newVMHarness(t)
@@ -622,7 +640,6 @@ func TestVMValidation(t *testing.T) {
 		"no short_name": {fill(h.typ, map[string]tftypes.Value{"vm": h.block("vm", map[string]tftypes.Value{
 			"host": str("192.0.2.7"), "user": str("ops"), "known_hosts_line": str(seedLine), "version": str("1.1.0")})}), "vm.short_name is required"},
 		"a bad short_name": {fill(h.typ, map[string]tftypes.Value{"vm": h.vmBlock("1.1.0", map[string]tftypes.Value{"short_name": str("a/b")})}), "not an installer's short name"},
-		"secrets_wo":       {h.vmConfig("1.1.0", map[string]tftypes.Value{"secrets_wo": str("x")}), "secrets_wo on a VM"},
 		"a bad line":       {fill(h.typ, map[string]tftypes.Value{"vm": h.vmBlock("1.1.0", map[string]tftypes.Value{"known_hosts_line": str("@revoked x ssh-ed25519 " + edKey)})}), "does not parse"},
 	} {
 		if got := errorsOf(h.validate(c.cfg)); !strings.Contains(got, c.want) {
@@ -1540,5 +1557,25 @@ func TestHarnessAppliesOnlyPlans(t *testing.T) {
 	}
 	if got := errorsOf(h.apply(state, nil, h.vmConfig("1.1.0", nil)).Diagnostics); !strings.Contains(got, "no plan to apply") {
 		t.Errorf("no plan: %s", got)
+	}
+}
+
+// A VM's status leaves registry_ca out when it cannot read it: a read keeps state's digest, one
+// that gives it records it.
+func TestVMRegistryCADigest(t *testing.T) {
+	t.Parallel()
+	h, f := newVMHarness(t)
+	state := h.create(h.vmConfig("1.1.0", nil))
+	if v := h.attrs(state)["registry_ca_digest"]; !v.IsNull() {
+		t.Fatalf("no CA: %v", v)
+	}
+	f.set("status", reply{stdout: vmStatusJSON("1.1.0", "", `,"registry_ca":"sha256:bb"`)})
+	read := h.read(state).NewState
+	if got := asString(t, h.attrs(read)["registry_ca_digest"]); got != "sha256:bb" {
+		t.Fatalf("given: %q", got)
+	}
+	f.set("status", reply{stdout: vmStatusJSON("1.1.0", "", "")})
+	if got := asString(t, h.attrs(h.read(read).NewState)["registry_ca_digest"]); got != "sha256:bb" {
+		t.Fatalf("left out: %q", got)
 	}
 }

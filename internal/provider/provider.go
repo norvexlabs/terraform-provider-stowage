@@ -54,7 +54,11 @@ type Data struct {
 	// RegistryKnown is false while the configuration's registry is not known yet (it depends
 	// on another resource): the plan-time comparison with the install's is then skipped.
 	RegistryKnown bool
-	NewRunner     RunnerFactory
+	// RegistryCAKnown is the same for registry_ca.
+	RegistryCAKnown bool
+	// UsernameUnknown is true while the pull account's username is not known yet.
+	UsernameUnknown bool
+	NewRunner       RunnerFactory
 	// Kubernetes is the provider's kubernetes block, nil without one: the cluster every
 	// kubernetes target reaches.
 	Kubernetes *k8sConnModel
@@ -172,16 +176,18 @@ func (p *stowageProvider) Configure(ctx context.Context, req provider.ConfigureR
 		}
 	}
 	d := &Data{
-		Kubernetes:    m.Kubernetes,
-		Username:      m.Username.ValueString(),
-		Password:      m.Password.ValueString(),
-		Registry:      m.Registry.ValueString(),
-		RegistryCA:    m.RegistryCA.ValueString(),
-		RegistryKnown: !m.Registry.IsUnknown(),
-		NewRunner:     p.newRunner,
-		Poll:          p.poll,
-		TempDir:       p.tmp,
-		CacheDir:      p.cache,
+		Kubernetes:      m.Kubernetes,
+		Username:        m.Username.ValueString(),
+		Password:        m.Password.ValueString(),
+		Registry:        m.Registry.ValueString(),
+		RegistryCA:      m.RegistryCA.ValueString(),
+		RegistryKnown:   !m.Registry.IsUnknown(),
+		RegistryCAKnown: !m.RegistryCA.IsUnknown(),
+		UsernameUnknown: m.Username.IsUnknown(),
+		NewRunner:       p.newRunner,
+		Poll:            p.poll,
+		TempDir:         p.tmp,
+		CacheDir:        p.cache,
 	}
 	resp.ResourceData = d
 	resp.DataSourceData = d

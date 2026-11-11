@@ -138,10 +138,17 @@ func (v VM) Status(ctx context.Context) (*VMStatus, error) {
 	if err != nil {
 		return nil, fmt.Errorf("status: %w", err)
 	}
-	if exit != 0 {
-		return nil, &FailedError{Verb: "status", Exit: exit, Stderr: tail(stderr)}
+	switch exit {
+	case 0:
+		return ParseVMStatus(stdout)
+	case 3: // the VM's status answers before the first install: any refusal is one
+		r, err := ParseRefused("status --json", stdout, stderr)
+		if err != nil {
+			return nil, err
+		}
+		return nil, r
 	}
-	return ParseVMStatus(stdout)
+	return nil, &FailedError{Verb: "status", Exit: exit, Stderr: tail(stderr)}
 }
 
 // VMInstall is what the VM's `install` is given: a first install, or its re-run.
@@ -254,12 +261,17 @@ func (v VM) Boot(ctx context.Context, name string) error {
 	return nil
 }
 
-// RetireScript retires a VM's one-time host key as `vm create` does once the install took what it
-// gave over SSH, by the files Stowage's README names: the key and its sshd drop-in removed, its
-// retirement marked on the OEM partition (no later boot serves it again), sshd reloaded.
-// Argument: the project's name.
+// RetireScript retires a VM's one-time host key as `vm host-key` does, by the files Stowage's
+// README names: the key and its sshd drop-in removed, its retirement marked on the OEM partition
+// (no later boot serves it again), sshd reloaded. On Kairos's recovery or live system it changes
+// nothing and exits 3: the first boot is not done, and the active system serves the key until
+// then. Argument: the project's name.
 const RetireScript = `set -eu
 n=$1
+if [ -e /run/cos/recovery_mode ] || [ -e /run/cos/live_mode ]; then
+  echo "the VM answers from its recovery or live system: its first boot is not done, and the one-time key is kept" >&2
+  exit 3
+fi
 rm -f "/run/$n-seed-host-key" "/etc/ssh/sshd_config.d/01-$n-seed-host-key.conf"
 touch "/oem/$n-seed-host-key.retired"
 for u in ssh.service sshd.service; do systemctl try-reload-or-restart "$u" 2>/dev/null || true; done

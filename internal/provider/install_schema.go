@@ -43,6 +43,7 @@ type installModel struct {
 	DeletionProtection    types.Bool     `tfsdk:"deletion_protection"`
 	DeleteData            types.Bool     `tfsdk:"delete_data"`
 	Registry              types.String   `tfsdk:"registry"`
+	RegistryCADigest      types.String   `tfsdk:"registry_ca_digest"`
 	ShortName             types.String   `tfsdk:"short_name"`
 	Version               types.String   `tfsdk:"version"`
 	Revision              types.Int64    `tfsdk:"revision"`
@@ -148,7 +149,7 @@ func installSchema(ctx context.Context) schema.Schema {
 			"secrets_wo": schema.StringAttribute{
 				Optional:            true,
 				WriteOnly:           true,
-				MarkdownDescription: "A decrypted `secrets export` of a machine made again (the installer's `--secrets`), write-only, used at create, on standard input. Docker only: refused with `kubernetes`, whose release keeps its secrets in the cluster, and with `vm`, whose seed cannot make the first boot wait for it.",
+				MarkdownDescription: "A decrypted `secrets export` of a machine made again (the installer's `--secrets`), write-only, used at create, on standard input. Docker and the VM — on a VM, one seeded with `stowage_vm_seed`'s `await_secrets`, whose first install waits for it (the installer refuses it once that install ran); refused with `kubernetes`, whose release keeps its secrets in the cluster.",
 			},
 			"tls": schema.StringAttribute{
 				Optional:            true,
@@ -171,7 +172,7 @@ func installSchema(ctx context.Context) schema.Schema {
 			},
 			"allow_rollback": schema.BoolAttribute{
 				Optional: true, Computed: true, Default: booldefault.StaticBool(false),
-				MarkdownDescription: "Lets a change of `installer` to `previous.installer` run the kept installer's `rollback`. Without it, that change is a plan-time error: a rollback restores the previous values, so a variable edit never triggers one.",
+				MarkdownDescription: "Lets a change of `installer` to `previous.installer` run the kept installer's `rollback`. Without it, that change is a plan-time error: a rollback takes the previous release back (its compose files, installer and images; every input keeps its value) and on a VM reboots, so a variable edit never triggers one.",
 			},
 			"deletion_protection": schema.BoolAttribute{
 				Optional: true, Computed: true, Default: booldefault.StaticBool(true),
@@ -181,9 +182,10 @@ func installSchema(ctx context.Context) schema.Schema {
 				Optional: true, Computed: true, Default: booldefault.StaticBool(false),
 				MarkdownDescription: "A destroy runs `uninstall --data`, deleting the volumes, instead of `uninstall`, which keeps them.",
 			},
-			"registry":   computedString("The provider's `registry` at the install, which a later plan compares; null in an imported state until its first apply."),
-			"short_name": computedString("The installer's short name (`describe` `short_name`): the install keeps its installer as `<id>/<short_name>-stow`."),
-			"version":    computedString("The release installed, from `status --json`."),
+			"registry":           computedString("The provider's `registry` at the install, which a later plan compares; null in an imported state until its first apply."),
+			"registry_ca_digest": computedString("`sha256:<hex>` of the registry CA the install keeps (the provider's `registry_ca` at its first install), as `status --json` reports it; null when it keeps none. A later plan compares it with the provider's `registry_ca`: first-install only on Docker and the VM."),
+			"short_name":         computedString("The installer's short name (`describe` `short_name`): the install keeps its installer as `<id>/<short_name>-stow`."),
+			"version":            computedString("The release installed, from `status --json`."),
 			"revision": schema.Int64Attribute{Computed: true, MarkdownDescription: "The installed release's package revision.",
 				PlanModifiers: []planmodifier.Int64{int64planmodifier.UseStateForUnknown()}},
 			"channel": computedString("The channel the install follows."),
