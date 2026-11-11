@@ -275,8 +275,9 @@ type hostKeyResult struct {
 
 // RetireHostKey runs `sudo -n <short>-stow host-key --json` on the VM: the VM's own ed25519 host
 // key, read, and the seed's one-time key retired by Stowage's own steps (run again, it changes
-// nothing more). Its refusal (exit 3: a recovery or live boot, no install done) is a
-// *RefusedError; its key is "ssh-ed25519 <base64>".
+// nothing more). Its refusal (exit 3: a recovery or live boot, not run as root, the first install
+// not done, a host name a known_hosts line cannot hold) is a *RefusedError; its key is
+// "ssh-ed25519 <base64>" (the line's host field is not read).
 func (v VM) RetireHostKey(ctx context.Context) (string, error) {
 	ctl, err := v.ctl()
 	if err != nil {
@@ -297,7 +298,7 @@ func (v VM) RetireHostKey(ctx context.Context) (string, error) {
 	case 1:
 		if bytes.Contains(stderr, []byte("unknown command")) {
 			return "", &FailedError{Verb: "host-key", Exit: exit, Stderr: tail(stderr),
-				Cause: fmt.Errorf("the VM's %s has no host-key verb: its OS carries an installer older than this provider reads (Stowage %s or later)", ctl, MinStowage)}
+				Cause: fmt.Errorf("the VM's %s has no host-key verb: its OS carries an installer built before Stowage %s's: move the VM on by hand (`sudo %s upgrade --version V`), the one-time key retired by the reboot after the install meanwhile", ctl, MinStowage, ctl)}
 		}
 		return "", &FailedError{Verb: "host-key", Exit: exit, Stderr: tail(stderr)}
 	default:

@@ -835,6 +835,7 @@ func TestK8sScriptCache(t *testing.T) {
 func TestK8sCreateTimeoutDuringARead(t *testing.T) {
 	t.Parallel()
 	h := k8sHarness(t, nil)
+	h.fake.lenient = true // every call before the wait answers however late: the timeout is the wait's
 	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
 	h.fake.set("k8s-status", reply{block: true})
 	config := h.k8sConfig(map[string]tftypes.Value{"timeouts": h.block("timeouts", map[string]tftypes.Value{"create": str("50ms")})})

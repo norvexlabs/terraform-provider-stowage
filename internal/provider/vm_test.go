@@ -1587,3 +1587,56 @@ func TestVMRetireProofCut(t *testing.T) {
 		t.Errorf("got %s", got)
 	}
 }
+
+// A retry of the retirement compares the VM's key with state's by the key alone (a vm.host
+// changed in place is the same key); a VM serving another key is an error that stops the update,
+// as neither key state accepts is served any more.
+func TestVMRetireRetryComparesTheKey(t *testing.T) {
+	t.Parallel()
+	setup := func(t *testing.T) (*harness, *vmFake, *tfprotov6.DynamicValue) {
+		h, f := newVMHarness(t)
+		f.retireNoop = true
+		f.then("status", reply{stdout: vmStatusJSON("1.1.0", "", "")}, reply{stdout: vmStatusJSON("1.1.0", "", "")})
+		cfg := h.vmConfig("1.1.0", nil)
+		a := h.apply(nil, h.plan(nil, cfg).PlannedState, cfg)
+		if vmAttr(t, h, a.NewState, "seed_boot_id") != unreadBoot {
+			t.Fatalf("seed_boot_id %s", vmAttr(t, h, a.NewState, "seed_boot_id"))
+		}
+		f.reset()
+		f.retireNoop = false
+		return h, f, a.NewState
+	}
+	h, f, state := setup(t)
+	f.set("retire", reply{stdout: `{"format":1,"known_hosts_line":"NOTES.example. ssh-ed25519 ` + ownKey + `","fingerprint":"SHA256:own"}`})
+	moved := h.vmConfig("1.1.0", map[string]tftypes.Value{"vm": h.vmBlock("1.1.0", map[string]tftypes.Value{"host": str("vm.example")}),
+		"inputs": strMap(map[string]string{"ADMIN_EMAIL": "c@d"})})
+	up := h.update(state, moved)
+	if d := errorsOf(up.Diagnostics); d != "" || vmAttr(t, h, up.NewState, "seed_boot_id") != "<null>" {
+		t.Fatalf("another host field, the same key: %s seed_boot_id %s", d, vmAttr(t, h, up.NewState, "seed_boot_id"))
+	}
+	h, f, state = setup(t)
+	f.set("retire", reply{stdout: `{"format":1,"known_hosts_line":"notes ssh-ed25519 ` + edKey + `","fingerprint":"SHA256:x"}`})
+	got := errorsOf(h.update(state, h.vmConfig("1.1.0", map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "c@d"})})).Diagnostics)
+	if !strings.Contains(got, "The VM's own host key changed") || len(f.callsOf("install")) != 0 || slices.Contains(f.ops(), "hostkey") {
+		t.Fatalf("another key: %q, calls %q", got, f.ops())
+	}
+}
+
+// When only the proof fails, the verb's key is state's and the warning says the files are retired
+// (no reboot needed); an installer without the verb is named, the key read alone.
+func TestVMRetireWarnings(t *testing.T) {
+	t.Parallel()
+	h2, f2 := newVMHarness(t)
+	f2.retireNoop = true
+	cfg := h2.vmConfig("1.1.0", nil)
+	ap := h2.apply(nil, h2.plan(nil, cfg).PlannedState, cfg)
+	if d := diagText(ap.Diagnostics); !strings.Contains(d, "host-key retired the one-time key's files") || vmAttr(t, h2, ap.NewState, "host_key_line") != ownLine {
+		t.Fatalf("proof alone: %s %s", d, vmAttr(t, h2, ap.NewState, "host_key_line"))
+	}
+	h3, f3 := newVMHarness(t)
+	f3.set("retire", reply{exit: 1, stderr: `Error: unknown command "host-key" for "notes-stow"`})
+	ap = h3.apply(nil, h3.plan(nil, cfg).PlannedState, cfg)
+	if d := diagText(ap.Diagnostics); !strings.Contains(d, "has no host-key verb") || vmAttr(t, h3, ap.NewState, "host_key_line") != ownLine || vmAttr(t, h3, ap.NewState, "seed_boot_id") == "<null>" {
+		t.Fatalf("no verb: %s %s", d, vmAttr(t, h3, ap.NewState, "host_key_line"))
+	}
+}

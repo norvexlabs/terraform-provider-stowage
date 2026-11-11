@@ -411,18 +411,19 @@ func (r *installResource) firstBoot(ctx context.Context, v installer.VM) (*insta
 }
 
 // learnKey retires the VM's one-time key by its own verb (retire), which gives the VM's own key;
-// when it fails, the key is read alone (the OpenSSH host key file, through the connection, whose
-// pinned key vouches for it). own is the key's line, null when neither gave it (the connection then
-// keeps accepting the configuration's key alone); seed is the boot during which the VM may still
-// serve the one-time key — null once its retirement is proved, else bootID (unreadBoot without
-// one), while which a connection accepts both. warns are "summary\ndetail" warnings.
+// when the verb gives none, the key is read alone (the OpenSSH host key file, through the
+// connection, whose pinned key vouches for it). own is the key's line, null when neither gave it
+// (the connection then keeps accepting the configuration's key alone); seed is the boot during
+// which the VM may still serve the one-time key — null once a connection accepting own alone
+// answered, else bootID (unreadBoot without one), while which a connection accepts both. warns
+// are "summary\ndetail" warnings.
 func (r *installResource) learnKey(ctx context.Context, m *installModel, v installer.VM, bootID string) (own, seed types.String, warns []string) {
 	host := m.VM.Host.ValueString()
-	own, err := r.retire(ctx, m, v, host)
+	own, err := r.retire(ctx, m, v, host, types.StringNull())
 	if err == nil {
 		return own, types.StringNull(), nil
 	}
-	if !known(own) {
+	if !known(own) && ctx.Err() == nil {
 		key, rerr := v.HostKey(ctx)
 		if rerr != nil {
 			return types.StringNull(), types.StringNull(), []string{"The VM's own host key was not read\n" + err.Error() + "; reading it alone: " + rerr.Error() +
@@ -430,34 +431,63 @@ func (r *installResource) learnKey(ctx context.Context, m *installModel, v insta
 		}
 		own = types.StringValue(host + " " + key)
 	}
+	if !known(own) {
+		return types.StringNull(), types.StringNull(), []string{"The VM's own host key was not read\n" + err.Error() +
+			". The connection keeps accepting vm.known_hosts_line alone, which the VM's next boot retires."}
+	}
 	seed = types.StringValue(bootID)
 	if bootID == "" {
 		seed = types.StringValue(unreadBoot)
 	}
-	return own, seed, []string{"The VM's one-time host key was not retired\n" + err.Error() +
-		". The VM serves it until its next boot, which retires it; until then the connection accepts it beside the VM's own (vm.seed_boot_id)."}
+	return own, seed, []string{"The VM's one-time host key was not retired\n" + err.Error() + ". " + notRetiredHint(err)}
 }
 
+// notRetiredHint is what a failed retirement leaves: the verb refused or failed (the VM serves the
+// one-time key until its next boot), or the verb ran and sshd did not answer under the VM's own key
+// alone yet (its reload pending: the next update's retry needs no reboot).
+func notRetiredHint(err error) string {
+	if errors.Is(err, errNotProved) {
+		return "host-key retired the one-time key's files, but sshd did not answer under the VM's own key alone yet; until then the connection accepts the one-time key beside the VM's own (vm.seed_boot_id), and the next update tries again."
+	}
+	return "The VM serves it until its next boot, which retires it; until then the connection accepts it beside the VM's own (vm.seed_boot_id)."
+}
+
+// errNotProved is a retirement whose verb ran but whose proof did not hold.
+var errNotProved = errors.New("the retirement is not proved")
+
 // retryRetire tries again a retirement that failed before (seed set): seed, null on success, and
-// the warning ("summary\ndetail") on a failure again.
-func (r *installResource) retryRetire(ctx context.Context, m *installModel, v installer.VM, own, seed types.String) (types.String, string) {
-	got, err := r.retire(ctx, m, v, m.VM.Host.ValueString())
-	if err == nil && !got.Equal(own) {
-		err = fmt.Errorf("host-key printed %s, not the VM's key state holds (%s)", got.ValueString(), own.ValueString())
+// the warning ("summary\ndetail") on a failure again. The VM serving another key than own, state's,
+// is an error (stop): the verb has retired the one-time key, and neither key state accepts is
+// served any more.
+func (r *installResource) retryRetire(ctx context.Context, m *installModel, v installer.VM, own, seed types.String) (types.String, string, error) {
+	if _, err := r.retire(ctx, m, v, m.VM.Host.ValueString(), own); err != nil {
+		if errors.Is(err, errOtherKey) {
+			return seed, "", err
+		}
+		return seed, "The VM's one-time host key is still not retired\n" + err.Error() + ". " + notRetiredHint(err) +
+			" vm.known_hosts_line stays needed until then.", nil
 	}
-	if err != nil {
-		return seed, "The VM's one-time host key is still not retired\n" + err.Error() +
-			". The connection keeps accepting it beside the VM's own (vm.seed_boot_id), and vm.known_hosts_line stays needed; the next update tries again, and the VM's next boot retires it."
-	}
-	return types.StringNull(), ""
+	return types.StringNull(), "", nil
+}
+
+// errOtherKey is a VM whose own key is not the one state records.
+var errOtherKey = errors.New("the VM serves another key than state's vm.host_key_line")
+
+// sameKey says whether two known_hosts lines hold the same key, whatever their host fields.
+func sameKey(a, b string) bool {
+	ka, ea := target.ParseKnownHostsLine(a)
+	kb, eb := target.ParseKnownHostsLine(b)
+	return ea == nil && eb == nil && ka == kb
 }
 
 // retire runs the VM's own verb, `sudo -n <short>-stow host-key --json` (Stowage's steps: run
 // again, it changes nothing more), whose key is the VM's own: own, `<host> <key>`, null when the
-// verb gave none. Then it proves the retirement — the verb exits 0 whether or not sshd took the
-// reload — by a connection accepting own alone reading the key again: six attempts a poll apart
-// (a minute in production), which also wait out sshd's reload, within the resource's timeout.
-func (r *installResource) retire(ctx context.Context, m *installModel, v installer.VM, host string) (types.String, error) {
+// verb gave none. With want known (state's key), another key stops there (errOtherKey). Then
+// it shows the VM answers under own alone — the verb exits 0 whether or not sshd took its reload —
+// by a connection accepting own alone reading the key again: six attempts a poll apart (a minute
+// in production), which also wait out sshd's reload, within the resource's timeout
+// (errNotProved otherwise).
+func (r *installResource) retire(ctx context.Context, m *installModel, v installer.VM, host string, want types.String) (types.String, error) {
 	key, err := v.RetireHostKey(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -466,6 +496,9 @@ func (r *installResource) retire(ctx context.Context, m *installModel, v install
 		return types.StringNull(), err
 	}
 	own := types.StringValue(host + " " + key)
+	if known(want) && !sameKey(own.ValueString(), want.ValueString()) {
+		return own, fmt.Errorf("%w: host-key printed %s, and state records %s. The one-time key is retired: give vm.known_hosts_line the VM's key (check it on its console: ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub), then `tofu state rm` this resource and import it", errOtherKey, key, want.ValueString())
+	}
 	only := *m
 	vmo := *m.VM
 	vmo.HostKeyLine, vmo.SeedBootID = own, types.StringNull()
@@ -483,13 +516,13 @@ func (r *installResource) retire(ctx context.Context, m *installModel, v install
 			}
 		}
 		if ctx.Err() != nil {
-			return own, fmt.Errorf("the VM did not answer under its own key alone when %s ran out", resourceTimeout)
+			return own, fmt.Errorf("%w: the VM did not answer under its own key alone when %s ran out", errNotProved, resourceTimeout)
 		}
 		if _, last = ov.HostKey(ctx); last == nil {
 			return own, nil
 		}
 	}
-	return own, fmt.Errorf("the VM did not answer under its own key alone in its six polls (a minute); the last attempt: %w", last)
+	return own, fmt.Errorf("%w: the VM did not answer under its own key alone in its six polls (a minute); the last attempt: %v", errNotProved, last)
 }
 
 // vmUpdate applies a release change to a VM in DESIGN § 13's order, after the re-run of the
@@ -542,7 +575,11 @@ func (u *vmUpdate) release(ctx context.Context, final, was *installModel, st *in
 	case !u.tried:
 		// No reboot: the retirement the key step left to it is tried here.
 		var warn string
-		if seed, warn = u.r.retryRetire(ctx, was, u.v, was.VM.HostKeyLine, seed); warn != "" {
+		var stop error
+		if seed, warn, stop = u.r.retryRetire(ctx, was, u.v, was.VM.HostKeyLine, seed); stop != nil {
+			u.diags.AddError("The VM's own host key changed", stop.Error())
+			return
+		} else if warn != "" {
 			summary, detail, _ := strings.Cut(warn, "\n")
 			u.diags.AddWarning(summary, detail)
 		}
@@ -752,7 +789,11 @@ func (r *installResource) updateVM(ctx context.Context, req resource.UpdateReque
 	case known(seed) && step == stay:
 		// A release change's reboot retires it anyway; a re-run alone tries again.
 		var warn string
-		if seed, warn = r.retryRetire(ctx, &conn, v, own, seed); warn != "" {
+		var stop error
+		if seed, warn, stop = r.retryRetire(ctx, &conn, v, own, seed); stop != nil {
+			resp.Diagnostics.AddError("The VM's own host key changed", stop.Error())
+			return
+		} else if warn != "" {
 			warns = append(warns, warn)
 		}
 	}
