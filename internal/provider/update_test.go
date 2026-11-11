@@ -484,7 +484,7 @@ func TestParseImportID(t *testing.T) {
 		"app.example:/srv/notes/notes-stow": {"app.example", "/srv", "notes", "notes"},
 		"/notes/nt-stow":                    {"", "/", "notes", "nt"},
 		"notes/notes-stow":                  {"", ".", "notes", "notes"},
-		"h:a/b:c/notes/notes-stow":          {"h", "a/b:c", "notes", "notes"},
+		"h:/a/b:c/notes/notes-stow":         {"h", "/a/b:c", "notes", "notes"},
 	} {
 		host, work, name, short, err := parseImportID(id)
 		if err != nil || [4]string{host, work, name, short} != want {
@@ -492,7 +492,8 @@ func TestParseImportID(t *testing.T) {
 		}
 	}
 	for _, id := range []string{"", "notes-stow", "/srv/notes/notes", "/srv/notes/-stow", "/srv/Notes/notes-stow", ":/srv/notes/notes-stow",
-		"-oProxy=x:/srv/notes/notes-stow", "ops@h:/srv/notes/notes-stow", "/srv//notes-stow"} {
+		"-oProxy=x:/srv/notes/notes-stow", "ops@h:/srv/notes/notes-stow", "/srv//notes-stow",
+		"h:a/b:c/notes/notes-stow", "srv/notes/notes-stow", "/srv/../x/notes/notes-stow"} {
 		if _, _, _, _, err := parseImportID(id); err == nil {
 			t.Errorf("%q accepted", id)
 		}

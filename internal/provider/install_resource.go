@@ -222,9 +222,18 @@ func workDir(d *dockerModel) string {
 // leaving it out and naming that directory are the same; else as given (an absolute, clean path,
 // or "." for a home not resolved).
 func heldWorkDir(state *installModel, d *dockerModel) string {
+	if workDir(state.Docker) != "." {
+		return workDir(d)
+	}
+	return homeWorkDir(state.ID, d)
+}
+
+// homeWorkDir is d's work directory, or, left out, the home an absolute id names (the one the
+// create resolved).
+func homeWorkDir(id types.String, d *dockerModel) string {
 	w := workDir(d)
-	if id := state.ID.ValueString(); w == "." && workDir(state.Docker) == "." && known(state.ID) && strings.HasPrefix(id, "/") {
-		return pathpkg.Dir(id)
+	if v := id.ValueString(); w == "." && known(id) && strings.HasPrefix(v, "/") {
+		return pathpkg.Dir(v)
 	}
 	return w
 }
@@ -312,6 +321,10 @@ func (r *installResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 		firstInstallOnlyFix(&resp.Diagnostics, path.Root("registry_ca_digest"), "the provider's registry_ca", state.RegistryCADigest.ValueString(), caDigest(r.data.RegistryCA),
 			"The install keeps the registry CA its first install was given (status --json registry_ca), which a re-run cannot change: give the provider that CA again (an empty one for none).")
 	}
+	// The provider's registry as written, against the one written at the install (state's): a
+	// plan cannot read the release's own registry, so naming it over an install made without one
+	// is a change too (leave it out). The apply compares the meaning with the install's
+	// (heldMismatch).
 	if r.data != nil && r.data.RegistryKnown && known(state.Registry) {
 		firstInstallOnly(&resp.Diagnostics, path.Root("registry"), "the provider's registry", state.Registry.ValueString(), r.data.Registry)
 	}
@@ -471,11 +484,8 @@ func (r *installResource) docker(m *installModel, short string) (installer.Docke
 	if err != nil {
 		return installer.Docker{}, err
 	}
-	dir := workDir(d)
-	if id := m.ID.ValueString(); dir == "." && known(m.ID) && strings.HasPrefix(id, "/") {
-		dir = pathpkg.Dir(id) // the home the create resolved: every ID built from it is state's
-	}
-	return installer.Docker{Runner: run, WorkDir: dir, Name: name, Short: short}, nil
+	// Left out, the home the create resolved: every ID built from it is state's.
+	return installer.Docker{Runner: run, WorkDir: homeWorkDir(m.ID, d), Name: name, Short: short}, nil
 }
 
 func addInstallerError(diags *diag.Diagnostics, summary string, err error) {
@@ -1041,14 +1051,13 @@ func (u *update) run(ctx context.Context, save func(*installModel) bool) {
 		u.diags.AddError("Installer of another project", fmt.Sprintf("The installer kept in %s/%s describes the project %q, not %q.", d.WorkDir, d.Name, running.Name, d.Name))
 		return
 	}
-	if imported(state) {
-		// The first apply of an imported state: the configuration's first-install-only settings
-		// must be the install's, as no re-run is given them.
-		if bad := heldMismatch(st, plan.Address.ValueString(), u.r.registry(), running.Registry, u.r.registryCA()); len(bad) > 0 {
-			u.diags.AddError("The install was made otherwise",
-				fmt.Sprintf("The imported install %s/%s recorded other first-install settings, which a re-run cannot change: %s. Give the settings the install holds (status --json).", d.WorkDir, d.Name, strings.Join(bad, "; ")))
-			return
-		}
+	// The configuration's first-install-only settings must be the install's, as no re-run is
+	// given them: an imported state's first apply, and a registry given over an install made
+	// without one (which the plan cannot tell from the release's own).
+	if bad := heldMismatch(st, plan.Address.ValueString(), u.r.registry(), running.Registry, u.r.registryCA()); len(bad) > 0 {
+		u.diags.AddError("The install was made otherwise",
+			fmt.Sprintf("The install %s/%s recorded other first-install settings, which a re-run cannot change: %s. Give the settings the install holds (status --json).", d.WorkDir, d.Name, strings.Join(bad, "; ")))
+		return
 	}
 	step, next := u.releaseStep(ctx, d, st)
 	if u.diags.HasError() {
@@ -1423,6 +1432,10 @@ func parseImportID(id string) (host, work, name, short string, err error) {
 		work = "/"
 	case work == "":
 		work = "."
+	case work == ".":
+	case !strings.HasPrefix(work, "/") || pathpkg.Clean(work) != work:
+		// docker.work_dir is an absolute, clean path, or left out (the home: <name>/… alone).
+		return "", "", "", "", fmt.Errorf("%q: the work directory %q is neither absolute and clean nor the home: give its absolute path, or <name>/<short>-stow for an install in the SSH user's home", id, work)
 	}
 	return host, work, name, short, nil
 }

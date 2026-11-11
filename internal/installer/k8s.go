@@ -26,26 +26,7 @@ import (
 // file names (space-separated, may be empty), the login's registry host and user ("" for none),
 // then the program and its arguments. Its own variables are named __stowage_*: an exported
 // variable of another name passes to the program unchanged.
-const K8sScript = `set -eu
-cd -- "$1"
-__stowage_kubeconfig=$2 __stowage_files=$3 __stowage_host=$4 __stowage_user=$5
-shift 5
-if [ -n "$__stowage_kubeconfig" ]; then KUBECONFIG=$__stowage_kubeconfig; export KUBECONFIG; else unset KUBECONFIG; fi
-__stowage_old=$(umask)
-umask 077
-__stowage_d=$(mktemp -d)
-trap 'rm -rf "$__stowage_d"' EXIT
-trap 'exit 130' HUP INT TERM
-` + LoginScript + `if [ -n "$__stowage_files" ] || [ -n "$__stowage_user" ]; then
-  tar -xf - -C "$__stowage_d"
-  for __stowage_f in $__stowage_files; do set -- "$@" "--$__stowage_f" "$__stowage_d/$__stowage_f"; done
-fi
-if [ -n "$__stowage_user" ]; then __stowage_login "$__stowage_host" "$__stowage_user" "$__stowage_d/login-password"; fi
-umask "$__stowage_old"
-__stowage_rc=0
-"$@" || __stowage_rc=$?
-exit "$__stowage_rc"
-`
+var K8sScript = runScript(true, true)
 
 // ToolsScript says which of the programs a Kubernetes run needs on the machine running OpenTofu
 // are missing from PATH: one line each on standard output, exit 0 either way.
@@ -225,7 +206,11 @@ func (k K8s) Describe(ctx context.Context) (*Describe, error) {
 	if exit != 0 {
 		return nil, &FailedError{Verb: "describe", Exit: exit, Stderr: tail(stderr), Cause: errOldInstaller}
 	}
-	return ParseDescribe(stdout)
+	desc, err := ParseDescribe(stdout)
+	if errors.Is(err, ErrPreRoutes) {
+		return nil, fmt.Errorf("%w; a release that runs such an installer is first moved on by hand: its own `k8s upgrade --version V` (Stowage %s or later), then run OpenTofu again", err, MinStowage)
+	}
+	return desc, err
 }
 
 // Status runs the fetched bootstrap script's `k8s status --json`: nil when the namespace holds no

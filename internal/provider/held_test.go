@@ -189,3 +189,20 @@ func TestUpdateKeepsTheResolvedHome(t *testing.T) {
 		t.Fatalf("re-run %q", rerun)
 	}
 }
+
+// The provider's registry is taken as the installer records it: a trailing / off.
+func TestRegistryTrailingSlash(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, map[string]tftypes.Value{"registry": str("mirror.lan/notes/")})
+	state := h.create(h.dockerConfig(nil))
+	if f := flags(h.fake.callsOf("install")[0].argv); f["--registry"] != "mirror.lan/notes" {
+		t.Fatalf("install %q", f)
+	}
+	if got := asString(t, h.attrs(state)["registry"]); got != "mirror.lan/notes" {
+		t.Fatalf("registry %q", got)
+	}
+	o := newHarness(t, map[string]tftypes.Value{"registry": str("mirror.lan/notes")})
+	if got := errorsOf(o.plan(state, o.dockerConfig(nil)).Diagnostics); got != "" {
+		t.Fatalf("the same registry without its slash: %q", got)
+	}
+}

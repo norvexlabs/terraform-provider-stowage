@@ -41,7 +41,11 @@ func (v VM) Describe(ctx context.Context) (*Describe, error) {
 	if exit != 0 {
 		return nil, describeFailed("describe", exit, stderr)
 	}
-	return ParseDescribe(stdout)
+	desc, err := ParseDescribe(stdout)
+	if errors.Is(err, ErrPreRoutes) {
+		return nil, fmt.Errorf("%w; the VM's OS carries such an installer: move the VM on by hand first (`sudo %s upgrade --version V`, a release of Stowage %s or later), then run OpenTofu again", err, ctl, MinStowage)
+	}
+	return desc, err
 }
 
 // CtlScript says whether its argument is a command the VM's shell finds (POSIX `command -v`):

@@ -527,7 +527,45 @@ func TestKeptDescribePre035(t *testing.T) {
 	f := &recorder{out: `{"format":1,"name":"notes","short_name":"notes","release":{"version":"1"}}`}
 	d := Docker{Runner: f, WorkDir: "/srv", Name: "notes", Short: "notes"}
 	_, err := d.KeptDescribe(context.Background())
-	if !errors.Is(err, ErrPreRoutes) || !strings.Contains(err.Error(), "/srv/notes/notes-stow upgrade --version V --dir /srv/notes") {
+	if !errors.Is(err, ErrPreRoutes) || !strings.Contains(err.Error(), "`<short>-stow upgrade --version V --dir /srv/notes`, the `*-stow` in /srv/notes), then run OpenTofu again") {
 		t.Fatalf("got %v", err)
+	}
+}
+
+// Docker Hub's login goes under the key its client looks it up by; any other under its host. A
+// login whose password file is empty stops the script.
+func TestAuthKeyAndLoginGuards(t *testing.T) {
+	t.Parallel()
+	for host, want := range map[string]string{"docker.io": "https://index.docker.io/v1/", "Index.Docker.io": "https://index.docker.io/v1/",
+		"registry-1.docker.io": "https://index.docker.io/v1/", "mirror.lan:5000": "mirror.lan:5000", "ghcr.io": "ghcr.io"} {
+		if got := AuthKey(host); got != want {
+			t.Errorf("%s: %q", host, got)
+		}
+	}
+	if _, host, _, _, err := loginInput(nil, &Login{Host: "docker.io", Username: "u", Password: "p"}); err != nil || host != "https://index.docker.io/v1/" {
+		t.Errorf("docker.io: %q %v", host, err)
+	}
+	dir := t.TempDir()
+	stdin, _ := tarFiles(map[string]string{"x": "y"})
+	_, stderr, exit, err := target.Local{}.Run(context.Background(), []string{"sh", "-c", RunLoginScript, "sh", dir, "", "mirror.lan", "u", "true"}, stdin)
+	if err != nil || exit == 0 || !strings.Contains(string(stderr), "the login's password did not arrive") {
+		t.Errorf("no password: %d %s %v", exit, stderr, err)
+	}
+}
+
+// ResolveScript names a home reached through a symbolic link by the link's name, as $HOME does.
+func TestResolveScriptKeepsTheLinksName(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	real, link := filepath.Join(dir, "real"), filepath.Join(dir, "home")
+	if err := os.Mkdir(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Docker{Runner: target.Local{}, WorkDir: link}.Resolve(context.Background())
+	if err != nil || got != link {
+		t.Fatalf("%q %v", got, err)
 	}
 }

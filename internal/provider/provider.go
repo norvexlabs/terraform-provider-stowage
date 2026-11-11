@@ -179,7 +179,7 @@ func (p *stowageProvider) Configure(ctx context.Context, req provider.ConfigureR
 		Kubernetes:      m.Kubernetes,
 		Username:        m.Username.ValueString(),
 		Password:        m.Password.ValueString(),
-		Registry:        m.Registry.ValueString(),
+		Registry:        strings.TrimSuffix(m.Registry.ValueString(), "/"), // as the installer records it
 		RegistryCA:      m.RegistryCA.ValueString(),
 		RegistryKnown:   !m.Registry.IsUnknown(),
 		RegistryCAKnown: !m.RegistryCA.IsUnknown(),

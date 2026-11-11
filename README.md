@@ -95,9 +95,9 @@ More in [examples/](examples/).
 
 | Attribute | | |
 |---|---|---|
-| `username` | optional | The registry's pull account, with `password`. The target logs in with it to fetch the installer image, in a Docker configuration of its own (`DOCKER_CONFIG` in a private temporary directory) that is removed afterwards: the credential is not left on the host. The login is written as that configuration's own `auths` entry (never by `docker login`, whose platform credential helper — a keychain — would keep it), the password read from standard input; the host must be a registry host (a name or address, an optional port), else refused. That configuration keeps the Docker context in use (its name, and the contexts of the configuration it replaces, linked): the login changes where the client reads credentials, never which daemon it talks to. Left out, the target's own `docker login` (or none) fetches it. The login goes to the installer reference's registry host (`docker.io` for a reference without one). |
+| `username` | optional | The registry's pull account, with `password`. The target logs in with it to fetch the installer image, in a Docker configuration of its own (`DOCKER_CONFIG` in a private temporary directory) that is removed afterwards: the credential is not left on the host. The login is written as that configuration's own `auths` entry (never by `docker login`, whose platform credential helper — a keychain — would keep it), under the key the Docker client looks the host up by (Docker Hub's `https://index.docker.io/v1/` for `docker.io`, `index.docker.io` and `registry-1.docker.io`), the password read from standard input (a missing or empty one, or no `base64` on the machine, stops the run before anything else); the host must be a registry host (a name or address, an optional port), else refused. That configuration keeps the Docker context in use (its name, and the contexts of the configuration it replaces, linked): the login changes where the client reads credentials, never which daemon it talks to. Left out, the target's own `docker login` (or none) fetches it. The login goes to the installer reference's registry host (`docker.io` for a reference without one). |
 | `password` | optional, sensitive | The pull account's password or token, with `username`; sent on the target's standard input only. One without the other is refused. |
-| `registry` | optional | A mirror's prefix (the installer's `--registry`), given at the install. First-install only: the resource records it (`registry`), and a plan whose provider `registry` differs is an error. |
+| `registry` | optional | A mirror's prefix (the installer's `--registry`), given at the install; a trailing `/` is taken off, as the installer records it. First-install only: the resource records it (`registry`), and a plan whose provider `registry` differs, as written, is an error (left out means the release's own registry, which a plan cannot read: naming it over an install made without a mirror is a change too — leave it out). |
 | `registry_ca` | optional | PEM of the mirror's certificate authority (the installer's `--registry-ca`), sent on standard input. Refused unless it holds `-----BEGIN CERTIFICATE-----`. The target's Docker daemon must already trust the mirror to fetch the installer image itself. |
 | `kubernetes` | block | The cluster the Kubernetes targets reach, below. |
 
@@ -169,7 +169,7 @@ from another resource) is not, its key checked when the configuration is validat
 | `user` | required with `host` | SSH user. A host or user starting with `-` or holding a space is refused. |
 | `private_key_file` | optional | The private key's path; left out, ssh's agent and default keys. |
 | `known_hosts_line` | required with `host` | The host's `known_hosts` line, `host keytype base64` (the host field may be left out, hashed or a pattern: it is replaced). That key alone is accepted. A marker (`@cert-authority`, `@revoked`), an unknown key type, a key that is not base64 or more than one line is refused. |
-| `work_dir` | optional | The directory on the target holding `<name>.sh` and the install directory `<name>/`: an absolute, clean path (no `.` or `..` element, no `//`, no trailing `/`; else refused). Left out, the SSH user's home (locally, OpenTofu's working directory), which the create resolves first (`cd` there, `pwd -P`) into `id`. First-install only: a plan naming another directory is an error, but naming the home a create resolved (state's `id`) when it was left out changes nothing; taking out a `work_dir` that was given is a change (that home was never resolved). |
+| `work_dir` | optional | The directory on the target holding `<name>.sh` and the install directory `<name>/`: an absolute, clean path (no `.` or `..` element, no `//`, no trailing `/`; else refused). Left out, the SSH user's home (locally, OpenTofu's working directory), which the create resolves first (`cd` there, `pwd -L`: a home reached through a symbolic link keeps the link's name, as `$HOME` does) into `id`. First-install only: a plan naming another directory is an error, but naming the home a create resolved (state's `id`) when it was left out changes nothing; taking out a `work_dir` that was given is a change (that home was never resolved). |
 
 **`kubernetes` block** — the Kubernetes shape, on the cluster the provider's `kubernetes` block
 reaches (one cluster per provider configuration: an alias per cluster). Not with the front's
@@ -181,7 +181,7 @@ cluster). On the target, `id` is `<namespace>/<release>`.
 |---|---|---|
 | `namespace` | required | The release's namespace (`--namespace`), a DNS label (lower-case letters, digits and `-`, at most 63 characters; else refused). First-install only. |
 | `release` | optional | The helm release's name (`--release`), a DNS label of at most 53 characters; left out, the project's name, the installer's default. First-install only (the effective name is compared: naming the default changes nothing). |
-| `image_pull_login` | optional bool | Writes the cluster's pull Secret for the mirror from the provider's pull account (`k8s install|upgrade --image-pull-login`), at every install and upgrade: the run gets a Docker configuration of its own (a private temporary directory, removed afterwards) holding `username`'s login to the host of the registry the release pulls from (the one state records, else the provider's `registry`), the password on standard input, never an argument. Opt-in, as the account's credential is then readable by whoever reads the release's Secrets. Turned on alone for an installed release, the update applies the release again (`k8s upgrade --no-input --json --image-pull-login`) to write it; turned off, nothing runs and the Secret stays. A plan with it and no `username`, or no provider `registry` (and none recorded), is an error (`image_pull_login needs the pull account`, `… a mirror`); the installer refuses the release's own registry, and a login the nodes cannot pull with. |
+| `image_pull_login` | optional bool | Writes the cluster's pull Secret for the mirror from the provider's pull account (`k8s install|upgrade --image-pull-login`), at every install and upgrade: the run gets a Docker configuration of its own (a private temporary directory, removed afterwards) holding `username`'s login to the host of the registry the release pulls from (the one state records, else the provider's `registry`), the password on standard input, never an argument. Opt-in, as the account's credential is then readable by whoever reads the release's Secrets. Turned on alone for an installed release, the update applies the release again (`k8s upgrade --no-input --json --image-pull-login`) to write it; with a rollback, it is refused (`a rollback goes alone`: helm's rollback writes no Secret); turned off, nothing runs and the Secret stays. A plan with it and no `username`, or no provider `registry` (and none recorded), is an error (`image_pull_login needs the pull account`, `… a mirror`); the installer refuses the release's own registry, and a login the nodes cannot pull with. |
 
 **`vm` block** — the Kairos VM shape: a VM its hypervisor's or cloud's own resource made from
 `stowage_vm_seed`, reached over SSH. `installer` is refused with it (the VM's release is
@@ -232,7 +232,7 @@ another name reaches the installer unchanged. Over ssh no environment is carried
 - **Create**: `docker run --rm <installer> > <work_dir>/<name>.sh` (written through a temporary
   file, so a failed fetch leaves no half script), the bootstrap script's `describe --json` (its
   `format` checked, its `name` compared, its shapes must include `docker` when it lists any, its
-  `short_name` recorded); with `work_dir` left out, the home resolved (`cd` there, `pwd -P`; a
+  `short_name` recorded); with `work_dir` left out, the home resolved (`cd` there, `pwd -L`; a
   failure is an error before anything runs); then its `status --json --dir ./<name>`: a refusal
   whose object says `absent` (no install in the directory) is a fresh install, any other refusal
   an error; an install of another project is an error;
@@ -276,9 +276,12 @@ another name reaches the installer unchanged. Over ssh no environment is carried
   the target. Any other change, in this order:
   1. `status --json` and the kept installer's `describe --json` (the running release's inputs and
      routes), the kept installer found by the short name `status` reports. No install directory
-     is an error; a kept installer of another project too. An imported state's first apply
-     compares the configuration's `address`, the provider's `registry` and `registry_ca` with the
-     install's first, as a create over an install does (`The install was made otherwise`).
+     is an error; a kept installer of another project too. Then the configuration's `address`,
+     the provider's `registry` and `registry_ca` are compared with what the install recorded, each
+     left out meaning its default (`127.0.0.1`, the release's own registry by the kept
+     installer's `describe`, no CA), as a create over an install does: another is an error before
+     anything runs (`The install was made otherwise`) — an imported state's first apply, or a
+     setting the plan could not tell.
   2. The release to reach: none when `installed.installer` is the desired `installer`; `rollback`
      when it is `previous.installer` (with `allow_rollback`); else the new installer is fetched
      (`<name>.sh` written again, as at create) and described — another project, or no `docker`
@@ -310,7 +313,9 @@ another name reaches the installer unchanged. Over ssh no environment is carried
   5. `status --json` fills the computed attributes; one that cannot be read keeps state's, with
      the error.
 - **Import**: `tofu import stowage_install.x '[<host>:]<work_dir>/<name>/<short>-stow'`, the
-  installer the install keeps (`ls <work_dir>/<name>/*-stow`); a host is what comes before the
+  installer the install keeps (`ls <work_dir>/<name>/*-stow`), `<work_dir>` an absolute, clean
+  path, or left out (`<name>/<short>-stow`, or `./<name>/…`) for the SSH user's home (another
+  relative one is refused); a host is what comes before the
   first colon when no slash does (an `@` is refused: the user comes from the configuration).
   State records the target, the directory and `short_name`, `deletion_protection = true`; the
   first apply, with the configuration's connection, runs the update above with every configured
@@ -631,8 +636,9 @@ state's first apply also plans `registry` unknown (it records the provider's).
   gives them. An installer of Stowage 0.34.0 speaks format 1 without them: its `describe` lists no
   `routes`, which is refused (`no routes: the installer predates the machine interface this
   provider reads`), before any verb; an install whose kept installer is one is refused at its
-  update, naming the hand upgrade that moves it on (`<dir>/<name>/<short>-stow upgrade --version
-  V`), after which the provider drives it.
+  update or destroy, naming the hand upgrade that moves it on (its kept `<short>-stow upgrade
+  --version V`; on Kubernetes the release's own `k8s upgrade --version V`, on a VM `sudo
+  <short>-stow upgrade --version V`), after which the provider drives it.
 
 ### SSH
 

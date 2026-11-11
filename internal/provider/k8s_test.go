@@ -1308,6 +1308,21 @@ func TestK8sImagePullLogin(t *testing.T) {
 	if ups := h.fake.callsOf("k8s-upgrade"); len(ups) != 1 || !contains(ups[0].argv, "--image-pull-login") {
 		t.Fatalf("turned on: %q", h.fake.ops())
 	}
+	// Turned on with a rollback: refused before anything runs (helm's rollback writes no Secret).
+	h.fake.reset()
+	h.fake.then("k8s-describe", reply{stdout: describeK8s}, reply{stdout: describeK8s2})
+	h.fake.then("k8s-status", reply{stdout: statusK8s})
+	h.fake.set("k8s-status", reply{stdout: statusK8s2})
+	upgraded := h.update(plain, h.k8sConfig(map[string]tftypes.Value{"installer": str(image2)}))
+	h.fake.reset()
+	h.fake.set("k8s-status", reply{stdout: statusK8s2})
+	h.fake.set("k8s-describe", reply{stdout: describeK8s2})
+	back := h.k8sConfig(map[string]tftypes.Value{"kubernetes": login, "allow_rollback": boolean(true)})
+	p := h.plan(upgraded.NewState, back)
+	got := errorsOf(p.Diagnostics) + errorsOf(h.apply(upgraded.NewState, p.PlannedState, back).Diagnostics)
+	if !strings.Contains(got, "a rollback goes alone") || len(h.fake.callsOf("k8s-rollback")) != 0 {
+		t.Fatalf("a rollback with image_pull_login turned on: %q %q", got, h.fake.ops())
+	}
 	for name, cfg := range map[string]map[string]tftypes.Value{
 		"no account": {"registry": str("mirror.lan/notes")},
 		"no mirror":  {"username": str("puller"), "password": str("pw")},

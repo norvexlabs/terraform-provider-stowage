@@ -214,3 +214,21 @@ func TestLocalWithoutEnvAdds(t *testing.T) {
 		t.Fatalf("%q", r.Unset)
 	}
 }
+
+// A relative DOCKER_CONFIG names a directory of the directory the script was started in, not of
+// the one it moves to: its contexts are the login's.
+func TestLoginKeepsARelativeDockerConfigsContexts(t *testing.T) {
+	t.Parallel()
+	start, dir, bin := t.TempDir(), t.TempDir(), t.TempDir()
+	if err := os.MkdirAll(filepath.Join(start, "cfg", "contexts", "meta"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testutil.WriteExecutable(t, filepath.Join(bin, "docker"), "#!/bin/sh\necho rootless\n")
+	stdin, _ := tarFiles(map[string]string{"login-password": "pw"})
+	script := `cd "$1" && shift && exec env DOCKER_CONFIG=cfg PATH="$0:/usr/bin:/bin" sh -c "$@"`
+	out, stderr, exit, err := target.Local{}.Run(context.Background(), []string{"sh", "-c", script, bin, start,
+		`exec sh -c "$0" sh "$@"`, RunLoginScript, dir, "", "mirror.lan", "u", "sh", "-c", `ls "$DOCKER_CONFIG/contexts"`}, stdin)
+	if err != nil || exit != 0 || strings.TrimSpace(string(out)) != "meta" {
+		t.Fatalf("%q %s %d %v", out, stderr, exit, err)
+	}
+}

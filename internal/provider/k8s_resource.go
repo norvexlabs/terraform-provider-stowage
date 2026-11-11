@@ -976,6 +976,9 @@ func (r *installResource) k8sUpdate(ctx context.Context, plan, state *installMod
 	case step == rollback && !rerun.Empty():
 		rollbackAlone(diags, "inputs or secret inputs")
 		return
+	case step == rollback && plan.Kubernetes.ImagePullLogin.ValueBool() && !state.Kubernetes.ImagePullLogin.ValueBool():
+		rollbackAlone(diags, "image_pull_login") // helm's rollback writes no pull Secret
+		return
 	}
 	short := running.ShortName
 	base := state // what the final read falls back to: the state saved last

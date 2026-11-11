@@ -24,23 +24,30 @@ const (
 	NotInstalledMark = "stowage-provider: no install directory"
 )
 
-// LoginScript is a shell function the scripts define: `__stowage_login HOST USER FILE` writes
-// USER's login to HOST, the password read from FILE, into a Docker configuration of its own under
-// $__stowage_d (removed with it), so the credential is not left on the machine. The login is
-// written as the configuration's own `auths` entry, never by `docker login`: a configuration that
-// holds an entry is one the client reads and writes itself, so no platform credential helper (a
-// keychain) takes the password. That configuration keeps the Docker context in use (its name, and
-// the contexts of the configuration it replaces): the login changes where the client reads
-// credentials, never which daemon it talks to. HOST is a registry host (ValidRegistryHost), safe
-// in JSON as it is; the base64 of the login is too.
-const LoginScript = `__stowage_login() {
+// LoginScript is defined at a script's start, before its cd: it notes the Docker configuration
+// in use then (made absolute), and defines `__stowage_login KEY USER FILE`, which writes USER's
+// login under the auths KEY (AuthKey: the host, Docker Hub's own key for it), the password read
+// from FILE, into a Docker configuration of its own under $__stowage_d (removed with it), so the
+// credential is not left on the machine. The login is written as the configuration's own `auths`
+// entry, never by `docker login`: a configuration that holds an entry is one the client reads and
+// writes itself, so no platform credential helper (a keychain) takes the password. That
+// configuration keeps the Docker context in use (its name, and the contexts of the configuration
+// it replaces): the login changes where the client reads credentials, never which daemon it talks
+// to. KEY is a registry host or Docker Hub's key (ValidRegistryHost), safe in JSON as it is; the
+// base64 of the login is too. A password file that is missing or empty, or no base64, stops the
+// script before anything runs.
+const LoginScript = `__stowage_from=${DOCKER_CONFIG:-${HOME:-/nonexistent}/.docker}
+case $__stowage_from in /*) ;; *) __stowage_from=$PWD/$__stowage_from ;; esac
+__stowage_login() {
+  [ -s "$3" ] || { echo "stowage-provider: the login's password did not arrive" >&2; exit 1; }
+  command -v base64 >/dev/null || { echo "stowage-provider: base64 is missing: a login needs it" >&2; exit 1; }
   __stowage_ctx=$(docker context show 2>/dev/null || true)
-  __stowage_from=${DOCKER_CONFIG:-${HOME:-/nonexistent}/.docker}
   DOCKER_CONFIG=$__stowage_d/docker
   export DOCKER_CONFIG
   mkdir "$DOCKER_CONFIG"
   if [ -d "$__stowage_from/contexts" ]; then ln -s "$__stowage_from/contexts" "$DOCKER_CONFIG/contexts"; fi
   __stowage_auth=$({ printf '%s:' "$2"; cat "$3"; } | base64 | tr -d '\n')
+  [ -n "$__stowage_auth" ] || { echo "stowage-provider: the login could not be encoded" >&2; exit 1; }
   case $__stowage_ctx in
   "" | default) __stowage_cur= ;;
   *) __stowage_cur=',"currentContext":"'$__stowage_ctx'"' ;;
@@ -48,6 +55,17 @@ const LoginScript = `__stowage_login() {
   printf '{"auths":{"%s":{"auth":"%s"}}%s}\n' "$1" "$__stowage_auth" "$__stowage_cur" > "$DOCKER_CONFIG/config.json"
 }
 `
+
+// AuthKey is the auths key the Docker client looks a registry's login up by: Docker Hub's
+// (docker.io, index.docker.io, registry-1.docker.io) is https://index.docker.io/v1/, any other
+// the host itself.
+func AuthKey(host string) string {
+	switch strings.ToLower(host) {
+	case "docker.io", "index.docker.io", "registry-1.docker.io":
+		return "https://index.docker.io/v1/"
+	}
+	return host
+}
 
 // ValidRegistryHost says whether h is a registry host a login may name: a host name or an IPv4
 // address, an optional port, or a bracketed IPv6 address with one.
@@ -60,14 +78,14 @@ var registryHost = regexp.MustCompile(`^([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?
 // Docker configuration of its own that is removed afterwards (LoginScript), so the credential is
 // not left on the host. Arguments: work_dir, image, name, registry host, user (empty: no login).
 const FetchScript = `set -eu
-cd -- "$1"
+` + LoginScript + `cd -- "$1"
 __stowage_img=$2 __stowage_name=$3 __stowage_host=$4 __stowage_user=$5
 __stowage_old=$(umask)
 umask 077
 __stowage_d=$(mktemp -d)
 trap 'rm -rf "$__stowage_d"' EXIT
 trap 'exit 130' HUP INT TERM
-` + LoginScript + `if [ -n "$__stowage_user" ]; then
+if [ -n "$__stowage_user" ]; then
   tar -xf - -C "$__stowage_d"
   __stowage_login "$__stowage_host" "$__stowage_user" "$__stowage_d/password"
 fi
@@ -78,30 +96,41 @@ cat "$__stowage_d/script" > "./.$__stowage_name.sh.part"
 mv -f "./.$__stowage_name.sh.part" "./$__stowage_name.sh"
 `
 
-// runScript is RunScript's body, and with login RunLoginScript's: one text, so a change to the
-// one is the other's.
-func runScript(login bool) string {
-	head, args, extract, logIn := `__stowage_files=$2
+// runScript is RunScript's body, with login RunLoginScript's, and with kube K8sScript's: one
+// text, so a change to the one is the others'. Arguments: the directory, with kube the
+// kubeconfig, the file names, with login (kube has it) the login's key and user, then the program.
+func runScript(login, kube bool) string {
+	head := `__stowage_files=$2
 shift 2
-`, "", `if [ -n "$__stowage_files" ]; then
-`, ""
-	if login {
+`
+	switch {
+	case kube:
+		head = `__stowage_kubeconfig=$2 __stowage_files=$3 __stowage_host=$4 __stowage_user=$5
+shift 5
+if [ -n "$__stowage_kubeconfig" ]; then KUBECONFIG=$__stowage_kubeconfig; export KUBECONFIG; else unset KUBECONFIG; fi
+`
+	case login:
 		head = `__stowage_files=$2 __stowage_host=$3 __stowage_user=$4
 shift 4
 `
-		args, extract = LoginScript, `if [ -n "$__stowage_files" ] || [ -n "$__stowage_user" ]; then
+	}
+	pre, extract, logIn := "", `if [ -n "$__stowage_files" ]; then
+`, ""
+	if login || kube {
+		pre = LoginScript
+		extract = `if [ -n "$__stowage_files" ] || [ -n "$__stowage_user" ]; then
 `
 		logIn = `if [ -n "$__stowage_user" ]; then __stowage_login "$__stowage_host" "$__stowage_user" "$__stowage_d/login-password"; fi
 `
 	}
 	return `set -eu
-cd -- "$1"
+` + pre + `cd -- "$1"
 ` + head + `__stowage_old=$(umask)
 umask 077
 __stowage_d=$(mktemp -d)
 trap 'rm -rf "$__stowage_d"' EXIT
 trap 'exit 130' HUP INT TERM
-` + args + extract + `  tar -xf - -C "$__stowage_d"
+` + extract + `  tar -xf - -C "$__stowage_d"
   for __stowage_f in $__stowage_files; do set -- "$@" "--$__stowage_f" "$__stowage_d/$__stowage_f"; done
 fi
 ` + logIn + `umask "$__stowage_old"
@@ -117,13 +146,13 @@ exit "$__stowage_rc"
 // names (space-separated, may be empty), then the program and its arguments. The scripts' own
 // variables are named __stowage_*: an exported variable of another name passes to the program
 // unchanged.
-var RunScript = runScript(false)
+var RunScript = runScript(false, false)
 
 // RunLoginScript is RunScript with a login: the tar holds `login-password` too (never named as a
 // file flag), and the program runs with a Docker configuration of its own holding that login
 // (LoginScript), which it reads the registry with. Arguments: work_dir, the file names, the
 // login's registry host and user ("" for none), then the program and its arguments.
-var RunLoginScript = runScript(true)
+var RunLoginScript = runScript(true, false)
 
 // loginInput is files and login as a run's standard input and the arguments RunLoginScript and
 // K8sScript take: the file names, the login's host and user.
@@ -147,7 +176,7 @@ func loginInput(files map[string]string, login *Login) (names, host, user string
 	}
 	all["login-password"] = login.Password
 	stdin, err = tarFiles(all)
-	return names, login.Host, login.Username, stdin, err
+	return names, AuthKey(login.Host), login.Username, stdin, err
 }
 
 // StowScript runs the installer the install keeps, <work_dir>/<name>/<short>-stow (else the one
@@ -270,7 +299,7 @@ func (d Docker) Fetch(ctx context.Context, installer string, login *Login) error
 		if !ValidRegistryHost(login.Host) {
 			return fmt.Errorf("fetching %s: %q is not a registry host", installer, login.Host)
 		}
-		argv[7], argv[8] = login.Host, login.Username
+		argv[7], argv[8] = AuthKey(login.Host), login.Username
 		var err error
 		if stdin, err = tarFiles(map[string]string{"password": login.Password}); err != nil {
 			return err
@@ -286,8 +315,9 @@ func (d Docker) Fetch(ctx context.Context, installer string, login *Login) error
 	return nil
 }
 
-// ResolveScript prints its argument's directory as an absolute path, symbolic links resolved.
-const ResolveScript = `cd -- "$1" && pwd -P`
+// ResolveScript prints its argument's directory as an absolute path, as the shell names it after
+// cd (logical: a home reached through a symbolic link keeps the link's name, as $HOME does).
+const ResolveScript = `cd -- "$1" && pwd -L`
 
 // Resolve is the work directory as the target resolves it: an absolute path.
 func (d Docker) Resolve(ctx context.Context) (string, error) {
@@ -452,7 +482,7 @@ func (d Docker) KeptDescribe(ctx context.Context) (*Describe, error) {
 	desc, err := ParseDescribe(stdout)
 	if errors.Is(err, ErrPreRoutes) {
 		// The install runs a release this provider cannot drive: it moves on by its own installer.
-		return nil, fmt.Errorf("%w; the install keeps an installer older than that: upgrade it by hand to a release made by Stowage %s or later (`%s/%s/%s-stow upgrade --version V --dir %s/%s`), then apply", err, MinStowage, d.WorkDir, d.Name, d.Short, d.WorkDir, d.Name)
+		return nil, fmt.Errorf("%w; the install keeps an installer older than that: upgrade the install by hand to a release made by Stowage %s or later with the installer it keeps (`<short>-stow upgrade --version V --dir %s/%s`, the `*-stow` in %s/%s), then run OpenTofu again", err, MinStowage, d.WorkDir, d.Name, d.WorkDir, d.Name)
 	}
 	return desc, err
 }

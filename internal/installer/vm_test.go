@@ -318,3 +318,16 @@ func TestUninstallAbsent(t *testing.T) {
 		t.Fatalf("another refusal: %v", err)
 	}
 }
+
+// A 0.34.0 installer on Kubernetes or the VM is refused naming the hand upgrade that moves the
+// release on.
+func TestDescribePre035Hints(t *testing.T) {
+	t.Parallel()
+	old := `{"format":1,"name":"notes","short_name":"notes","release":{"version":"1"}}`
+	if _, err := (VM{Runner: &vmRecorder{stdout: old}, Short: "notes"}).Describe(context.Background()); !errors.Is(err, ErrPreRoutes) || !strings.Contains(err.Error(), "sudo notes-stow upgrade --version V") {
+		t.Errorf("vm: %v", err)
+	}
+	if _, err := (K8s{Runner: &vmRecorder{stdout: old}, Name: "notes"}).Describe(context.Background()); !errors.Is(err, ErrPreRoutes) || !strings.Contains(err.Error(), "its own `k8s upgrade --version V`") {
+		t.Errorf("k8s: %v", err)
+	}
+}
