@@ -8,7 +8,7 @@ DOCKER_GO  := docker run --rm --memory 4g -u $(shell id -u):$(shell id -g) -e HO
               -e GOMODCACHE=/cache/mod -e GOFLAGS=-trimpath -v $(GOCACHE_DIR):/cache -v $(CURDIR):/src -w /src
 GO         := $(DOCKER_GO) golang:$(GO_VERSION)-bookworm
 
-.PHONY: all check build release-check test hooks-test acc-docker acc-k8s acc-image acc-vm fmt tidy docs shell hooks clean
+.PHONY: all check build install-local release-check test hooks-test acc-docker acc-k8s acc-image acc-vm fmt tidy docs shell hooks clean
 
 all: check build
 
@@ -20,6 +20,14 @@ check:            ## GATE: gofmt + vet + staticcheck + govulncheck + the hooks' 
 
 build:            ## ./bin/terraform-provider-stowage (only after green checks)
 	$(BUILD) --target bin --output type=local,dest=bin .
+
+# install-local: the built provider in OpenTofu's implied local mirror, so a root naming
+# `source = "norvexlabs/stowage"` and this version installs it with `tofu init`, no registry.
+# The build is linux_amd64. PLUGIN_DIR picks the mirror (default ~/.terraform.d/plugins).
+PLUGIN_DIR ?= $(HOME)/.terraform.d/plugins
+install-local: build ## the provider in OpenTofu's implied local mirror (PLUGIN_DIR), for tofu init without the registry
+	install -D -m 0755 bin/terraform-provider-stowage $(PLUGIN_DIR)/registry.opentofu.org/norvexlabs/stowage/$(VERSION)/linux_amd64/terraform-provider-stowage_v$(VERSION)
+	@echo "installed norvexlabs/stowage $(VERSION) in $(PLUGIN_DIR); after a rebuild, run tofu init -upgrade in each root"
 
 # GoReleaser's image, pinned by digest; its go command runs the Go of GO_VERSION (GOTOOLCHAIN).
 GORELEASER := docker.io/goreleaser/goreleaser:v2.19.0@sha256:b62e651c2fd9e7b1c94133a4e5d131187649e45aeeca137fbf4940f0f654ad08

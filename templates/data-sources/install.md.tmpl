@@ -1,0 +1,39 @@
+---
+page_title: "{{.Name}} {{.Type}} - {{.ProviderName}}"
+subcategory: ""
+description: |-
+{{ .Description | plainmarkdown | trimspace | prefixlines "  " }}
+---
+
+# {{.Name}} ({{.Type}})
+
+{{ .Description | trimspace }}
+
+## Example Usage
+
+{{ tffile .ExampleFile }}
+
+{{ .SchemaMarkdown | trimspace }}
+
+## Details
+
+Reads an install's `status --json` without managing it: a Docker install by the installer it keeps
+(`<work_dir>/<name>/<short_name>-stow status --json`, through the same scripts as the resource's
+read) or a VM by its OS bundle's (`<short_name>-stow status --json`, as the SSH user). Nothing on
+the target changes, and no installer image is fetched: a Kubernetes release, whose read needs one,
+is read by the resource. The read is bounded by 5 minutes. Exactly one of the `docker` and `vm` blocks (`One target`); no install in
+the directory (`No install`) and another project's (`Another project's install`) are errors.
+
+| Argument | | |
+|---|---|---|
+| `name`, `short_name` | required | The project's name (the install directory `<name>/` on Docker; compared with the status's) and the installer's short name, one path element each. |
+| `docker` | block | `host`, `port` (1–65535), `user`, `private_key_file`, `known_hosts_line`, `work_dir` (an absolute, clean path), as the resource's `docker` block (left out, `host` is this machine and `work_dir` the home). |
+| `vm` | block | `host`, `port`, `user`, `private_key_file`, `known_hosts_line` (the VM's own key), as the resource's `vm` block. |
+
+| Attribute | |
+|---|---|
+| `id` | `<work_dir>/<name>` on Docker, `vm:<host>/<short_name>-stow` on a VM. |
+| `installed`, `previous` | `{version, revision, installer}` (`installer` null on a VM); null before the first install, and when the install keeps no release for `rollback`. |
+| `channel`, `status` | As the resource's. |
+| `inputs` | The input keys the install records, sorted, never a value; null when the installer does not tell. |
+| `registry`, `address`, `registry_ca_digest` | What the first install recorded; null when the status gives none. |

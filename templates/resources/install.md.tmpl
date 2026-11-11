@@ -1,0 +1,135 @@
+---
+page_title: "{{.Name}} {{.Type}} - {{.ProviderName}}"
+subcategory: ""
+description: |-
+{{ .Description | plainmarkdown | trimspace | prefixlines "  " }}
+---
+
+# {{.Name}} ({{.Type}})
+
+{{ .Description | trimspace }}
+
+What each operation runs on a target: [Docker](../guides/docker-target.md),
+[Kubernetes](../guides/kubernetes-target.md), [VM](../guides/vm-target.md).
+
+## Example Usage
+
+{{ tffile .ExampleFile }}
+
+{{ .SchemaMarkdown | trimspace }}
+
+## Details
+
+One install on one target: exactly one of the `docker`, `kubernetes` and `vm` blocks (none, or
+two, is an error).
+
+### Arguments
+
+| Attribute | | |
+|---|---|---|
+| `installer` | required with `docker` / `kubernetes`; refused with `vm` | The installer image by digest, `<prefix>/<name>-installer@sha256:<64 hex>` (lower-case hex, no tag beside the digest), as `stowage ship` prints it. An installer carries one release, so the digest is the release. `<name>` is the project's name: `describe` must report the same, or the create is refused. |
+| `inputs` | optional map | Non-secret inputs, each given as `--set KEY=VALUE`. They are on the target's command line and in state. A key is a letter or `_`, then letters, digits or `_`; `tls` is refused (the answers file's reserved section). An input given a non-empty value here that `describe` marks `secret` is refused: at create, and at an update (every key of the map, changed or not) for the running release and the one an upgrade goes to, before anything runs. A key taken out of the map is given empty (`--set KEY=`) to the re-run: the installer's rule for an empty value decides (a required input is refused, an advanced one goes back to its default); a key taken out that `secret_inputs_wo` now holds is not (`--set` would win over its answer), and, given another value than `inputs` gave, needs a new `secret_inputs_wo_version` in the same apply (else a plan error, `an input moved to secret_inputs_wo`, on every target; OpenTofu plans again with the final configuration before an apply, so an apply never sees one). |
+| `secret_inputs_wo` | optional map, **write-only** | Secret inputs, never in plan or state, sent on standard input as an answers file (`--answers`). A key in both maps is refused. |
+| `secret_inputs_wo_version` | optional number | Change it to apply a change of `secret_inputs_wo` (a write-only value is never compared): the update re-sends every secret input the running release declares. Leaving it out with `secret_inputs_wo` set is a warning. |
+| `given_wo` | optional, **write-only** | What another install gives (the installer's `--given` YAML), used at create, on standard input. |
+| `secrets_wo` | optional, **write-only** | A decrypted `secrets export` of a machine made again (`--secrets`), used at create, on standard input. Docker and the VM (one seeded with `stowage_vm_seed`'s `await_secrets`, below); refused with `kubernetes`. |
+| `tls` | optional | The front's TLS mode, `--tls`: `acme`, `dns-cloudflare`, `byo` or `internal`. Left out, loopback mode. A change is given to the re-run (`--tls`); taking it out is a plan error. |
+| `domains` | optional map | Route → domain, `--domains route=host,…` (sorted). A route name is a letter or digit, then letters, digits, `_ . -`; a value holding `,`, `=` or a space is refused. A changed or added route is given to the re-run; taking one out, or adding one while `installer` changes, is a plan error. |
+| `ports` | optional map of numbers | Route → port (1–65535; checked again at apply, for a port computed from another resource), `--ports route=port,…`. A changed port is given to the re-run; when the release changes, a route the new release adds (its `describe` `routes` lists it and the running release's does not) goes to the upgrade's `--ports`, every other to the re-run; taking one out is a plan error. |
+| `address` | optional | The loopback address the routes bind, `--address`. First-install only: a read records the install's (`status --json` `address`) when state names another, or when it was left out and the install binds another than `127.0.0.1`, so the next plan shows the change, a plan error. |
+| `allow_rollback` | default `false` | Lets a change of `installer` to `previous.installer` run the kept installer's `rollback`. Without it, that change is a plan error (and an apply error when `status --json` names it `previous` only at apply). |
+| `deletion_protection` | default `true` | While true, a destroy is refused (`deletion_protection is on`). Set it `false` and apply first. |
+| `delete_data` | default `false` | A destroy runs `uninstall --data` (the volumes deleted) instead of `uninstall` (kept). |
+| `plan_dry_run` | default `false` | On Docker, a plan changing `installer` alone (no re-run of the running release beside it) runs the change's dry run on the target, the step chosen from the install's `status --json` by the apply's own rule (its errors — `a rollback needs allow_rollback`, `installer is another digest of the release installed`, first-install settings the install holds otherwise — at plan, or the apply's alone), so the installer's refusal is a plan error (its reason the summary, its fix the detail): an upgrade's — `sh -c '…' sh <work_dir>` removes the plans' directories older than an hour there, then makes a private (0700) `<work_dir>/.stowage-plan.XXXXXX` beside the install; the new installer is fetched into it (as at create, logged in the same way) and described, the inputs checked as the apply checks them (a secret input in `inputs` refused before anything runs), then `sh ./<name>.sh upgrade --dry-run --no-input --json --dir <work_dir>/<name> [--set K=V]… [--ports]` runs in that directory (what it extracts stays there) with what the upgrade would be given (the inputs, secret inputs as `--answers` and ports the new release adds), and the directory is removed (only a `.stowage-plan.XXXXXX` of the work directory is; a removal that fails is a warning); a rollback's — the inputs checked as for the upgrade (a secret input in `inputs`, and on this machine an input the run's environment sets, refused before anything runs), then the kept installer's `rollback --dry-run --json`, without the inputs' variables as the apply's. A plan that also re-runs the running release gets a warning instead (`No dry run of this plan`: the upgrade runs on what that re-run leaves; told before anything is fetched when the change is the running release's whatever the new one is: TLS, domains, a secret input, an input it declares that the plan gives, a port of a route it has), a rollback with one is `a rollback goes alone` (as at apply, its status's `previous` deciding a rollback); an install gone since its status was read gets a warning too (the apply says what it finds); an input moved to `secret_inputs_wo` without a new version is refused before anything is fetched; one holding a value not known yet, or an install whose home `work_dir` was never resolved (an import's), nothing.  A failure is a plan error too. The fetched image stays in the daemon's store, and the dry run takes the install's lock while it reads it (an apply of the same install meanwhile is refused by it). Opt-in: the plan reaches the target, and OpenTofu plans again at apply, which runs it again. Skipped for an imported state never applied. |
+| `timeouts` | block | `create` (default 30m; it bounds the wait for a first install still `installing`), `read` (5m), `update` (30m), `delete` (15m). A run cut by its timeout is a failure. |
+
+A null value in `inputs`, `secret_inputs_wo`, `domains` or `ports` is refused by its key
+(`<attribute>.<key> is null`); a value not known until apply (an ephemeral variable's, one computed
+from another resource) is not, its key checked when the configuration is validated.
+
+**`docker` block** — the Docker shape.
+
+| Attribute | | |
+|---|---|---|
+| `host` | optional | The Docker host, reached by the system `ssh`. Left out, the install is on the machine running OpenTofu, and `user`, `port`, `private_key_file` and `known_hosts_line` are refused. |
+| `port` | optional | SSH port (1–65535); left out, 22. |
+| `user` | required with `host` | SSH user. A host or user starting with `-` or holding a space is refused. |
+| `private_key_file` | optional | The private key's path; left out, ssh's agent and default keys. |
+| `known_hosts_line` | required with `host` | The host's `known_hosts` line, `host keytype base64` (the host field may be left out, hashed or a pattern: it is replaced). That key alone is accepted. A marker (`@cert-authority`, `@revoked`), an unknown key type, a key that is not base64 or more than one line is refused. |
+| `work_dir` | optional | The directory on the target holding `<name>.sh` and the install directory `<name>/`: an absolute, clean path (no `.` or `..` element, no `//`, no trailing `/`; else refused). Left out, the SSH user's home (locally, OpenTofu's working directory), which the create resolves first into `id`: `$HOME` when it is the directory the run starts in (their physical paths compared), so a home reached through a symbolic link keeps the link's name; else `cd` there and `pwd -L`. First-install only: a plan naming another directory is an error, but naming the home a create resolved (state's `id`) when it was left out changes nothing; taking out a `work_dir` that was given is a change (that home was never resolved). |
+
+**`kubernetes` block** — the Kubernetes shape, on the cluster the provider's `kubernetes` block
+reaches (one cluster per provider configuration: an alias per cluster). Not with the front's
+settings: `tls`, `domains`, `ports`, `address` and `secrets_wo` are refused (`<name> is not
+Kubernetes's`: the chart's ingress owns TLS and routes, and the release keeps its secrets in the
+cluster). On the target, `id` is `<namespace>/<release>`.
+
+| Attribute | | |
+|---|---|---|
+| `namespace` | required | The release's namespace (`--namespace`), a DNS label (lower-case letters, digits and `-`, at most 63 characters; else refused). First-install only. |
+| `release` | optional | The helm release's name (`--release`), a DNS label of at most 53 characters; left out, the project's name, the installer's default. First-install only (the effective name is compared: naming the default changes nothing). |
+| `image_pull_login` | optional bool | Writes the cluster's pull Secret for the mirror from the provider's pull account (`k8s install|upgrade --image-pull-login`), at every install and upgrade: the run gets a Docker configuration of its own (a private temporary directory, removed afterwards) holding `username`'s login to the host of the registry the release pulls from (the one state records, else the provider's `registry`), the password on standard input, never an argument. Opt-in, as the account's credential is then readable by whoever reads the release's Secrets. Turned on alone for an installed release, the update applies the release again (`k8s upgrade --no-input --json --image-pull-login`) to write it; with a rollback, it is refused (`a rollback goes alone`: helm's rollback writes no Secret); turned off, nothing runs and the Secret stays. A plan with it and no `username`, or no provider `registry` (and none recorded), is an error (`image_pull_login needs the pull account`, `… a mirror`); the installer refuses the release's own registry, and a login the nodes cannot pull with. |
+
+**`vm` block** — the Kairos VM shape: a VM its hypervisor's or cloud's own resource made from
+`stowage_vm_seed`, reached over SSH. `installer` is refused with it (the VM's release is
+`vm.version`; its disk carried the first). A destroy (with `deletion_protection` off) forgets the
+resource and runs nothing: removing the VM is its own resource's job.
+
+| Attribute | | |
+|---|---|---|
+| `host` | required | The VM's address (its resource's address output), reached by the system `ssh`. |
+| `port`, `user`, `private_key_file` | | As the `docker` block's; `user` required (the seed's administrator, who runs `sudo -n` without a password). |
+| `known_hosts_line` | required to install | The key the VM serves until the provider has read its own: `stowage_vm_seed`'s `known_hosts_line` (the one-time key) for a VM the provider installs, the VM's own key for an imported one. Checked as the `docker` block's. Left out, a create and an imported state's first apply are refused (`vm.known_hosts_line is required to install`); once `host_key_line` is known it may be left out. |
+| `short_name` | required | `stowage_vm_seed`'s `short_name`: the VM runs `<short_name>-stow`, on its `PATH`. One path element (`[a-z0-9][a-z0-9._-]*`), else refused. First-install only (the VM's installer is its seed's, or the import ID's; an imported state is held to the ID's too): when the VM runs another installer (a release that renamed it, an import under a wrong name), give `vm.known_hosts_line` the VM's own key (`vm.host_key_line` from state while `vm.seed_boot_id` is null — with it set, reboot the VM first —, else the key checked on its console), then `tofu state rm` the resource and import it under the right name. |
+| `version` | required | The release the VM runs. At create, the release the VM's OS carries (`stowage_vm_seed`'s `version`): another is refused before anything changes (`vm.version is not the VM's release`; a create never upgrades). A later change upgrades it, or rolls it back to `previous.version` with `allow_rollback` (below). |
+| `channel` | optional | The channel the VM follows, which its seed's `channel` set. A create (once the install is done, before the VM's key is learnt, saving no state: the next apply goes on from the install) and an imported state's first apply (before anything runs) refuse one other than the VM's (`vm.channel is not the VM's`, naming it; a VM whose status reports no channel: leave it out), as state would record it. First-install only, but for an imported state never applied. |
+| `host_key_line` | computed | The VM's own SSH host key, `<host> ssh-ed25519 <base64>`, read through the one-time key once its first install is done: every later connection accepts it, and it alone once the one-time key is retired. |
+| `seed_boot_id` | computed | Set only when the one-time key's retirement failed: the boot the install finished in, during which the VM still serves that key — or `unread` when the VM reported no boot id, which no read clears. While it is set, a connection also accepts `known_hosts_line`, which a plan refuses to drop (`vm.known_hosts_line is still needed`). It goes null: at a read or an update whose status shows a later boot (which retired the key); after an upgrade's or a rollback's followed reboot; when an update's retirement, tried again, holds — an update without a release change tries it in its first steps, one with a release change whose upgrade or rollback had nothing to do (no reboot) tries it then, unless a retirement already failed earlier in the same apply. Each retry that fails is a warning (`The VM's one-time host key is still not retired`). From the moment it goes null, the update's connection accepts the VM's own key alone. |
+
+With the `vm` block, `secrets_wo` goes to the create's `install --secrets` (on standard input):
+for a VM seeded with `stowage_vm_seed`'s `await_secrets`, whose first install waits for it; on
+a VM whose first install ran, the installer refuses it, and the create fails with its reason. A
+re-run never gives it.
+
+### Attributes read from the target
+
+| Attribute | |
+|---|---|
+| `id` | `<work_dir>/<name>` on Docker (the home resolved when `work_dir` is left out); `<namespace>/<release>` on Kubernetes; `vm:<host>/<short_name>-stow` on a VM. |
+| `short_name` | The installer's short name: a Docker install keeps its installer as `<id>/<short_name>-stow` (`describe`'s at create, then `status --json` `short_name` at each read and update, so a rollback across a release that renamed it finds the one kept); a VM runs its OS bundle's `<short_name>-stow`. |
+| `registry_ca_digest` | `sha256:<hex>` of the registry CA the install keeps (`status --json` `registry_ca`; on Kubernetes, the provider's at the install), null for none. On Docker and the VM a plan whose provider `registry_ca` has another digest (none included) is an error (`the provider's registry_ca is first-install only`), but for an imported state never applied. |
+| `version`, `revision` | The release installed (`status --json` `installed`). |
+| `channel` | The channel the install follows. |
+| `status` | `installed`, `installing` (the first install has not finished; helm's `pending-install` on Kubernetes), `failed: <why>` (`install_failed` on Docker; a latest helm revision neither deployed nor pending on Kubernetes), `pending: <why>` (Kubernetes: helm working on the release), or `not installed`. |
+| `previous` | `{version, revision, installer}`, the release `rollback` returns to; null before an upgrade. |
+| `registry` | The provider's `registry` at the install; null in an imported state until its first apply. |
+
+### Plan-time errors
+
+A change of a first-install-only setting — `docker.work_dir`, `kubernetes.namespace`, the helm
+release (`kubernetes.release`, else the project's name), `address`, `vm.channel`, `vm.short_name`,
+the provider's `registry`, the target block's kind, or the project an `installer` names (an imported
+Docker state: its install directory's name; an imported release's is checked at the first apply)
+— is a plan error naming the old value, never a replacement:
+replacing an install deletes its data.
+
+Also plan errors: `installer` changed to `previous.installer`, or `vm.version` to
+`previous.version`, without `allow_rollback` (`a rollback needs allow_rollback`); `vm.known_hosts_line`
+left out while `vm.seed_boot_id` is set (`vm.known_hosts_line is still needed`); `tls` taken out (`tls cannot be removed`: a re-run has no flag
+for loopback mode); a route taken out of `domains` or `ports` (`domains.<route> cannot be
+removed`); a rollback with any other change of what the target applies (`a rollback goes
+alone`); a route added to `domains` while `installer` changes (known at plan time) (`a domain added with a release
+change`: a route the new release adds takes its domain from its domain input, in `inputs`; one
+the running release has takes it in an apply of its own). A plan changing anything the target
+applies plans `status`, `version`, `revision`, `channel` and `previous` unknown (the update reads
+them after its run, and the target may run another release than state says: changed outside
+OpenTofu since the last refresh); one changing `installer` also `short_name`. On a VM, also
+`vm.seed_boot_id` unknown while it is set, and `vm.host_key_line` and
+`vm.seed_boot_id` unknown while state has no `vm.host_key_line` (the update learns it). An imported
+state's first apply also plans `registry` unknown (it records the provider's).
+
+{{ if .HasImport -}}
+## Import
+
+{{ codefile "shell" .ImportFile }}
+{{- end }}
