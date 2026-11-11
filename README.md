@@ -500,7 +500,8 @@ argument.
      follows (the `vm` block's `channel` row), else an error saving no state.
   5. The one-time key retired by the VM's own verb, `sudo -n <short>-stow host-key --json`
      (Stowage's steps; run again it changes nothing more), whose `known_hosts_line` is the VM's
-     own key: `vm.host_key_line`, `<vm.host> ssh-ed25519 <base64>`. The retirement is then
+     own key: `vm.host_key_line`, `<vm.host> ssh-ed25519 <base64>` (the `vm.host` it was learnt under: a
+     line's host field is never read, the connection naming the key by its alias). The retirement is then
      checked — the verb exits 0 whether or not sshd took its reload — by a connection accepting
      that key alone answering, reading it again (`cat /etc/ssh/ssh_host_ed25519_key.pub`), tried for six
      polls, a minute (`… when its six polls (a minute) ran out`), which also waits out sshd's

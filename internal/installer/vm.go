@@ -298,7 +298,7 @@ func (v VM) RetireHostKey(ctx context.Context) (string, error) {
 	case 1:
 		if bytes.Contains(stderr, []byte("unknown command")) {
 			return "", &FailedError{Verb: "host-key", Exit: exit, Stderr: tail(stderr),
-				Cause: fmt.Errorf("the VM's %s has no host-key verb: its OS carries an installer built before Stowage %s's: move the VM on by hand (`sudo %s upgrade --version V`), the one-time key retired by the reboot after the install meanwhile", ctl, MinStowage, ctl)}
+				Cause: fmt.Errorf("the VM's %s has no host-key verb: its OS carries an installer built before Stowage %s's; the reboot of the next release change retires the one-time key: set vm.version to a release built by Stowage %s or later and apply", ctl, MinStowage, MinStowage)}
 		}
 		return "", &FailedError{Verb: "host-key", Exit: exit, Stderr: tail(stderr)}
 	default:

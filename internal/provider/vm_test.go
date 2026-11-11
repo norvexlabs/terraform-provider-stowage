@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/providerserver"
+	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
 
@@ -1638,5 +1640,60 @@ func TestVMRetireWarnings(t *testing.T) {
 	ap = h3.apply(nil, h3.plan(nil, cfg).PlannedState, cfg)
 	if d := diagText(ap.Diagnostics); !strings.Contains(d, "has no host-key verb") || vmAttr(t, h3, ap.NewState, "host_key_line") != ownLine || vmAttr(t, h3, ap.NewState, "seed_boot_id") == "<null>" {
 		t.Fatalf("no verb: %s %s", d, vmAttr(t, h3, ap.NewState, "host_key_line"))
+	}
+}
+
+// An upgrade with nothing to do retries the retirement after it; a VM serving another key then
+// stops the update with an error, nothing more run, state as before.
+func TestVMUpgradeNothingStopsOnAnotherKey(t *testing.T) {
+	t.Parallel()
+	h, f := newVMHarness(t)
+	f.retireNoop = true
+	cfg := h.vmConfig("1.1.0", nil)
+	a := h.apply(nil, h.plan(nil, cfg).PlannedState, cfg)
+	if vmAttr(t, h, a.NewState, "seed_boot_id") != "boot-1" {
+		t.Fatalf("seed_boot_id %s", vmAttr(t, h, a.NewState, "seed_boot_id"))
+	}
+	f.reset()
+	f.retireNoop = false
+	f.then("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", "")})
+	f.set("status", reply{stdout: vmStatusJSON("1.2.0", "boot-1", "")})
+	f.set("upgrade", reply{stdout: `{"format":1,"result":"nothing","release":{"version":"1.2.0","revision":1}}`})
+	f.set("retire", reply{stdout: `{"format":1,"known_hosts_line":"notes ssh-ed25519 ` + edKey + `","fingerprint":"SHA256:x"}`})
+	up := h.update(a.NewState, h.vmConfig("1.2.0", nil))
+	if got := errorsOf(up.Diagnostics); !strings.Contains(got, "The VM's own host key changed") || !strings.Contains(got, "vm:<host>/<short>-stow") || len(f.callsOf("install")) != 0 {
+		t.Fatalf("got %q, calls %q", got, f.ops())
+	}
+}
+
+// A state line that does not parse is said so, not taken for another key.
+func TestSameKeyAndAMalformedStateLine(t *testing.T) {
+	t.Parallel()
+	if !sameKey("a ssh-ed25519 "+ownKey, "B.example ssh-ed25519 "+ownKey) || sameKey("a ssh-ed25519 "+ownKey, "a ssh-ed25519 "+edKey) {
+		t.Fatal("sameKey")
+	}
+	f := newVMFake()
+	m := installModel{VM: &vmModel{Host: types.StringValue("192.0.2.7"), User: types.StringValue("ops"), KnownHostsLine: types.StringValue(seedLine), ShortName: types.StringValue("notes")}}
+	r := &installResource{data: &Data{NewRunner: f.factory, Poll: time.Millisecond}}
+	v, err := r.vm(&m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.retire(context.Background(), &m, v, "192.0.2.7", types.StringValue("not a line")); err == nil || !strings.Contains(err.Error(), "state's vm.host_key_line") || errors.Is(err, errOtherKey) {
+		t.Fatalf("%v", err)
+	}
+}
+
+// A create whose timeout runs out during host-key reads nothing more on the dead context, and its
+// warning names the fix.
+func TestVMRetireCutByTheTimeout(t *testing.T) {
+	t.Parallel()
+	h, f := newVMHarness(t)
+	f.set("retire", reply{stderr: hang})
+	cfg := h.vmConfig("1.1.0", map[string]tftypes.Value{"timeouts": h.block("timeouts", map[string]tftypes.Value{"create": str("300ms")})})
+	a := h.apply(nil, h.plan(nil, cfg).PlannedState, cfg)
+	d := diagText(a.Diagnostics)
+	if !strings.Contains(d, "The VM's own host key was not read") || !strings.Contains(d, "ssh-keygen -lf") || strings.Contains(d, "reading it alone") {
+		t.Fatalf("%s, calls %q", d, f.ops())
 	}
 }
