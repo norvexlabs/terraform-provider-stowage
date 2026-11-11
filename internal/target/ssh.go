@@ -30,6 +30,9 @@ type SSH struct {
 	KeyFile string
 	// KnownHostsLine is the host's known_hosts line (`[host] keytype base64`).
 	KnownHostsLine string
+	// AlsoKnownHostsLines are other keys the host may serve, accepted as KnownHostsLine is: a
+	// VM's own key beside the one-time key it serves until its next reboot.
+	AlsoKnownHostsLines []string
 	// Binary is the ssh program; empty is "ssh" from PATH.
 	Binary string
 	// ConnectTimeout in seconds; 0 is 30.
@@ -134,8 +137,15 @@ func (s SSH) Validate() error {
 	if s.Port < 0 || s.Port > 65535 {
 		return fmt.Errorf("ssh: port %d is out of range", s.Port)
 	}
-	_, err := ParseKnownHostsLine(s.KnownHostsLine)
-	return err
+	if _, err := ParseKnownHostsLine(s.KnownHostsLine); err != nil {
+		return err
+	}
+	for _, l := range s.AlsoKnownHostsLines {
+		if _, err := ParseKnownHostsLine(l); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ValidateHostUser refuses a host or user ssh would misread: empty, starting with '-', or
@@ -160,13 +170,18 @@ func (s SSH) Run(ctx context.Context, argv []string, stdin []byte) ([]byte, []by
 		return nil, nil, -1, err
 	}
 	key, _ := ParseKnownHostsLine(s.KnownHostsLine)
+	keys := key.KnownHostsFile()
+	for _, l := range s.AlsoKnownHostsLines {
+		k, _ := ParseKnownHostsLine(l)
+		keys += k.KnownHostsFile()
+	}
 	dir, err := os.MkdirTemp("", "stowage-ssh-")
 	if err != nil {
 		return nil, nil, -1, fmt.Errorf("ssh: known_hosts: %w", err)
 	}
 	defer os.RemoveAll(dir)
 	kh := filepath.Join(dir, "known_hosts")
-	if err := os.WriteFile(kh, []byte(key.KnownHostsFile()), 0o600); err != nil {
+	if err := os.WriteFile(kh, []byte(keys), 0o600); err != nil {
 		return nil, nil, -1, fmt.Errorf("ssh: known_hosts: %w", err)
 	}
 	full := s.Argv(kh, ShellJoin(argv))

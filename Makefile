@@ -8,7 +8,7 @@ DOCKER_GO  := docker run --rm --memory 4g -u $(shell id -u):$(shell id -g) -e HO
               -e GOMODCACHE=/cache/mod -e GOFLAGS=-trimpath -v $(GOCACHE_DIR):/cache -v $(CURDIR):/src -w /src
 GO         := $(DOCKER_GO) golang:$(GO_VERSION)-bookworm
 
-.PHONY: all check build release-check test hooks-test fmt tidy docs shell hooks clean
+.PHONY: all check build release-check test hooks-test acc-vm fmt tidy docs shell hooks clean
 
 all: check build
 
@@ -33,6 +33,9 @@ test: | $(GOCACHE_DIR)             ## fast loop: unit tests only, no race detect
 
 hooks-test:       ## the hooks' branches (test/hooks.sh), on this machine; make check runs it too
 	bash test/hooks.sh
+
+acc-vm: build     ## the VM target against a real VM on TrueNAS: STOWAGE_VM_ENV=<file> [STOWAGE_REPO=<dir>] make acc-vm
+	bash test/acc-vm.sh
 
 fmt: | $(GOCACHE_DIR)              ## rewrite sources with gofmt
 	$(GO) gofmt -w .

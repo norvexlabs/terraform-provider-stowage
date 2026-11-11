@@ -1,0 +1,281 @@
+package installer
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/norvexlabs/terraform-provider-stowage/internal/target"
+)
+
+// VM drives an install on a Kairos VM over SSH: `<Short>-stow` is on the VM's PATH, carried by its
+// OS bundle, and runs the release that OS carries. The verbs that change the install run as root
+// (`sudo -n`, never asking a password); the reads run as the SSH user, in the admin group.
+type VM struct {
+	Runner target.Runner
+	Short  string
+}
+
+// SSHFailure is the exit status ssh gives for its own failure (no connection, a host key
+// refused) — or the remote program's own 255.
+const SSHFailure = 255
+
+func (v VM) ctl() (string, error) {
+	if !ValidShortName(v.Short) {
+		return "", fmt.Errorf("vm.short_name %q is not an installer's short name (stowage_vm_seed's short_name)", v.Short)
+	}
+	return v.Short + "-stow", nil
+}
+
+// Describe runs the VM's `<short>-stow describe --json`: the release its OS carries.
+func (v VM) Describe(ctx context.Context) (*Describe, error) {
+	ctl, err := v.ctl()
+	if err != nil {
+		return nil, err
+	}
+	stdout, stderr, exit, err := v.Runner.Run(ctx, []string{ctl, "describe", "--json"}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("describe: %w", err)
+	}
+	if exit != 0 {
+		return nil, describeFailed("describe", exit, stderr)
+	}
+	return ParseDescribe(stdout)
+}
+
+// CtlScript says whether its argument is a command the VM's shell finds (POSIX `command -v`):
+// exit 0 found, 1 not.
+const CtlScript = `command -v "$1" >/dev/null || exit 1`
+
+// HasCtl says whether the VM's shell finds <Short>-stow — the OS bundle's /usr/sbin/<short>-stow
+// — whatever its language or the message a missing program printed.
+func (v VM) HasCtl(ctx context.Context) (bool, error) {
+	ctl, err := v.ctl()
+	if err != nil {
+		return false, err
+	}
+	_, stderr, exit, err := v.Runner.Run(ctx, []string{"sh", "-c", CtlScript, "sh", ctl}, nil)
+	switch {
+	case err != nil:
+		return false, fmt.Errorf("looking for %s: %w", ctl, err)
+	case exit == 0:
+		return true, nil
+	case exit == 1:
+		return false, nil
+	}
+	return false, &FailedError{Verb: "looking for " + ctl, Exit: exit, Stderr: tail(stderr)}
+}
+
+// VMStatus is the VM's `status --json`: the fields of every shape, and the boot's.
+type VMStatus struct {
+	Status
+	// OS is the release the OS carries.
+	OS *Release `json:"os"`
+	// Boot is the system Kairos booted: active, passive (the fallback) or recovery.
+	Boot     string `json:"boot"`
+	Fallback bool   `json:"fallback"`
+	// OnTrial: the boot runs an upgrade's new system, which the health gate has not judged yet.
+	OnTrial bool `json:"on_trial"`
+	// FailedBoot is the last boot the health gate found unhealthy.
+	FailedBoot    *FailedBoot `json:"failed_boot"`
+	RebootPending bool        `json:"reboot_pending"`
+	// BootID is the kernel's id of this boot: it changes at every reboot. Empty when the VM
+	// cannot read it.
+	BootID string `json:"boot_id"`
+}
+
+// FailedBoot is a boot the health gate found unhealthy: the release it ran, when, why, and why
+// the gate kept it when going back was refused.
+type FailedBoot struct {
+	Release Release `json:"release"`
+	At      string  `json:"at"`
+	Reason  string  `json:"reason"`
+	Kept    string  `json:"kept"`
+}
+
+// Same says whether f and g name the same failed boot (both nil included).
+func (f *FailedBoot) Same(g *FailedBoot) bool {
+	if f == nil || g == nil {
+		return f == g
+	}
+	return f.Release == g.Release && f.At == g.At && f.Reason == g.Reason && f.Kept == g.Kept
+}
+
+// ParseVMStatus reads the VM's `status --json`.
+func ParseVMStatus(b []byte) (*VMStatus, error) {
+	const doc = "status --json"
+	var s VMStatus
+	if err := decodeOne(doc, b, &s); err != nil {
+		return nil, err
+	}
+	if err := checkFormat(doc, s.Format); err != nil {
+		return nil, err
+	}
+	if s.Name == "" {
+		return nil, fmt.Errorf("%s: no name", doc)
+	}
+	for field, r := range map[string]*Release{"installed": s.Installed, "previous": s.Previous, "os": s.OS} {
+		if err := r.check(doc, field); err != nil {
+			return nil, err
+		}
+	}
+	if s.FailedBoot != nil {
+		if err := s.FailedBoot.Release.check(doc, "failed_boot.release"); err != nil {
+			return nil, err
+		}
+	}
+	return &s, nil
+}
+
+// Status runs the VM's `<short>-stow status --json`.
+func (v VM) Status(ctx context.Context) (*VMStatus, error) {
+	ctl, err := v.ctl()
+	if err != nil {
+		return nil, err
+	}
+	stdout, stderr, exit, err := v.Runner.Run(ctx, []string{ctl, "status", "--json"}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("status: %w", err)
+	}
+	if exit != 0 {
+		return nil, &FailedError{Verb: "status", Exit: exit, Stderr: tail(stderr)}
+	}
+	return ParseVMStatus(stdout)
+}
+
+// VMInstall is what the VM's `install` is given: a first install, or its re-run.
+type VMInstall struct {
+	Change
+	Given   string // --given, a file on standard input
+	Secrets string // --secrets, a file on standard input
+}
+
+// Install runs `sudo -n <short>-stow install --no-input --json` on the VM: its first install, or
+// the re-run of the install it holds. The secret inputs (an answers file), the given material
+// and a secrets export reach it as files on standard input, in a private directory removed
+// afterwards (RunScript); nothing secret is on its command line.
+func (v VM) Install(ctx context.Context, in VMInstall) (*Result, error) {
+	ctl, err := v.ctl()
+	if err != nil {
+		return nil, err
+	}
+	args, files, err := changeArgs(in.Change, "sudo", "-n", ctl, "install", "--no-input", "--json")
+	if err != nil {
+		return nil, err
+	}
+	for name, val := range map[string]string{"given": in.Given, "secrets": in.Secrets} {
+		if val != "" {
+			files[name] = val
+		}
+	}
+	names, stdin, err := filesInput(files)
+	if err != nil {
+		return nil, err
+	}
+	stdout, stderr, exit, err := v.Runner.Run(ctx, append([]string{"sh", "-c", RunScript, "sh", ".", names}, args...), stdin)
+	if err != nil {
+		return nil, fmt.Errorf("install: %w", err)
+	}
+	return Outcome("install", stdout, stderr, exit)
+}
+
+// ErrCut is a verb whose SSH connection was lost before it printed its result (exit 255 and no
+// result object): an upgrade or a rollback may have scheduled its reboot, which status tells.
+var ErrCut = errors.New("the connection ended before the result")
+
+// Upgrade runs `sudo -n <short>-stow upgrade --version version --yes --json`: the job ends as it
+// schedules the reboot, so the result's release is the one installed before it.
+func (v VM) Upgrade(ctx context.Context, version string) (*Result, error) {
+	if version == "" || strings.HasPrefix(version, "-") || strings.ContainsAny(version, " \t\r\n") {
+		return nil, fmt.Errorf("vm.version %q is not a version", version)
+	}
+	return v.rebooting(ctx, "upgrade", "upgrade", "--version", version, "--yes", "--json")
+}
+
+// Rollback runs `sudo -n <short>-stow rollback --yes --json`: the reboot into the passive
+// system, back to the release the last upgrade replaced.
+func (v VM) Rollback(ctx context.Context) (*Result, error) {
+	return v.rebooting(ctx, "rollback", "rollback", "--yes", "--json")
+}
+
+func (v VM) rebooting(ctx context.Context, verb string, args ...string) (*Result, error) {
+	ctl, err := v.ctl()
+	if err != nil {
+		return nil, err
+	}
+	stdout, stderr, exit, err := v.Runner.Run(ctx, append([]string{"sudo", "-n", ctl}, args...), nil)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", verb, err)
+	}
+	if exit == SSHFailure && len(strings.TrimSpace(string(stdout))) == 0 {
+		return nil, fmt.Errorf("%s: %w (%s)", verb, ErrCut, tail(stderr))
+	}
+	return Outcome(verb, stdout, stderr, exit)
+}
+
+// HostKey reads the VM's own ed25519 host key, `ssh-ed25519 <base64>`, through the connection,
+// whose pinned key vouches for it: the key the VM serves alone once its one-time key retired.
+func (v VM) HostKey(ctx context.Context) (string, error) {
+	stdout, stderr, exit, err := v.Runner.Run(ctx, []string{"cat", "/etc/ssh/ssh_host_ed25519_key.pub"}, nil)
+	if err != nil {
+		return "", fmt.Errorf("reading the VM's host key: %w", err)
+	}
+	if exit != 0 {
+		return "", &FailedError{Verb: "reading the VM's host key", Exit: exit, Stderr: tail(stderr)}
+	}
+	f := strings.Fields(string(stdout))
+	if len(f) < 2 || f[0] != "ssh-ed25519" {
+		return "", fmt.Errorf("reading the VM's host key: no ed25519 key in %q", tail(stdout))
+	}
+	line := f[0] + " " + f[1]
+	if _, err := target.ParseKnownHostsLine(line); err != nil {
+		return "", fmt.Errorf("reading the VM's host key: %w", err)
+	}
+	return line, nil
+}
+
+// Boot runs `sudo -n systemctl start <name>.service`: the VM's boot unit (`<short>-stow boot`),
+// which returns once that boot did its part — loaded the release's images, made the first install
+// from the cloud-config's settings or found it waiting, or wrote another release's OS and
+// rebooted (the connection then ends, exit 255). It is what `vm create` runs before it gives an
+// install over SSH, so the two never run at once (the install's lock refuses the second).
+func (v VM) Boot(ctx context.Context, name string) error {
+	if !ValidName(name) {
+		return fmt.Errorf("%q is not a project's name", name)
+	}
+	_, stderr, exit, err := v.Runner.Run(ctx, []string{"sudo", "-n", "systemctl", "start", name + ".service"}, nil)
+	if err != nil {
+		return fmt.Errorf("the VM's boot unit: %w", err)
+	}
+	if exit != 0 {
+		return &FailedError{Verb: "starting the VM's boot unit " + name + ".service", Exit: exit, Stderr: tail(stderr)}
+	}
+	return nil
+}
+
+// RetireScript retires a VM's one-time host key as `vm create` does once the install took what it
+// gave over SSH, by the files Stowage's README names: the key and its sshd drop-in removed, its
+// retirement marked on the OEM partition (no later boot serves it again), sshd reloaded.
+// Argument: the project's name.
+const RetireScript = `set -eu
+n=$1
+rm -f "/run/$n-seed-host-key" "/etc/ssh/sshd_config.d/01-$n-seed-host-key.conf"
+touch "/oem/$n-seed-host-key.retired"
+for u in ssh.service sshd.service; do systemctl try-reload-or-restart "$u" 2>/dev/null || true; done
+`
+
+// RetireSeed runs RetireScript as root on the VM.
+func (v VM) RetireSeed(ctx context.Context, name string) error {
+	if !ValidName(name) {
+		return fmt.Errorf("%q is not a project's name", name)
+	}
+	_, stderr, exit, err := v.Runner.Run(ctx, []string{"sudo", "-n", "sh", "-c", RetireScript, "sh", name}, nil)
+	if err != nil {
+		return fmt.Errorf("retiring the one-time host key: %w", err)
+	}
+	if exit != 0 {
+		return &FailedError{Verb: "retiring the one-time host key", Exit: exit, Stderr: tail(stderr)}
+	}
+	return nil
+}

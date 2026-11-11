@@ -15,14 +15,15 @@ installer's machine interface and decides nothing itself. A finished item is del
 3. **Kubernetes target** (P2): `k8s install|upgrade|uninstall --json` run locally (kubeconfig
    and context, helm ≥ 3.14, kubectl, a linux/amd64 runner); the installer fetched locally by
    digest; `k8s upgrade --given -` for a recorded input; no `secrets_wo` (refuse it).
-4. **`stowage_vm_seed` and the VM target** (P3): the seed as a managed resource (`vm seed --json`,
-   the one-time host key's private key in state until the install), the VM's `install --set`,
-   `upgrade --version V --yes` followed by the reboot (a new `boot_id`, the trial over,
-   `installed` the target; a fallback or a failed boot an error saving the release that runs).
+4. **Run `make acc-vm`** (written, never run): `stowage_vm_seed` and the VM target against a real
+   VM on TrueNAS with Stowage ≥ 0.34.0 — the seed, the module's VM, the first install over SSH
+   under the one-time key, the own key read, a re-run, an upgrade and its reboot, the rollback,
+   the destroy. Fix what it finds; until then the VM target is proven by unit tests alone.
 5. **Docs** (P4): `make docs` (tfplugindocs) into `docs/` from the schema and `examples/`; needs a
    way to give tfplugindocs OpenTofu's schema instead of downloading Terraform.
 6. **Acceptance scripts against `tofu`** (P4): sshd + Docker-in-Docker for the Docker target,
-   kind for Kubernetes, one TrueNAS VM; run in Docker like the gates, with a memory cap.
+   kind for Kubernetes (the VM's is `test/acc-vm.sh`, item 4); run in Docker like the gates, with
+   a memory cap.
 7. **First release** (P5): the public repository `norvexlabs/terraform-provider-stowage`, created
    by the maintainer with the org's GitHub App and its ruleset (pushes as the app only, like
    Stowage); a GPG key for the release (`GPG_FINGERPRINT`); a release workflow (GoReleaser
@@ -30,9 +31,6 @@ installer's machine interface and decides nothing itself. A finished item is del
 
 ## Should
 
-- **A flaky test**: `TestCreateWaitsForTheFirstInstall` failed once in `make check` on a loaded
-  host and passed on the re-run; its 20ms create timeout races the fake's status loop. Scale it
-  with an unexported unit, as the test rules ask.
 - **A short name changed across releases**: state's `short_name` is the running release's after
   a rollback, and the kept `*-stow` fallback runs only when `<short>-stow` is missing; with both
   files left the stale one runs. Re-derive the short name after a rollback (or ask Stowage to
@@ -65,6 +63,32 @@ installer's machine interface and decides nothing itself. A finished item is del
 - **A create over an existing install records the configuration's first-install-only settings**
   (`address`, the provider's `registry`) though the install keeps its own: state may name values
   never applied. Ask Stowage to report them in `status --json`, and compare.
+
+- **Blocked on Stowage — what the VM target asks of it** (the provider fills none with a rule of
+  its own; each is asked of Stowage):
+  - **A verb that retires the one-time host key** and prints the VM's own key (e.g. `sudo
+    <short>-stow seed-key retire --json` → `{known_hosts_line}`), or `install --json`'s result
+    doing it at the install's end, as `vm create` does over its pinned SSH. Until then the
+    provider runs the steps README documents (the key's file and drop-in removed, the `.retired`
+    mark, sshd reloaded): a copy of that rule, to drop once the verb exists.
+  - **`vm seed --secrets-awaited`** (the settings file's `await_secrets: true`): a first boot that
+    waits for a secrets export, so the VM target can take `secrets_wo` as DESIGN § 13 says
+    (Docker and the VM). Until then it is refused on the VM — a departure from DESIGN § 13.
+  - **A seed whose first install waits for TLS material** (`vm seed --tls byo`, the cloud-config
+    marking the wait as `vm create`'s given mark does): today the first boot installs in another
+    mode and `given_wo`'s certificate moves it to `byo` after.
+  - **`meta_data` in `vm seed --json`**: the NoCloud `instance-id` and `local-hostname` Stowage
+    writes, for a hypervisor that builds its own seed (libvirt's `libvirt_cloudinit_disk`,
+    Proxmox's `cicustom`); the example's `seed-iso.sh` writes them itself.
+  - **The disk as a file, and its size**: a verb that fetches `disk[<platform>]` to a file and
+    prints its path and SHA-256, and `os_gib` (what Kairos takes of the VM's disk) in `vm seed
+    --json`; the example reads them from the documented artifact form (oras, zstd, the
+    `dev.stowage.disk.os-mib` annotation).
+  - **A cloud's image** in `vm seed --json`: the image ID `ship` registered (`cloud_publish`) per
+    cloud platform, which `aws_instance`, `google_compute_instance`… boot.
+  - **`vm seed`'s refusal as an object**: exit 3 prints the reason on stderr alone, so the fix
+    Stowage chose (the platforms the registry offers) never reaches a program; ask for the verbs'
+    `{format, result, refused: {reason, fix}}` on its stdout.
 
 ## Could
 

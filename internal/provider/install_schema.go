@@ -79,6 +79,9 @@ type vmModel struct {
 	KnownHostsLine types.String `tfsdk:"known_hosts_line"`
 	Version        types.String `tfsdk:"version"`
 	Channel        types.String `tfsdk:"channel"`
+	ShortName      types.String `tfsdk:"short_name"`
+	HostKeyLine    types.String `tfsdk:"host_key_line"`
+	SeedBootID     types.String `tfsdk:"seed_boot_id"`
 }
 
 func sshAttributes(hostDesc string) map[string]schema.Attribute {
@@ -113,9 +116,7 @@ func installSchema(ctx context.Context) schema.Schema {
 		Optional:            true,
 		MarkdownDescription: "The directory on the target holding `<name>.sh` and the install directory `<name>/`; left out, the SSH user's home (or OpenTofu's working directory, locally). First-install only.",
 	}
-	vm := sshAttributes("The Kairos VM, reached over SSH by the system `ssh` binary; required in this block.")
-	vm["version"] = schema.StringAttribute{Optional: true, MarkdownDescription: "The release the VM runs; required in this block."}
-	vm["channel"] = schema.StringAttribute{Optional: true, MarkdownDescription: "The channel the VM follows. First-install only."}
+	vm := vmAttributes()
 
 	computedString := func(desc string) schema.StringAttribute {
 		return schema.StringAttribute{Computed: true, MarkdownDescription: desc,
@@ -123,7 +124,7 @@ func installSchema(ctx context.Context) schema.Schema {
 	}
 	return schema.Schema{
 		MarkdownDescription: "One install of a Stowage product on one target: a Docker host, a Kubernetes cluster or a Kairos VM. " +
-			"Exactly one of the `docker`, `kubernetes` and `vm` blocks. Only the Docker target installs in this release.",
+			"Exactly one of the `docker`, `kubernetes` and `vm` blocks.",
 		Attributes: map[string]schema.Attribute{
 			"id": computedString("`<work_dir>/<name>` on the target."),
 			"installer": schema.StringAttribute{
@@ -154,7 +155,7 @@ func installSchema(ctx context.Context) schema.Schema {
 			"secrets_wo": schema.StringAttribute{
 				Optional:            true,
 				WriteOnly:           true,
-				MarkdownDescription: "A decrypted `secrets export` of a machine made again (the installer's `--secrets`), write-only, used at create, on standard input. Docker and the VM.",
+				MarkdownDescription: "A decrypted `secrets export` of a machine made again (the installer's `--secrets`), write-only, used at create, on standard input. Docker only: a seed cannot make a VM's first boot wait for it.",
 			},
 			"tls": schema.StringAttribute{
 				Optional:            true,
@@ -215,7 +216,7 @@ func installSchema(ctx context.Context) schema.Schema {
 				},
 			},
 			"vm": schema.SingleNestedBlock{
-				MarkdownDescription: "The Kairos VM shape, reached over SSH. Not yet implemented: the schema only.",
+				MarkdownDescription: "The Kairos VM shape, reached over SSH: a VM its hypervisor's or cloud's resource made from `stowage_vm_seed`. `sudo -n <short_name>-stow install|upgrade|rollback --json` and `<short_name>-stow status|describe --json` run on it; destroying the resource forgets it, removing the VM is its own resource's job.",
 				Attributes:          vm,
 			},
 			"timeouts": timeouts.Block(ctx, timeouts.Opts{Create: true, Read: true, Update: true, Delete: true}),

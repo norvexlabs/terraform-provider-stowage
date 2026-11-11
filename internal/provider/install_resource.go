@@ -103,10 +103,7 @@ func (r *installResource) ValidateConfig(ctx context.Context, req resource.Valid
 		}
 	}
 	if m.VM != nil {
-		validateSSH(path.Root("vm"), m.VM.Host, m.VM.User, m.VM.KnownHostsLine, m.VM.PrivateKeyFile, m.VM.Port, false, &resp.Diagnostics)
-		if m.VM.Version.IsNull() {
-			resp.Diagnostics.AddAttributeError(path.Root("vm").AtName("version"), "vm.version is required", "Give the release the VM runs.")
-		}
+		validateVM(&m, &resp.Diagnostics)
 	}
 	if m.Kubernetes != nil && m.Kubernetes.Namespace.IsNull() {
 		resp.Diagnostics.AddAttributeError(path.Root("kubernetes").AtName("namespace"), "kubernetes.namespace is required", "Give the namespace the release lives in.")
@@ -211,11 +208,15 @@ func targetKind(m *installModel) string {
 // and replacing an install deletes its data, so a change is a plan-time error, never a
 // replacement.
 func firstInstallOnly(diags *diag.Diagnostics, p path.Path, name, was, now string) {
+	firstInstallOnlyFix(diags, p, name, was, now, fmt.Sprintf("A re-run cannot change it, and a new install would delete this one's data: set it back to %q, or move the install by hand and then `tofu state rm` this resource.", was))
+}
+
+// firstInstallOnlyFix is firstInstallOnly's refusal with its own fix.
+func firstInstallOnlyFix(diags *diag.Diagnostics, p path.Path, name, was, now, fix string) {
 	if was == now {
 		return
 	}
-	diags.AddAttributeError(p, name+" is first-install only",
-		fmt.Sprintf("%s was %q at the install and is now %q. A re-run cannot change it, and a new install would delete this one's data: set it back to %q, or move the install by hand and then `tofu state rm` this resource.", name, was, now, was))
+	diags.AddAttributeError(p, name+" is first-install only", fmt.Sprintf("%s was %q at the install and is now %q. %s", name, was, now, fix))
 }
 
 func (r *installResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
@@ -241,7 +242,12 @@ func (r *installResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 	if !imported(&state) && (known(plan.Address) || plan.Address.IsNull()) {
 		firstInstallOnly(&resp.Diagnostics, path.Root("address"), "address", state.Address.ValueString(), plan.Address.ValueString())
 	}
-	if plan.VM != nil && state.VM != nil && !plan.VM.Channel.IsUnknown() {
+	// The VM's installer is its seed's, or the import ID's: no other is run.
+	if plan.VM != nil && state.VM != nil && known(plan.VM.ShortName) {
+		shortNameFixed(&resp.Diagnostics, state.VM.ShortName.ValueString(), plan.VM.ShortName.ValueString())
+	}
+	// An imported state does not know the VM's channel: the first apply records the configuration's.
+	if plan.VM != nil && state.VM != nil && !plan.VM.Channel.IsUnknown() && !imported(&state) {
 		firstInstallOnly(&resp.Diagnostics, path.Root("vm").AtName("channel"), "vm.channel", state.VM.Channel.ValueString(), plan.VM.Channel.ValueString())
 	}
 	if known(plan.Installer) && (known(state.Installer) || imported(&state)) {
@@ -250,6 +256,7 @@ func (r *installResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 		firstInstallOnly(&resp.Diagnostics, path.Root("installer"), "the installer's project", was, now)
 	}
 	r.planRollback(ctx, &plan, &state, &resp.Diagnostics)
+	planVM(ctx, &plan, &state, resp)
 	planRemovals(ctx, &plan, &state, &resp.Diagnostics)
 	if r.data != nil && r.data.RegistryKnown && known(state.Registry) {
 		firstInstallOnly(&resp.Diagnostics, path.Root("registry"), "the provider's registry", state.Registry.ValueString(), r.data.Registry)
@@ -258,9 +265,17 @@ func (r *installResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 	switch {
 	case !plan.Installer.Equal(state.Installer) || imported(&state):
 		unknowns = []string{"version", "revision", "channel", "status", "previous", "short_name"}
+		if imported(&state) {
+			unknowns = append(unknowns, "registry") // the first apply records the provider's
+		}
+	case plan.VM != nil && len(remoteChange(&plan, &state)) > 0:
+		// The update reads the release after its run, and the VM may run another than state
+		// says (a refresh skipped).
+		unknowns = []string{"version", "revision", "channel", "status", "previous"}
 	case len(remoteChange(&plan, &state)) > 0:
 		unknowns = []string{"status"} // a re-run may finish a first install that failed
 	}
+
 	if len(unknowns) > 0 {
 		for _, a := range unknowns {
 			var unknown attr.Value
@@ -435,7 +450,7 @@ func (r *installResource) Create(ctx context.Context, req resource.CreateRequest
 		notYet(&resp.Diagnostics, "The Kubernetes target")
 		return
 	case "vm":
-		notYet(&resp.Diagnostics, "The VM target")
+		r.createVM(ctx, req, resp)
 		return
 	}
 	timeout, diags := m.Timeouts.Create(ctx, createTimeout)
@@ -572,8 +587,12 @@ func (r *installResource) fetchDescribe(ctx context.Context, d installer.Docker,
 // settle reads the install until its first install is over (done, or failed): every Poll, within
 // ctx's deadline (the create timeout).
 func (r *installResource) settle(ctx context.Context, d installer.Docker) (*installer.Status, error) {
+	timedOut := fmt.Errorf("%s/%s is still installing when the create timeout ran out (timeouts.create): apply again once status --json no longer reports installing", d.WorkDir, d.Name)
 	for {
 		st, err := d.Status(ctx)
+		if err != nil && ctx.Err() != nil {
+			return nil, timedOut // the deadline cut the read
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -585,7 +604,7 @@ func (r *installResource) settle(ctx context.Context, d installer.Docker) (*inst
 		}
 		select {
 		case <-ctx.Done():
-			return nil, fmt.Errorf("%s/%s is still installing when the create timeout ran out (timeouts.create): apply again once status --json no longer reports installing", d.WorkDir, d.Name)
+			return nil, timedOut
 		case <-time.After(r.data.Poll):
 		}
 	}
@@ -648,8 +667,15 @@ func applyStatus(m *installModel, st *installer.Status, read bool) {
 func (r *installResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
 	var m installModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &m)...)
-	if resp.Diagnostics.HasError() || m.Docker == nil {
-		return // only the Docker target is created, so only it is read
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if m.VM != nil {
+		r.readVM(ctx, &m, resp)
+		return
+	}
+	if m.Docker == nil {
+		return // the Kubernetes target is not created yet, so not read
 	}
 	if known(m.Docker.Host) && m.Docker.KnownHostsLine.IsNull() {
 		return // an imported state: the configuration gives the connection, at the first apply
@@ -743,7 +769,7 @@ func (r *installResource) Update(ctx context.Context, req resource.UpdateRequest
 		notYet(&resp.Diagnostics, "The Kubernetes target")
 		return
 	case "vm":
-		notYet(&resp.Diagnostics, "The VM target")
+		r.updateVM(ctx, req, resp, &plan, &state)
 		return
 	}
 	timeout, diags := plan.Timeouts.Update(ctx, updateTimeout)
@@ -1108,6 +1134,10 @@ func portMap(ctx context.Context, m types.Map, diags *diag.Diagnostics) map[stri
 // <name>/<short>-stow`: the target and the install's directory. The configuration gives the
 // connection and the rest at the first apply, which reconfigures the install with it.
 func (r *installResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
+	if id, ok := strings.CutPrefix(req.ID, "vm:"); ok {
+		r.importVM(ctx, id, resp)
+		return
+	}
 	host, work, name, short, err := parseImportID(req.ID)
 	if err != nil {
 		resp.Diagnostics.AddError("Import ID", err.Error())

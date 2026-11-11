@@ -196,7 +196,7 @@ func TestSSHRunWritesPinnedKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := SSH{Host: "h", User: "u", KnownHostsLine: "h ssh-ed25519 " + edKey, Binary: fake}
-	out, _, exit, err := s.Run(context.Background(), []string{"echo", "a b"}, []byte("secret-on-stdin"))
+	out, _, exit, err := runScript(s, []string{"echo", "a b"}, []byte("secret-on-stdin"))
 	if err != nil || exit != 0 {
 		t.Fatalf("exit %d err %v", exit, err)
 	}
@@ -207,5 +207,43 @@ func TestSSHRunWritesPinnedKey(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Dir(path)); !os.IsNotExist(err) {
 		t.Fatalf("known_hosts directory %s left behind: %v", path, err)
+	}
+}
+
+// Run pins the other keys the host may serve beside the first, each under the alias, and refuses
+// one that does not parse before any connection.
+func TestSSHRunPinsEveryKey(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "ssh")
+	script := "#!/bin/sh\nfor a; do case $a in UserKnownHostsFile=*) cat \"${a#UserKnownHostsFile=}\";; esac; done\n"
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	other := "AAAAC3NzaC1lZDI1NTE5AAAAIA6m3nbmS3rbQ6jH1gm8K07n6l9Tqv9c0vY2pY6J6oTd"
+	s := SSH{Host: "h", User: "u", KnownHostsLine: "h ssh-ed25519 " + edKey, AlsoKnownHostsLines: []string{"vm-seed-host-key ssh-ed25519 " + other}, Binary: fake}
+	out, _, _, err := runScript(s, []string{"true"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := HostKeyAlias + " ssh-ed25519 " + edKey + "\n" + HostKeyAlias + " ssh-ed25519 " + other + "\n"; string(out) != want {
+		t.Fatalf("known_hosts %q, want %q", out, want)
+	}
+	s.AlsoKnownHostsLines = []string{"@revoked * ssh-ed25519 " + other}
+	if _, _, _, err := s.Run(context.Background(), []string{"true"}, nil); err == nil {
+		t.Fatal("a marker line among the other keys is taken")
+	}
+}
+
+// runScript runs s, whose Binary is a script the test just wrote, again while exec reports it busy
+// (ETXTBSY): a parallel test's fork may hold the descriptor the script was written through until
+// its own exec closes it.
+func runScript(s SSH, argv []string, stdin []byte) ([]byte, []byte, int, error) {
+	for i := 0; ; i++ {
+		out, errOut, exit, err := s.Run(context.Background(), argv, stdin)
+		if err == nil || !strings.Contains(err.Error(), "text file busy") || i == 50 {
+			return out, errOut, exit, err
+		}
+		time.Sleep(time.Millisecond)
 	}
 }

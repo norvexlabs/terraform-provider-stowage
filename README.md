@@ -23,14 +23,17 @@ and exit status): it decides nothing the installer does not decide, orders no ve
 copy of a rule.
 
 **Status: pre-release (0.1.0, unreleased).** What works: the Docker target — create, read,
-update (inputs, then the release: upgrade or rollback), import and delete. Not yet: the plan-time
-dry run, the Kubernetes and VM targets, `stowage_vm_seed` — see [TODO.md](TODO.md). Not yet
+update (inputs, then the release: upgrade or rollback), import and delete; the VM target and
+`stowage_vm_seed` — the same operations on a Kairos VM a hypervisor's or cloud's resource made from
+the seed. Not yet: the plan-time dry run, the Kubernetes target — see [TODO.md](TODO.md). Not yet
 proven against a real installer (unit tests drive the verbs' results as Stowage prints them).
 
 - Provider address: `registry.opentofu.org/norvexlabs/stowage`, plugin protocol 6.
 - Needs **OpenTofu ≥ 1.11** (write-only attributes), and for a remote target the system `ssh`
   binary, OpenSSH ≥ 8.5 (`KnownHostsCommand`), on the machine running OpenTofu. The target needs
-  a POSIX `sh`, `tar`, `mktemp` and Docker.
+  a POSIX `sh`, `tar`, `mktemp` and Docker; a VM, those of its OS bundle and `sudo` without a
+  password for its SSH user (the bundle's admin group). `stowage_vm_seed` runs the installer on
+  the machine running OpenTofu: there, Docker and a linux/amd64 machine.
 - Reads installers made by **Stowage 0.34.0 or later** (machine interface format 1).
 
 ## Example
@@ -84,7 +87,7 @@ two, is an error).
 | `secret_inputs_wo` | optional map, **write-only** | Secret inputs, never in plan or state, sent on standard input as an answers file (`--answers`). A key in both maps is refused. |
 | `secret_inputs_wo_version` | optional number | Change it to apply a change of `secret_inputs_wo` (a write-only value is never compared): the update re-sends every secret input the running release declares. Leaving it out with `secret_inputs_wo` set is a warning. |
 | `given_wo` | optional, **write-only** | What another install gives (the installer's `--given` YAML), used at create, on standard input. |
-| `secrets_wo` | optional, **write-only** | A decrypted `secrets export` of a machine made again (`--secrets`), used at create, on standard input. |
+| `secrets_wo` | optional, **write-only** | A decrypted `secrets export` of a machine made again (`--secrets`), used at create, on standard input. Docker only: refused with `vm` (below). |
 | `tls` | optional | The front's TLS mode, `--tls`: `acme`, `dns-cloudflare`, `byo` or `internal`. Left out, loopback mode. A change is given to the re-run (`--tls`); taking it out is a plan error. |
 | `domains` | optional map | Route → domain, `--domains route=host,…` (sorted). A route name is a letter or digit, then letters, digits, `_ . -`; a value holding `,`, `=` or a space is refused. A changed or added route is given to the re-run; taking one out, or adding one while `installer` changes, is a plan error. |
 | `ports` | optional map of numbers | Route → port (1–65535), `--ports route=port,…`. A changed port is given to the re-run; a route state does not record goes to the upgrade's `--ports` when the release changes (taken as a route the release adds: set the port of a route the running release has in an apply of its own), else to the re-run; taking one out is a plan error. |
@@ -108,16 +111,32 @@ two, is an error).
 **`kubernetes` block** — schema only (`kubeconfig`, `context`, `namespace` required, `release`):
 a create is refused, `The Kubernetes target is not implemented yet`.
 
-**`vm` block** — schema only (`host` required, `port`, `user` and `known_hosts_line` required,
-`private_key_file`, `version` required, `channel` first-install only): a create is refused, `The VM
-target is not implemented yet`. A destroy (with `deletion_protection` off) forgets the resource:
-removing the VM is its hypervisor resource's job.
+**`vm` block** — the Kairos VM shape: a VM its hypervisor's or cloud's own resource made from
+`stowage_vm_seed`, reached over SSH. `installer` is refused with it (the VM's release is
+`vm.version`; its disk carried the first). A destroy (with `deletion_protection` off) forgets the
+resource and runs nothing: removing the VM is its own resource's job.
+
+| Attribute | | |
+|---|---|---|
+| `host` | required | The VM's address (its resource's address output), reached by the system `ssh`. |
+| `port`, `user`, `private_key_file` | | As the `docker` block's; `user` required (the seed's administrator, who runs `sudo -n` without a password). |
+| `known_hosts_line` | required to install | The key the VM serves until the provider has read its own: `stowage_vm_seed`'s `known_hosts_line` (the one-time key) for a VM the provider installs, the VM's own key for an imported one. Checked as the `docker` block's. Left out, a create and an imported state's first apply are refused (`vm.known_hosts_line is required to install`); once `host_key_line` is known it may be left out. |
+| `short_name` | required | `stowage_vm_seed`'s `short_name`: the VM runs `<short_name>-stow`, on its `PATH`. One path element (`[a-z0-9][a-z0-9._-]*`), else refused. First-install only (the VM's installer is its seed's, or the import ID's; an imported state is held to the ID's too): when the VM runs another installer (a release that renamed it, an import under a wrong name), give `vm.known_hosts_line` the VM's own key (`vm.host_key_line` from state while `vm.seed_boot_id` is null — with it set, reboot the VM first —, else the key checked on its console), then `tofu state rm` the resource and import it under the right name. |
+| `version` | required | The release the VM runs. At create, the release the VM's OS carries (`stowage_vm_seed`'s `version`): another is refused before anything changes (`vm.version is not the VM's release`; a create never upgrades). A later change upgrades it, or rolls it back to `previous.version` with `allow_rollback` (below). |
+| `channel` | optional | The channel the VM follows, which its seed's `channel` set. A create (once the install is done, before the VM's key is learnt, saving no state: the next apply goes on from the install) and an imported state's first apply (before anything runs) refuse one other than the VM's (`vm.channel is not the VM's`, naming it; a VM whose status reports no channel: leave it out), as state would record it. First-install only, but for an imported state never applied. |
+| `host_key_line` | computed | The VM's own SSH host key, `<host> ssh-ed25519 <base64>`, read through the one-time key once its first install is done: every later connection accepts it, and it alone once the one-time key is retired. |
+| `seed_boot_id` | computed | Set only when the one-time key's retirement failed: the boot the install finished in, during which the VM still serves that key — or `unread` when the VM reported no boot id, which no read clears. While it is set, a connection also accepts `known_hosts_line`, which a plan refuses to drop (`vm.known_hosts_line is still needed`). It goes null: at a read or an update whose status shows a later boot (which retired the key); after an upgrade's or a rollback's followed reboot; when an update's retirement, tried again, holds — an update without a release change tries it in its first steps, one with a release change whose upgrade or rollback had nothing to do (no reboot) tries it then, unless a retirement already failed earlier in the same apply. Each retry that fails is a warning (`The VM's one-time host key is still not retired`). From the moment it goes null, the update's connection accepts the VM's own key alone. |
+
+`secrets_wo` is refused with the `vm` block (`secrets_wo on a VM`): a seed cannot make the VM's
+first boot wait for a secrets export, so the boot installs with new secrets and an install's
+re-run takes no `--secrets`. Make a VM again from an export with `<short>-stow vm create
+--secrets FILE`, or install it without `secrets_wo` and `restore` a backup.
 
 ### Attributes read from the target
 
 | Attribute | |
 |---|---|
-| `id` | `<work_dir>/<name>`. |
+| `id` | `<work_dir>/<name>`; on a VM `vm:<host>/<short_name>-stow`. |
 | `short_name` | The installer's short name (`describe` `short_name`): the install keeps its installer as `<id>/<short_name>-stow`. |
 | `version`, `revision` | The release installed (`status --json` `installed`). |
 | `channel` | The channel the install follows. |
@@ -213,29 +232,145 @@ the remote shell; nothing secret is ever an argument.
   then `<short>-stow uninstall --yes --no-input --json [--data] --dir ./<name>`. An install
   directory already gone is success, and runs nothing.
 
+### What each operation runs on a VM target
+
+`<short>-stow` is the VM's own (its OS bundle's, on its `PATH`): the reads run as the SSH user
+(`<short>-stow describe --json`, `<short>-stow status --json`), the changes as root without a
+password (`sudo -n <short>-stow install|upgrade|rollback … --json`). Files go on standard input
+into a private (0700) temporary directory removed afterwards, as on Docker; nothing secret is an
+argument.
+
+- **Create** (every step under `vm.known_hosts_line`, the one-time key):
+  1. The first boot, as `vm create` waits for it, tried again every 10 seconds within the create
+     timeout (`the VM's first boot had not settled … when the timeout ran out`, with the last
+     error): `describe --json` (ssh failing, exit 255, while the VM boots; no `<short>-stow` on the
+     VM — any failure but ssh's, the VM's shell then not finding it (`command -v`) — is an error on
+     `vm.short_name`, `The VM has no
+     <short>-stow`, asking for `stowage_vm_seed`'s; another failure is an error at once), then `sudo -n systemctl start <name>.service`, the VM's boot unit, which
+     returns once that boot did its part (loaded the release's images, made the first install or
+     found it waiting, or wrote another release's OS and rebooted: ssh's exit 255, tried again) —
+     so the provider's install never runs beside the boot's, which the install's lock would
+     refuse; any other failure of the unit goes on to the install, which finishes what it left or
+     says why not —, then `status --json` (tried again while it fails: the VM's daemon may answer
+     after sshd), neither on the `recovery` system nor with `reboot_pending`, and `describe --json`
+     again, the same release (else the OS changed under the boot: read again; ssh failing, tried
+     again; another failure, an error at once). Its shapes must include `kairos` when it lists any.
+  2. `vm.version` must be that release (`vm.version is not the VM's release`, naming it): a create
+     installs the release the VM's OS carries and never upgrades, as an upgrade failing there
+     would leave a created object OpenTofu replaces. An input given a non-empty value that
+     `describe` marks `secret` is refused. Neither runs anything.
+  3. `sudo -n <short>-stow install --no-input --json [--set K=V]… [--tls] [--domains] [--ports]`,
+     with `secret_inputs_wo` as `--answers` and `given_wo` as `--given` on standard input: the
+     first install (from the settings the seed's cloud-config wrote), or the re-run of the one the
+     first boot made — the installer decides, and refuses what a re-run does not take (exit 3,
+     the diagnostic).
+  4. `status --json` until it no longer reports `installing` (a read that fails is tried again);
+     an `install_failed`, or no release installed, is an error saving no state (apply again: the
+     install runs again and finishes). Then `vm.channel`, when given, must be the channel the VM
+     follows (the `vm` block's `channel` row), else an error saving no state.
+  5. `cat /etc/ssh/ssh_host_ed25519_key.pub` through the one-time key, which vouches for it:
+     `vm.host_key_line`. A failure is a warning (`The VM's own host key was not read`): the
+     connection keeps accepting `known_hosts_line` alone, which the VM's next boot retires.
+  6. The one-time key retired as `vm create` retires it, by the files Stowage's README names:
+     `sudo -n sh -c '…' sh <name>` removes `/run/<name>-seed-host-key` and
+     `/etc/ssh/sshd_config.d/01-<name>-seed-host-key.conf`, touches
+     `/oem/<name>-seed-host-key.retired` and reloads sshd; then a connection accepting the VM's own
+     key alone reads it again, tried for six polls, a minute (`… when its six polls (a minute) ran
+     out`). A failure is a warning (`The VM's
+     one-time host key was not retired`), and `vm.seed_boot_id` is set: the one-time key is
+     accepted beside the VM's own until a later boot.
+- **Read**: `status --json`; one that finds no `<short>-stow` on the VM (a release that renamed its installer) names the route to take the install over, as an update's read does: the VM's own key in `vm.known_hosts_line` (state's `vm.host_key_line`; with `vm.seed_boot_id` set, reboot the VM first, which retires its one-time key; else the key checked on its console), then `tofu state rm` and `tofu import` under the new name. It counts as missing when the run fails (any exit but ssh's 255: shells give a missing command 127, tcsh 1) and the VM's shell does not find `<short>-stow` either (`sh -c 'command -v <short>-stow'`, whatever the shell's language): a program the installer runs missing is not it. A check that itself fails is said (`could not be checked`). The first boot's wait stops at once on it too. No release installed and no first install running or failed removes
+  the resource from state (the next apply installs again). The release the VM runs replaces
+  `vm.version` in state, so a VM whose health gate fell back shows its real release and the next
+  plan proposes the upgrade again; `inputs` are dropped as on Docker. An imported state (no
+  `known_hosts_line` yet) is not read.
+- **Update**: a change of the provider's own settings alone is saved without touching the VM.
+  Otherwise, in this order:
+  1. `status --json` (no release installed is an error; no `<short>-stow` on the VM is the Read
+     step's rename route) and `describe --json` (the running release).
+     The refusals that need no change come first: a rollback without `allow_rollback`, a secret
+     input in `inputs`, a rollback with other changes, an imported state's `vm.channel` other than
+     the VM's (`vm.channel is not the VM's`), and a release change on a status without `boot_id`
+     (`The VM reports no boot_id`: its reboot could not be followed). Then the keys,
+     before anything else changes on the VM: when state has no `vm.host_key_line` yet (it could
+     not be read at create; an imported state), the VM's own key is learnt under the
+     configuration's key as at create (steps 5 and 6: read, the one-time key retired and the
+     retirement proved, else `vm.seed_boot_id` set); when `vm.seed_boot_id` is set (a retirement
+     that failed), it is null at once when the status shows a later boot (which retired the key),
+     left to the reboot of a release change, and else tried again — null on success, a warning
+     (`The VM's one-time host key is still not retired`) on failure. Either is saved at once, with
+     the configuration's connection, whatever fails after it. A release change whose own key could not be read is an error
+     before anything else runs (`The VM's own host key is not known`): its reboot would retire
+     the key the connection accepts.
+  2. The release to reach: none when the plan does not change `vm.version` (a VM that runs
+     another release than state says — a refresh skipped — is the next refresh's to show), nor
+     when `installed.version` is `vm.version`; `rollback` when it is `previous.version` (with
+     `allow_rollback`, else an error); else `upgrade --version`.
+  3. The **re-run**, `sudo -n <short>-stow install --no-input --json …`, when there is anything to
+     give: the changed and added inputs the running release declares (every one without an
+     upgrade), the inputs taken out that it declares (`--set KEY=`), the secret inputs on a new
+     `secret_inputs_wo_version`, the changed `tls`, and the changed `domains` and `ports` (added
+     ones too without an upgrade). When a release change follows, state is saved here, the release
+     unchanged.
+  4. The **upgrade**: `sudo -n <short>-stow upgrade --version <vm.version> --yes --json`, which
+     ends as it schedules the VM's reboot (an ssh cut with no result, exit 255, is taken as that
+     reboot beginning); or the **rollback**, `sudo -n <short>-stow rollback --yes --json`, alone (a
+     change of inputs, secret inputs, TLS mode, domains or ports with it is an error, `a rollback
+     goes alone`). The VM's upgrade takes no input.
+  5. The reboot followed: `status --json` every 10 seconds (ssh failing meanwhile) until its
+     `boot_id` is another than before and `on_trial` is false (the health gate judged the new
+     boot), within the update timeout. A status without `boot_id` is an error (the reboot cannot
+     be followed). When the VM then runs another release than `vm.version`, or its `failed_boot`
+     is a new one of that release (a boot the gate kept, as going back was refused), it is an
+     error naming the gate's reason — `The VM's health gate found <v>'s boot unhealthy: <reason>`,
+     then that it went back to the release it runs, or the kept boot's reason — and state saves
+     the release the VM runs, so the next plan proposes the change again.
+  6. After an upgrade, `describe --json` of the new release, then the re-run again with what it
+     adds: the inputs and secret inputs the old release did not declare, and the `domains` and
+     `ports` of routes state does not record. An input given a non-empty value the new release
+     marks `secret` is refused there, before the re-run (state saves the release the VM runs, and
+     not that input). Then `status --json` fills the computed attributes (one that cannot be read
+     keeps the status read after the reboot, with the error); `seed_boot_id` is null (the reboot
+     retired the one-time key). After the reboot was followed, an error — the new release's
+     describe, its re-run — saves the release the VM runs and the inputs applied; a reboot not
+     followed in time leaves state as step 3 saved it (the release before the upgrade), the next
+     refresh reading the one the VM runs.
+- **Import**: `tofu import stowage_install.x 'vm:<host>/<short>-stow'` (`ls /usr/sbin/*-stow`
+  on the VM); give `vm.known_hosts_line` the VM's own key. State records `vm.host`,
+  `vm.short_name` and `deletion_protection = true`; the first apply runs the update above with
+  every configured input, as on Docker.
+- **Delete**: refused while `deletion_protection`; else nothing runs: the resource is forgotten.
+
 ### Plan-time errors
 
-A change of a first-install-only setting — `docker.work_dir`, `address`, `vm.channel`, the
+A change of a first-install-only setting — `docker.work_dir`, `address`, `vm.channel`, `vm.short_name`, the
 provider's `registry`, the target block's kind, or the project an `installer` names (an imported
 state: its install directory's name) — is a plan error naming the old value, never a replacement:
 replacing an install deletes its data.
 
-Also plan errors: `installer` changed to `previous.installer` without `allow_rollback` (`a
-rollback needs allow_rollback`); `tls` taken out (`tls cannot be removed`: a re-run has no flag
+Also plan errors: `installer` changed to `previous.installer`, or `vm.version` to
+`previous.version`, without `allow_rollback` (`a rollback needs allow_rollback`); `vm.known_hosts_line`
+left out while `vm.seed_boot_id` is set (`vm.known_hosts_line is still needed`); `tls` taken out (`tls cannot be removed`: a re-run has no flag
 for loopback mode); a route taken out of `domains` or `ports` (`domains.<route> cannot be
 removed`); a rollback with any other change of what the target applies (`a rollback goes
 alone`); a route added to `domains` while `installer` changes (known at plan time) (`a domain added with a release
 change`: a route the new release adds takes its domain from its domain input, in `inputs`; one
 the running release has takes it in an apply of its own). A plan changing anything the target applies plans `status` unknown; one changing
-`installer` also `version`, `revision`, `channel`, `previous` and `short_name`.
+`installer` also `version`, `revision`, `channel`, `previous` and `short_name`; one changing
+`vm.version` also `version`, `revision`, `channel` and `previous`. On a VM, one changing anything
+it applies plans those unknown too (the update reads the release after its run), and
+`vm.seed_boot_id` unknown while it is set, and `vm.host_key_line` and
+`vm.seed_boot_id` unknown while state has no `vm.host_key_line` (the update learns it). An imported
+state's first apply also plans `registry` unknown (it records the provider's).
 
 ### The machine interface, as read
 
 - A verb (install and re-run, `upgrade`, `rollback`, `uninstall`) runs with `--json`: its
   standard output is one object, `{format, result, release, refused}`; its text goes to standard
   error. Every verb runs after a `describe --json` of the installer it runs (the fetched one, or
-  the kept one), so an installer without the machine interface is stopped there: a failed
-  `describe` says that an installer made by Stowage before 0.34.0 has none.
+  the kept one), so an installer without the machine interface is stopped there: a `describe`
+  exiting 1 (cobra's unknown command, as such an installer answers) says that an installer made
+  by Stowage before 0.34.0 has none; another exit says nothing of the installer's age.
 - The installer's exit status:
   - **0** with the object, `result` `done` or `nothing`, no `refused`: success. State is then what
     `status --json` reads (`nothing` — the install already runs that release — changes nothing).
@@ -260,7 +395,7 @@ the running release has takes it in an apply of its own). A plan changing anythi
 
 The system `ssh` runs with `BatchMode=yes`, `StrictHostKeyChecking=yes`, a private 0600
 `known_hosts` file (in a 0700 temporary directory, removed after the run) holding the given key
-under `HostKeyAlias=stowage-target`, `GlobalKnownHostsFile=/dev/null`, `KnownHostsCommand=none`,
+(on a VM, the keys it may serve: see `vm.seed_boot_id`) under `HostKeyAlias=stowage-target`, `GlobalKnownHostsFile=/dev/null`, `KnownHostsCommand=none`,
 `CheckHostIP=no`, `UpdateHostKeys=no`, `VerifyHostKeyDNS=no` (no SSHFP record trusted),
 `ControlMaster=no` and `ControlPath=none` (no connection another ssh opened is reused),
 `ConnectTimeout=30`, and with a key file `IdentitiesOnly=yes`. The user's `~/.ssh/config` still
@@ -270,6 +405,56 @@ A run cut by its timeout kills the local `ssh` (or, on this machine, the shell),
 10 seconds for its output to close; so does a program that exited while one it started holds
 the output, which keeps its exit status. It does not stop the program on the target: an install or
 upgrade cut there goes on, and the installer refuses another run until it ends.
+
+## Resource `stowage_vm_seed`
+
+A new Kairos VM's first-boot material: `vm seed --json` of the release an installer carries, run
+once on the machine running OpenTofu. Its one-time SSH host key would change at every plan from a
+data source, so it is a managed resource **generated once**: every argument forces a new seed
+(and so a new VM, whose resource reads `user_data`). Read and destroy run nothing.
+
+**Create**: `docker run --rm <installer> > <name>.sh` in a private temporary directory removed
+afterwards (logged in with the provider's `username`/`password` as on a Docker target), its
+`describe --json` (`name` compared with the image's, shapes must include `kairos` when it lists
+any), then `sh <name>.sh vm seed --json --platform=<platform> [--flag=value]… [--set K=V]…
+[--registry=<provider registry>]`, the SSH key and the provider's `registry_ca` as `--ssh-key` and
+`--registry-ca` files on standard input. The installer refuses (exit 3, the diagnostic's summary
+its error) a `platform` the registry holds no disk for, naming those it offers, and a secret input
+in `inputs`; it fails (exit 1) when the registry cannot be read.
+
+| Argument | | |
+|---|---|---|
+| `installer` | required | The installer by digest, as `stowage_install`'s. |
+| `platform` | required | `--platform`: `truenas`, `proxmox`, `libvirt`, `vmware`, `hyperv`, `azure`, `gcp`, `aws`, `scaleway` or `metal`. |
+| `hostname`, `user`, `channel` | optional | `--hostname`, `--user` (the administrator, who logs in over SSH and runs `sudo`), `--channel` (the first install's). |
+| `ssh_public_key` | optional | The administrator's public key, e.g. `file("~/.ssh/id_ed25519.pub")` (`--ssh-key`, as a file). Left out, the installer's default key of the machine running OpenTofu. |
+| `network`, `address`, `gateway`, `dns` | optional | `--network dhcp\|static`, its static address, gateway and DNS servers. |
+| `ipv6`, `address6`, `gateway6` | optional | `--ipv6`, `--address6`, `--gateway6`. |
+| `tune_profile` | optional | `--tune-profile`: `default` or `network`. |
+| `ssh_allow` | optional list | `--ssh-allow`, one CIDR each (a comma or space is refused). |
+| `timezone`, `device` | optional | `--timezone`; `--device` (`metal`). |
+| `add_hosts`, `interfaces` | optional maps | `--add-host NAME=IP`, `--interface ROLE=SPEC`. |
+| `tls` | optional | `--tls`: `acme`, `dns-cloudflare` or `internal`. `byo` is refused at plan time (`a seed carries no certificate`): seed with another mode, and give the certificate in `stowage_install`'s `given_wo` (its `tls` section), which the VM's first `install --given` takes, moving the front to `byo`. |
+| `domains` | optional map | `--domains route=host,…`. |
+| `http_port`, `https_port` | optional | `--http-port`, `--https-port` (1–65535). |
+| `inputs` | optional map | Non-secret inputs, `--set KEY=VALUE`: in the cloud-config and in state. A secret input goes to `stowage_install`'s `secret_inputs_wo`, given over SSH once the VM answers. |
+| `timeouts` | block | `create` (default 10m). |
+
+| Attribute | |
+|---|---|
+| `id`, `fingerprint` | The one-time host key's SHA256 fingerprint, as ssh prints it. |
+| `name`, `short_name` | The project's name; the installer's short name, for `stowage_install`'s `vm.short_name`. |
+| `version`, `revision` | The release the seed's disk boots first. |
+| `user_data` | **sensitive** — the cloud-config for `platform` (a NoCloud seed's `user-data`, or a cloud's user data): no secret input, but the one-time host key's private key. |
+| `known_hosts_line` | The one-time key as a `known_hosts` line under `vm-seed-host-key`, for `stowage_install`'s `vm.known_hosts_line`. |
+| `host_key_private` | **sensitive** — the one-time key's OpenSSH private key, which the VM serves until its install and the reboot after it. |
+| `disk` | Map, per platform the registry holds a disk for, of `{format, image}`: the disk it boots, by digest. |
+| `waiting` | The required secret inputs nothing gives, sorted: the VM's first install waits for them (`secret_inputs_wo`). |
+
+The private key is in state (in `user_data` and `host_key_private`) until it retires: encrypt
+state. What the seed does not give a hypervisor yet — a NoCloud `meta-data`, the disk as a file,
+the size the OS takes of the disk — is in [TODO.md](TODO.md); the
+[TrueNAS example](examples/resources/stowage_vm_seed/resource.tf) runs Stowage's own steps for it.
 
 ## Build
 

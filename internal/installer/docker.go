@@ -190,7 +190,7 @@ func (d Docker) Describe(ctx context.Context) (*Describe, error) {
 		return nil, fmt.Errorf("describe: %w", err)
 	}
 	if exit != 0 {
-		return nil, &FailedError{Verb: "describe", Exit: exit, Stderr: tail(stderr), Cause: errOldInstaller}
+		return nil, describeFailed("describe", exit, stderr)
 	}
 	return ParseDescribe(stdout)
 }
@@ -284,6 +284,16 @@ func (d Docker) stow(ctx context.Context, files map[string]string, withDir bool,
 	return d.Runner.Run(ctx, argv, stdin)
 }
 
+// describeFailed is a describe that exited non-zero: on exit 1 — cobra's unknown command, as an
+// installer without the machine interface answers — it names the Stowage release that has it.
+func describeFailed(verb string, exit int, stderr []byte) *FailedError {
+	f := &FailedError{Verb: verb, Exit: exit, Stderr: tail(stderr)}
+	if exit == 1 {
+		f.Cause = errOldInstaller
+	}
+	return f
+}
+
 // errOldInstaller is what a failed describe tells besides its error: every verb runs after a
 // describe, so an installer without the machine interface stops there, before a verb is given
 // --json.
@@ -317,7 +327,7 @@ func (d Docker) KeptDescribe(ctx context.Context) (*Describe, error) {
 		return nil, nil
 	}
 	if exit != 0 {
-		return nil, &FailedError{Verb: "describe (the installer the install keeps)", Exit: exit, Stderr: tail(stderr), Cause: errOldInstaller}
+		return nil, describeFailed("describe (the installer the install keeps)", exit, stderr)
 	}
 	return ParseDescribe(stdout)
 }

@@ -24,6 +24,8 @@ type Connection struct {
 	User           string
 	KeyFile        string
 	KnownHostsLine string
+	// AlsoKnownHostsLines are other keys the host may serve (target.SSH's).
+	AlsoKnownHostsLines []string
 }
 
 // RunnerFactory gives the Runner that reaches a target.
@@ -34,7 +36,7 @@ func DefaultRunner(c Connection) (target.Runner, error) {
 	if c.Host == "" {
 		return target.Local{}, nil
 	}
-	s := target.SSH{Host: c.Host, Port: c.Port, User: c.User, KeyFile: c.KeyFile, KnownHostsLine: c.KnownHostsLine}
+	s := target.SSH{Host: c.Host, Port: c.Port, User: c.User, KeyFile: c.KeyFile, KnownHostsLine: c.KnownHostsLine, AlsoKnownHostsLines: c.AlsoKnownHostsLines}
 	if err := s.Validate(); err != nil {
 		return nil, err
 	}
@@ -145,7 +147,7 @@ func (p *stowageProvider) Configure(ctx context.Context, req provider.ConfigureR
 }
 
 func (p *stowageProvider) Resources(context.Context) []func() resource.Resource {
-	return []func() resource.Resource{newInstallResource}
+	return []func() resource.Resource{newInstallResource, newSeedResource}
 }
 
 func (p *stowageProvider) DataSources(context.Context) []func() datasource.DataSource {
