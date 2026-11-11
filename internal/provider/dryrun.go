@@ -72,7 +72,8 @@ func (r *installResource) planDryRun(ctx context.Context, req resource.ModifyPla
 		return
 	}
 	if running == nil {
-		return // the install went since status read it: the apply says so
+		diags.AddWarning("No dry run of this plan", "The install went since its status was read: the apply says what it finds.")
+		return
 	}
 	secrets := stringMap(ctx, secretsWO, diags)
 	u := &update{r: r, plan: plan, state: state, secrets: secrets, diags: diags}
@@ -105,7 +106,7 @@ func (r *installResource) planDryRun(ctx context.Context, req resource.ModifyPla
 			return installer.Docker{}, false
 		}
 		if certainRerun(plan, running, certain) {
-			noDryRun(diags)
+			noDryRun(diags, false)
 			return installer.Docker{}, false
 		}
 		var err error
@@ -121,19 +122,21 @@ func (r *installResource) planDryRun(ctx context.Context, req resource.ModifyPla
 	if diags.HasError() {
 		return
 	}
-	switch step {
-	case stay:
+	if step == stay {
 		return
-	case rollback:
-		// As the apply: the inputs checked, and a rollback goes alone.
-		rerun, _ := u.split(ctx, running, nil)
-		refuseSecretInputs(diags, stringMap(ctx, plan.Inputs, diags), running, nil)
-		if d.Local() {
-			refuseRunEnvInputs(diags, nil, "", stringMap(ctx, plan.Inputs, diags), secrets)
-		}
-		if diags.HasError() {
-			return
-		}
+	}
+	// As the apply: the inputs checked (next nil for a rollback), then a rollback goes alone and
+	// an upgrade beside a re-run is not dry-run.
+	rerun, up := u.split(ctx, running, next)
+	given := stringMap(ctx, plan.Inputs, diags)
+	refuseSecretInputs(diags, given, running, next)
+	if d.Local() {
+		refuseRunEnvInputs(diags, nil, "", given, secrets)
+	}
+	if diags.HasError() {
+		return
+	}
+	if step == rollback {
 		if !rerun.Empty() {
 			rollbackAlone(diags, "inputs, secret inputs, TLS, domains or ports")
 			return
@@ -143,16 +146,8 @@ func (r *installResource) planDryRun(ctx context.Context, req resource.ModifyPla
 		}
 		return
 	}
-	rerun, up := u.split(ctx, running, next)
-	refuseSecretInputs(diags, stringMap(ctx, plan.Inputs, diags), running, next)
-	if d.Local() {
-		refuseRunEnvInputs(diags, nil, "", stringMap(ctx, plan.Inputs, diags), secrets)
-	}
-	if diags.HasError() {
-		return
-	}
 	if !rerun.Empty() {
-		noDryRun(diags)
+		noDryRun(diags, true)
 		return
 	}
 	if _, err := d.Without(running, next).DryRunUpgrade(ctx, dir, up); err != nil {
@@ -184,9 +179,14 @@ func certainRerun(plan *installModel, running *installer.Describe, c installer.C
 	return false
 }
 
-func noDryRun(diags *diag.Diagnostics) {
-	diags.AddWarning("No dry run of this plan",
-		"The plan also re-runs the running release (inputs, secret inputs, TLS, domains or ports it declares): the upgrade runs on the install that re-run leaves, which a dry run cannot show, and the new installer is not read (what only it tells — another digest of the release installed — is the apply's to say). Apply the re-run alone first to have the upgrade dry-run.")
+// noDryRun is the warning of a plan whose upgrade comes after a re-run: read says whether the new
+// installer was read (else what only it tells is the apply's to say).
+func noDryRun(diags *diag.Diagnostics, read bool) {
+	detail := "The plan also re-runs the running release (inputs, secret inputs, TLS, domains or ports it declares): the upgrade runs on the install that re-run leaves, which a dry run cannot show."
+	if !read {
+		detail += " The new installer is not read either: what only it tells (another digest of the release installed) is the apply's to say."
+	}
+	diags.AddWarning("No dry run of this plan", detail+" Apply the re-run alone first to have the upgrade dry-run.")
 }
 
 // wholyKnown says whether v and every element in it are known.

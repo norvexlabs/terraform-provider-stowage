@@ -124,12 +124,12 @@ func TestPlanDryRunAgreesWithTheApply(t *testing.T) {
 	}
 }
 
-// Round six: the rollback the status names goes alone, as at apply (a port of a route the running
+// The rollback the status names goes alone, as at apply (a port of a route the running
 // release has is the re-run's); it runs without the inputs' variables, as the apply's; a
 // first-install setting the install holds otherwise is the apply's error at plan; a port of an
 // existing route beside an upgrade is told before anything is fetched; a release already
 // running asks nothing.
-func TestPlanDryRunRoundSix(t *testing.T) {
+func TestPlanDryRunRollbackAndReRuns(t *testing.T) {
 	t.Parallel()
 	statusPrev := `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1,"installer":"` + image + `"},"channel":"stable",` +
 		`"previous":{"version":"2.0.0","revision":1,"installer":"` + image2 + `"},"inputs":["ADMIN_EMAIL"]}`
@@ -171,7 +171,7 @@ func TestPlanDryRunRoundSix(t *testing.T) {
 	}
 }
 
-// Round seven: a rollback's dry run checks the inputs as the apply does before reaching the
+// A rollback's dry run checks the inputs as the apply does before reaching the
 // target (a secret input in inputs is refused, nothing run).
 func TestPlanDryRunRollbackChecksTheInputs(t *testing.T) {
 	t.Parallel()
@@ -192,5 +192,43 @@ func TestPlanDryRunRollbackChecksTheInputs(t *testing.T) {
 	if got := errorsOf(h.plan(state, h.dockerConfig(map[string]tftypes.Value{"installer": str(image2), "plan_dry_run": boolean(true), "allow_rollback": boolean(true),
 		"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})})).Diagnostics); got != "" {
 		t.Fatalf("gone: %q", got)
+	}
+}
+
+// Locally, a rollback's dry run refuses an input the run's environment sets, as the apply does.
+func TestPlanDryRunRollbackRunEnv(t *testing.T) {
+	t.Setenv("HTTPS_PROXY", "http://proxy.example:3128") // a variable the local run keeps
+	h := newHarness(t, nil)
+	local := func(extra map[string]tftypes.Value) tftypes.Value {
+		vals := map[string]tftypes.Value{"docker": h.block("docker", map[string]tftypes.Value{"work_dir": str("/srv")})}
+		for k, v := range extra {
+			vals[k] = v
+		}
+		return h.dockerConfig(vals)
+	}
+	state := h.create(local(nil))
+	h.fake.reset()
+	h.fake.set("status", reply{stdout: `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1,"installer":"` + image + `"},"channel":"stable",` +
+		`"previous":{"version":"2.0.0","revision":1,"installer":"` + image2 + `"},"inputs":[]}`})
+	h.fake.set("kept-describe", reply{stdout: strings.Replace(describe1, `{"key":"LEGACY"}`, `{"key":"LEGACY"},{"key":"HTTPS_PROXY"}`, 1)})
+	got := errorsOf(h.plan(state, local(map[string]tftypes.Value{"installer": str(image2), "plan_dry_run": boolean(true), "allow_rollback": boolean(true),
+		"inputs": strMap(map[string]string{"HTTPS_PROXY": "http://other:1"})})).Diagnostics)
+	if !strings.Contains(got, "comes from the environment") || len(h.fake.callsOf("dry-rollback")) != 0 {
+		t.Fatalf("got %q, calls %q", got, h.fake.ops())
+	}
+}
+
+// The kept installer is the one the status's short name names, as the apply finds it.
+func TestPlanDryRunTakesTheStatusShortName(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	state := h.create(h.dockerConfig(nil))
+	h.fake.reset()
+	h.fake.set("status", reply{stdout: strings.Replace(statusHeld, `"short_name":"notes"`, `"short_name":"nt"`, 1)})
+	h.fake.set("describe", reply{stdout: describe2})
+	h.plan(state, h.dockerConfig(map[string]tftypes.Value{"installer": str(image2), "plan_dry_run": boolean(true)}))
+	kd := h.fake.callsOf("kept-describe")
+	if len(kd) != 1 || kd[0].argv[6] != "nt" {
+		t.Fatalf("kept-describe %q", kd)
 	}
 }
