@@ -8,7 +8,7 @@ DOCKER_GO  := docker run --rm --memory 4g -u $(shell id -u):$(shell id -g) -e HO
               -e GOMODCACHE=/cache/mod -e GOFLAGS=-trimpath -v $(GOCACHE_DIR):/cache -v $(CURDIR):/src -w /src
 GO         := $(DOCKER_GO) golang:$(GO_VERSION)-bookworm
 
-.PHONY: all check build release-check test hooks-test fmt tidy docs shell hooks clean
+.PHONY: all check build release-check test hooks-test fmt tidy docs shell hooks clean acc-k8s acc-image
 
 all: check build
 
@@ -30,6 +30,25 @@ release-check: | $(GOCACHE_DIR)    ## .goreleaser.yml checked, a snapshot releas
 
 test: | $(GOCACHE_DIR)             ## fast loop: unit tests only, no race detector; never the gate
 	$(GO) go test -count=1 -p 4 ./...
+
+# The acceptance tests run in a container of their own (test/acc.Dockerfile), capped in memory,
+# driving the host's Docker through its socket: the paths they hand it (the work directory in the
+# cache, this tree, Stowage's) are mounted at the same paths. ~/.docker holds the registry logins
+# Stowage's ship pulls the base images with, and buildx's state.
+STOWAGE_REPO ?= $(HOME)/stowage
+ACC_IMAGE    := terraform-provider-stowage-acc
+ACC_RUN       = docker run --rm --memory 4g --network host -u $(shell id -u):$(shell id -g) \
+                --group-add $(shell stat -c %g /var/run/docker.sock) -v /var/run/docker.sock:/var/run/docker.sock \
+                -e HOME=$(HOME) -v $(HOME)/.cache:$(HOME)/.cache -v $(HOME)/.docker:$(HOME)/.docker \
+                -v $(CURDIR):$(CURDIR):ro -v $(STOWAGE_REPO):$(STOWAGE_REPO):ro -e STOWAGE_REPO=$(STOWAGE_REPO) \
+                -w $(CURDIR) $(ACC_IMAGE)
+
+acc-image:
+	DOCKER_BUILDKIT=1 docker buildx build --load -t $(ACC_IMAGE) -f test/acc.Dockerfile test
+
+acc-k8s: build acc-image    ## the Kubernetes target through tofu on a kind cluster, against a real Stowage (STOWAGE_REPO, default ~/stowage), in the acceptance runner; prints PASS
+	mkdir -p $(HOME)/.cache $(HOME)/.docker
+	$(ACC_RUN) bash test/acc-k8s.sh
 
 hooks-test:       ## the hooks' branches (test/hooks.sh), on this machine; make check runs it too
 	bash test/hooks.sh

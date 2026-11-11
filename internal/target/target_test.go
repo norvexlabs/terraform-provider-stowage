@@ -197,6 +197,12 @@ func TestSSHRunWritesPinnedKey(t *testing.T) {
 	}
 	s := SSH{Host: "h", User: "u", KnownHostsLine: "h ssh-ed25519 " + edKey, Binary: fake}
 	out, _, exit, err := s.Run(context.Background(), []string{"echo", "a b"}, []byte("secret-on-stdin"))
+	// A parallel test's fork may hold the descriptor the fake was written through until it execs
+	// (ETXTBSY): the run is tried again.
+	for i := 0; i < 50 && err != nil && strings.Contains(err.Error(), "text file busy"); i++ {
+		time.Sleep(10 * time.Millisecond)
+		out, _, exit, err = s.Run(context.Background(), []string{"echo", "a b"}, []byte("secret-on-stdin"))
+	}
 	if err != nil || exit != 0 {
 		t.Fatalf("exit %d err %v", exit, err)
 	}
@@ -207,5 +213,20 @@ func TestSSHRunWritesPinnedKey(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Dir(path)); !os.IsNotExist(err) {
 		t.Fatalf("known_hosts directory %s left behind: %v", path, err)
+	}
+}
+
+// Local leaves the variables Unset names out of the program's environment, and every other in.
+func TestLocalUnset(t *testing.T) {
+	t.Setenv("STOWAGE_TEST_GONE", "secret")
+	t.Setenv("STOWAGE_TEST_KEPT", "kept")
+	out, _, exit, err := Local{Unset: []string{"STOWAGE_TEST_GONE"}}.Run(context.Background(),
+		[]string{"sh", "-c", `printf '%s|%s' "${STOWAGE_TEST_GONE-unset}" "${STOWAGE_TEST_KEPT-unset}"`}, nil)
+	if err != nil || exit != 0 || string(out) != "unset|kept" {
+		t.Fatalf("%q %d %v", out, exit, err)
+	}
+	out, _, _, _ = Local{}.Run(context.Background(), []string{"sh", "-c", `printf '%s' "${STOWAGE_TEST_GONE-unset}"`}, nil)
+	if string(out) != "secret" {
+		t.Fatalf("without Unset: %q", out)
 	}
 }

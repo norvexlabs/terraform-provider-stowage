@@ -12,9 +12,6 @@ installer's machine interface and decides nothing itself. A finished item is del
    error. Unit tests drive the results as Stowage's `printResult` prints them.
 2. **Plan-time dry run** (P1, opt-in): an upgrade's `--dry-run` over SSH, skipped while the target
    does not exist yet.
-3. **Kubernetes target** (P2): `k8s install|upgrade|uninstall --json` run locally (kubeconfig
-   and context, helm ≥ 3.14, kubectl, a linux/amd64 runner); the installer fetched locally by
-   digest; `k8s upgrade --given -` for a recorded input; no `secrets_wo` (refuse it).
 4. **`stowage_vm_seed` and the VM target** (P3): the seed as a managed resource (`vm seed --json`,
    the one-time host key's private key in state until the install), the VM's `install --set`,
    `upgrade --version V --yes` followed by the reboot (a new `boot_id`, the trial over,
@@ -22,7 +19,8 @@ installer's machine interface and decides nothing itself. A finished item is del
 5. **Docs** (P4): `make docs` (tfplugindocs) into `docs/` from the schema and `examples/`; needs a
    way to give tfplugindocs OpenTofu's schema instead of downloading Terraform.
 6. **Acceptance scripts against `tofu`** (P4): sshd + Docker-in-Docker for the Docker target,
-   kind for Kubernetes, one TrueNAS VM; run in Docker like the gates, with a memory cap.
+   one TrueNAS VM; run in Docker like the gates, with a memory cap (`test/acc.Dockerfile`, which
+   `make acc-k8s` runs Kubernetes's in).
 7. **First release** (P5): the public repository `norvexlabs/terraform-provider-stowage`, created
    by the maintainer with the org's GitHub App and its ruleset (pushes as the app only, like
    Stowage); a GPG key for the release (`GPG_FINGERPRINT`); a release workflow (GoReleaser
@@ -30,9 +28,6 @@ installer's machine interface and decides nothing itself. A finished item is del
 
 ## Should
 
-- **A flaky test**: `TestCreateWaitsForTheFirstInstall` failed once in `make check` on a loaded
-  host and passed on the re-run; its 20ms create timeout races the fake's status loop. Scale it
-  with an unexported unit, as the test rules ask.
 - **A short name changed across releases**: state's `short_name` is the running release's after
   a rollback, and the kept `*-stow` fallback runs only when `<short>-stow` is missing; with both
   files left the stale one runs. Re-derive the short name after a rollback (or ask Stowage to

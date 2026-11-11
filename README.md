@@ -22,15 +22,18 @@ the installer's machine interface (`describe --json`, `status --json`, the verbs
 and exit status): it decides nothing the installer does not decide, orders no version and keeps no
 copy of a rule.
 
-**Status: pre-release (0.1.0, unreleased).** What works: the Docker target — create, read,
-update (inputs, then the release: upgrade or rollback), import and delete. Not yet: the plan-time
-dry run, the Kubernetes and VM targets, `stowage_vm_seed` — see [TODO.md](TODO.md). Not yet
-proven against a real installer (unit tests drive the verbs' results as Stowage prints them).
+**Status: pre-release (0.1.0, unreleased).** What works: the Docker and Kubernetes targets —
+create, read, update (inputs, then the release: upgrade or rollback), import and delete. Not yet:
+the plan-time dry run, the VM target, `stowage_vm_seed` — see [TODO.md](TODO.md). The Kubernetes
+target is proven against a real installer on a kind cluster (`make acc-k8s`).
 
 - Provider address: `registry.opentofu.org/norvexlabs/stowage`, plugin protocol 6.
 - Needs **OpenTofu ≥ 1.11** (write-only attributes), and for a remote target the system `ssh`
   binary, OpenSSH ≥ 8.5 (`KnownHostsCommand`), on the machine running OpenTofu. The target needs
   a POSIX `sh`, `tar`, `mktemp` and Docker.
+- The Kubernetes target runs the installer on the machine running OpenTofu, which must be
+  **linux/amd64** (installers are built for it) with `docker` (to fetch the installer image),
+  `helm` ≥ 3.14 (the installer checks the version) and `kubectl` on `PATH`.
 - Reads installers made by **Stowage 0.34.0 or later** (machine interface format 1).
 
 ## Example
@@ -59,6 +62,30 @@ resource "stowage_install" "notes" {
 }
 ```
 
+On a cluster another resource of the root creates, reached as the helm provider reaches it:
+
+```hcl
+provider "stowage" {
+  kubernetes {
+    host                   = aws_eks_cluster.this.endpoint
+    cluster_ca_certificate = base64decode(aws_eks_cluster.this.certificate_authority[0].data)
+    exec {
+      api_version = "client.authentication.k8s.io/v1beta1"
+      command     = "aws"
+      args        = ["eks", "get-token", "--cluster-name", aws_eks_cluster.this.name]
+    }
+  }
+}
+
+resource "stowage_install" "notes_k8s" {
+  installer = "registry.example.com/notes/notes-installer@sha256:<64 hex>"
+  inputs    = { ADMIN_EMAIL = "ops@example.com" }
+  kubernetes {
+    namespace = "notes"
+  }
+}
+```
+
 More in [examples/](examples/).
 
 ## Provider configuration
@@ -69,6 +96,38 @@ More in [examples/](examples/).
 | `password` | optional, sensitive | The pull account's password or token, with `username`; sent on the target's standard input only. One without the other is refused. |
 | `registry` | optional | A mirror's prefix (the installer's `--registry`), given at the install. First-install only: the resource records it (`registry`), and a plan whose provider `registry` differs is an error. |
 | `registry_ca` | optional | PEM of the mirror's certificate authority (the installer's `--registry-ca`), sent on standard input. Refused unless it holds `-----BEGIN CERTIFICATE-----`. The target's Docker daemon must already trust the mirror to fetch the installer image itself. |
+| `kubernetes` | block | The cluster the Kubernetes targets reach, below. |
+
+On Kubernetes, `registry` is the installer's `--image-registry`: the chart and the images come from
+the mirror, for which the installer writes no pull Secret. The cluster's nodes must pull from it on
+their own (an anonymous mirror, or the container runtime's credentials on each node): the provider
+gives the chart no values file.
+
+**`kubernetes` block** — how the cluster is reached, named as the helm provider's `kubernetes`
+block. A provider's configuration is read at every run and never written to state: its
+credentials are not in state, and a short-lived token (`exec`) is fetched again each run. With
+`host`, a kubeconfig of these values is written for each run (one cluster, user and context named
+`stowage`; PEM values as their `*-data`; 0600, in a private 0700 temporary directory removed when
+the run ends); with `config_path`, that file; with neither (or no block), kubectl's default:
+`KUBECONFIG` (each file made absolute), else `~/.kube/config`. A value not known yet (a cluster
+made in the same apply) is checked, and used, when the apply configures the provider again; an
+install run while one is still unknown is an error (`The provider's kubernetes block is not known
+yet`).
+
+| Attribute | | |
+|---|---|---|
+| `host` | optional | The API server's URL (`http://` or `https://`, else refused). Refused with `config_path` or `config_context`; it needs a credential: `token`, `client_certificate` with `client_key`, or `exec` (`no credential for host`). |
+| `token` | optional, sensitive | A bearer token. |
+| `cluster_ca_certificate` | optional | PEM of the API server's certificate authority. |
+| `client_certificate`, `client_key` | optional, the key sensitive | PEM of a client certificate and its key, together (one alone is refused). |
+| `insecure` | optional | `true` skips the API server certificate's check; refused with `cluster_ca_certificate`. |
+| `tls_server_name`, `proxy_url` | optional | The name the server's certificate is checked against; a proxy to the API server. |
+| `exec` | block | A credential plugin (`api_version` and `command` required, `args`, `env` sensitive) kubectl and helm run for a token, never interactively (`interactiveMode: Never`). |
+| `config_path` | optional | A kubeconfig file on the machine running OpenTofu (a leading `~/` is the home directory; made absolute). Refused with `host`. |
+| `config_context` | optional | Its context, given as `--kube-context` (of `config_path`'s file, or of kubectl's default). Refused with `host`. |
+
+`token`, `cluster_ca_certificate`, the client certificate, `insecure = true`, `tls_server_name`,
+`proxy_url` and `exec` without `host` are refused (`<name> without host`).
 
 ## Resource `stowage_install`
 
@@ -105,8 +164,16 @@ two, is an error).
 | `known_hosts_line` | required with `host` | The host's `known_hosts` line, `host keytype base64` (the host field may be left out, hashed or a pattern: it is replaced). That key alone is accepted. A marker (`@cert-authority`, `@revoked`), an unknown key type, a key that is not base64 or more than one line is refused. |
 | `work_dir` | optional | The directory on the target holding `<name>.sh` and the install directory `<name>/`. Left out, the SSH user's home (`.`; locally, OpenTofu's working directory). First-install only (taking it out is a change too); empty is refused. |
 
-**`kubernetes` block** — schema only (`kubeconfig`, `context`, `namespace` required, `release`):
-a create is refused, `The Kubernetes target is not implemented yet`.
+**`kubernetes` block** — the Kubernetes shape, on the cluster the provider's `kubernetes` block
+reaches (one cluster per provider configuration: an alias per cluster). Not with the front's
+settings: `tls`, `domains`, `ports`, `address` and `secrets_wo` are refused (`<name> is not
+Kubernetes's`: the chart's ingress owns TLS and routes, and the release keeps its secrets in the
+cluster). On the target, `id` is `<namespace>/<release>`.
+
+| Attribute | | |
+|---|---|---|
+| `namespace` | required | The release's namespace (`--namespace`), a DNS label (lower-case letters, digits and `-`, at most 63 characters; else refused). First-install only. |
+| `release` | optional | The helm release's name (`--release`), a DNS label of at most 53 characters; left out, the project's name, the installer's default. First-install only (the effective name is compared: naming the default changes nothing). |
 
 **`vm` block** — schema only (`host` required, `port`, `user` and `known_hosts_line` required,
 `private_key_file`, `version` required, `channel` first-install only): a create is refused, `The VM
@@ -117,18 +184,25 @@ removing the VM is its hypervisor resource's job.
 
 | Attribute | |
 |---|---|
-| `id` | `<work_dir>/<name>`. |
-| `short_name` | The installer's short name (`describe` `short_name`): the install keeps its installer as `<id>/<short_name>-stow`. |
+| `id` | `<work_dir>/<name>` on Docker; `<namespace>/<release>` on Kubernetes. |
+| `short_name` | The installer's short name (`describe` `short_name`): a Docker install keeps its installer as `<id>/<short_name>-stow`. |
 | `version`, `revision` | The release installed (`status --json` `installed`). |
 | `channel` | The channel the install follows. |
-| `status` | `installed`, `installing` (the first install has not finished), `failed: <why>` (`install_failed`), or `not installed`. |
+| `status` | `installed`, `installing` (the first install has not finished; helm's `pending-install` on Kubernetes), `failed: <why>` (`install_failed` on Docker; a latest helm revision neither deployed nor pending on Kubernetes), `pending: <why>` (Kubernetes: helm working on the release), or `not installed`. |
 | `previous` | `{version, revision, installer}`, the release `rollback` returns to; null before an upgrade. |
 | `registry` | The provider's `registry` at the install; null in an imported state until its first apply. |
 
 ### What each operation runs on a Docker target
 
 Every remote command is one `sh -c` script with its values as positional arguments, quoted for
-the remote shell; nothing secret is ever an argument.
+the remote shell; nothing secret is ever an argument. On the machine running OpenTofu (no `host`)
+the installer runs with OpenTofu's environment but for the variables named as an input the
+installer declares (those it reads before an answers file), each left out of the program's
+environment before it starts — but those the run
+needs itself, the Kubernetes target's list below; an input of one of those names while the
+environment sets it is refused, a key of `given_wo`'s `inputs` included (`<KEY> comes from the
+environment`). The scripts' own variables are named `__stowage_*`, so an exported variable of
+another name reaches the installer unchanged. Over ssh no environment is carried.
 
 - **Create**: `docker run --rm <installer> > <work_dir>/<name>.sh` (written through a temporary
   file, so a failed fetch leaves no half script), the bootstrap script's `describe --json` (its
@@ -213,11 +287,144 @@ the remote shell; nothing secret is ever an argument.
   then `<short>-stow uninstall --yes --no-input --json [--data] --dir ./<name>`. An install
   directory already gone is success, and runs nothing.
 
+### What each operation runs on a Kubernetes target
+
+Everything runs on the machine running OpenTofu, in a private (0700) temporary directory removed
+when the operation ends, which holds the kubeconfig (when `host` gives it) and each installer
+fetched. Every run is one `sh -c` script, `KUBECONFIG` set to the kubeconfig when one is written or
+named (else the environment's), files sent on standard input as a tar into a private directory;
+nothing secret is an argument. The installer runs with OpenTofu's environment but for the
+variables named as an input the installer declares (the installer reads an exported variable of an
+input's name before an answers file or a `--given` file; but those the run needs itself: `PATH`,
+`HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `LANG`, `TERM`, `KUBECONFIG`, the proxies' and
+`DOCKER_*`, `XDG_*`, `SSL_CERT_*`, `LC_*`) and helm's `HELM_DRIVER`,
+`HELM_DRIVER_SQL_CONNECTION_STRING`, `HELM_KUBE*` and `HELM_NAMESPACE` (another release store, or
+another cluster than kubectl's), each unset. Each
+operation first refuses a machine that is not linux/amd64 and names the programs missing from
+`PATH` among `docker`, `helm` and `kubectl`. Every verb gets
+`--namespace`, `--release` (when given) and `--kube-context` (with `config_context`).
+
+- **The installer** is fetched as on Docker (`docker run --rm <installer> > <name>.sh`, the pull
+  account's login in a Docker configuration of its own, removed afterwards), into the run's
+  directory, then `sh <name>.sh describe --json` (its `name` compared; its shapes must include
+  `kubernetes`). Each operation fetches the installer it runs, but for one fetched before: the
+  bootstrap script an installer prints is kept by its digest (an image by digest prints one, ever)
+  in the user's cache directory, `<cache>/terraform-provider-stowage/installers/<digest>/bootstrap.sh`
+  (`~/.cache` on Linux; 0600 in 0700 directories, written through a temporary file renamed into
+  place) with its SHA-256 beside it (`bootstrap.sh.sha256`), and copied into the run's directory
+  from there; a kept script that does not match its checksum is fetched again, and a cache that
+  cannot be written is only not kept. The cache keeps the 8 installers last used (each embeds an
+  installer binary) and removes the others; delete the directory to fetch again.
+- **Create**: the desired installer's `k8s status --json`. No release (exit 3, nothing on
+  standard output, and `no release <release> in <namespace>:` on standard error — any other
+  refusal is an error) installs: `sh <name>.sh k8s install --no-input --json [--set K=V]…
+  [--image-registry <the provider's registry>]`, with `--answers` (the secret inputs), `--given`
+  (`given_wo`) and `--registry-ca` on standard input; then `k8s status --json`, read again every 10
+  seconds while it reports `installing` (helm's `pending-install`), within the create timeout. A
+  release of another project is an error; one recording an installer the provider does not run
+  (as at update) is refused, not taken over (`The release records another installer`: `k8s
+  uninstall` it, or install in another namespace);
+  one running another installer than the desired one is an error naming it (set `installer` to
+  it, apply, then change it); one helm uninstalled with its
+  history kept is the installer's install to decide. A release running the desired installer is
+  taken over with a warning (`A release is already there`): `given_wo` is given as it is (`k8s
+  upgrade --given`), then `inputs` and `secret_inputs_wo` the same way (below), which win as at an
+  install; the provider's `registry` and `registry_ca` are not given (the release keeps what it
+  recorded); with nothing to give, a release whose latest helm revision is failed is applied
+  again, `k8s upgrade --no-input --json` given nothing. A release whose values record no installer is taken over only by an
+  installer of the release it runs (the same `version` and `revision`, else `The release runs
+  another release`); one helm is working on (`installing`, or a latest revision `pending-…` or
+  `uninstalling`) is refused (`helm is working on the release`: apply again once it is over; a
+  helm killed in its operation leaves it so for good, which `helm rollback` or `helm uninstall`
+  ends). An input named as a variable the run keeps (above) while OpenTofu's environment sets it, or
+  named `KUBECONFIG` (which the run sets itself), is refused at create and update, a key of
+  `given_wo`'s included (its `inputs`, read as YAML) (`<KEY> comes from the environment`, `KUBECONFIG
+  is set by the run`: such an input cannot be given by a run on this machine; leave it to its
+  default). A
+  create whose release is not `deployed` once settled is an error, and saves no state.
+- **Read**: state's installer's `k8s status --json`. No release removes the resource from state;
+  the release that runs replaces `installer` in state, and an input key it does not record is
+  dropped, as on Docker. A release of another project under the name is an error. An installer
+  the release records that the provider does not run (as at update, against state's installer
+  and the provider's `registry`) is never put in state (a warning, `The release records another
+  installer`): state keeps its installer and `status` is `failed: the release records an installer
+  the provider does not run: "<installer>"` (the reference quoted, as Go quotes a string;
+  followed by ` (and: <status>)` when helm's condition or a failure would have shown). A plan of such a state that changes the release is an
+  error naming the fix — the configured installer's `k8s upgrade` run by hand, or `k8s
+  uninstall`, then a refresh; or `tofu state rm` — but for an installer the configuration's own
+  registry trusts (a configuration moved to another registry: the update then takes its usual
+  way) or that is not known yet (the apply checks its registry; another project's, or no
+  installer by digest, is refused at plan all the same), and while the provider's `kubernetes` block
+  is not known (its cluster made again). A plan
+  of the provider's own settings alone (`deletion_protection`, `delete_data`, `allow_rollback`,
+  `timeouts`) is not refused, and touches nothing. A destroy of such a state is refused too (`Not
+  uninstalled`: nothing is run over the release), unless the installer is trusted now (the
+  provider's `registry` set to its registry since). `status` is
+  `pending: helm's latest revision (<n>) of the release is
+  <status>` while helm works on it (`pending-upgrade`, `pending-rollback`, `uninstalling`), and
+  `failed: …` the same way when that revision is neither that nor `deployed` (a release
+  uninstalled with its history kept: `not installed`). An imported state,
+  never applied, is not read; nor is any while a value of the provider's `kubernetes` block is not
+  known yet (its cluster made again in the same plan): state stands until the apply.
+- **Update**: a change of the provider's own settings alone touches nothing. Otherwise, in
+  DESIGN § 13's order:
+  1. `k8s status --json`, by state's installer (an imported state's: the desired one). No release,
+     another project's, one helm is working on (`helm is working on the release`, as at create),
+     or nothing running (uninstalled with its history kept) is an error. An installer the release
+  records that the provider does not run — not this project's by digest
+  (`<prefix>/<name>-installer@sha256:<64 hex>`), or from another registry than the configured
+  installer's (state's or the configuration's) or the provider's `registry`, registries compared
+  as Docker reads them (a prefix without a host is `docker.io`, `index.docker.io` is `docker.io`,
+  the host's case does not count) — is never fetched or run (the provider's pull account would go
+  to it, and it would run on this machine), and nothing is run over it: the update is refused
+  before anything changes (`The release records another installer`, naming the fix). A release
+  recording such an installer after a run of the provider's (the reconfiguration, an upgrade)
+  has its state saved with the status below, with that error, and nothing more is run (an
+  upgrade after the reconfiguration is not); after a create, the same with a warning (an error
+  would taint the resource, whose replacement uninstalls the release). A read after the
+  reconfiguration that fails, or finds helm working on the release, stops the run there too
+  (`the upgrade is not run`), state the reconfiguration's. A read after the apply that fails
+  leaves `status` `failed: not read after this apply (refresh to read it)` rather than a drift
+  the run may have ended. Each such diagnostic names the fix: when the installer is this
+  release's own reference from another registry (a mirror's, an alias), set `installer` to it or
+  the provider's `registry` to its registry; else install the configured release by hand (its
+  `k8s upgrade`) or `k8s uninstall` it, then refresh; or `tofu state rm`. A
+  `previous.installer` from another registry is left out of state, so no rollback goes to it. The
+     installer of the release that runs (`installed.installer`; when the release records none,
+     state's, else the desired one, which must then carry the release that runs: `the release
+     names no installer`, naming it) is fetched and described: the running release's inputs.
+  2. The release to reach, as on Docker: none, `k8s rollback` (with `allow_rollback`), or the
+     desired installer fetched and described, its `k8s upgrade` to run; the same `version` and
+     `revision` under another digest is an error naming the digest the release records.
+  3. A **reconfiguration**, when there is anything to give the running release: its installer's
+     `k8s upgrade --no-input --json --given <file>` (the same release applied again), the file on
+     standard input: `project` and `inputs` — each input changed or added that the running release
+     declares (every one without an upgrade), each taken out given `""`, and the secret inputs
+     when `secret_inputs_wo_version` changed — which replace the values the release's Secret
+     records; `--registry-ca` too. When a release change follows, state is saved here, as on Docker,
+     with the release's status read again after the reconfiguration.
+  4. The new installer's `k8s upgrade --no-input --json [--set K=V]…` given the inputs and secret
+     inputs (`--answers`) the new release adds, with `--registry-ca`; or `k8s rollback --json`
+     by the running release's installer, alone (`a rollback goes alone`; an imported release is
+     taken over first). The registry is the one the release was installed from: `--image-registry`
+     is never given again.
+  5. `k8s status --json` by the installer that now runs fills the computed attributes.
+- **Import**: `tofu import stowage_install.x 'kubernetes:<namespace>/<release>'`. State records
+  the namespace and the release, `deletion_protection = true`; the first apply, with the
+  configuration's cluster and installer, runs the update above (the release's project checked
+  from its status) and records the provider's `registry`.
+- **Delete**: refused while `deletion_protection`; else state's installer fetched and described,
+  then `k8s uninstall --yes --no-input --json [--data]`. The installer's refusal `no release …,
+  and nothing … made for it there` (gone, and nothing left) is success; one keeping its data's
+  Secrets is an error, as any refusal (a chart whose own claims helm would delete refuses an
+  uninstall without `delete_data`).
+
 ### Plan-time errors
 
-A change of a first-install-only setting — `docker.work_dir`, `address`, `vm.channel`, the
-provider's `registry`, the target block's kind, or the project an `installer` names (an imported
-state: its install directory's name) — is a plan error naming the old value, never a replacement:
+A change of a first-install-only setting — `docker.work_dir`, `kubernetes.namespace`, the helm
+release (`kubernetes.release`, else the project's name), `address`, `vm.channel`, the provider's
+`registry`, the target block's kind, or the project an `installer` names (an imported Docker
+state: its install directory's name; an imported release's is checked at the first apply) — is a plan error naming the old value, never a replacement:
 replacing an install deletes its data.
 
 Also plan errors: `installer` changed to `previous.installer` without `allow_rollback` (`a
@@ -286,7 +493,21 @@ make shell   # toolchain container
 make hooks   # commit identity + .githooks
 make hooks-test  # the hooks' test (test/hooks.sh) on this machine; make check runs it too
 make release-check # goreleaser check + a snapshot release (zips, manifest, checksums; unsigned) in dist/, in Docker
+make acc-k8s # the Kubernetes target through tofu on a kind cluster, against a real Stowage, in a container; prints PASS
 ```
+
+`make acc-k8s` (`test/acc-k8s.sh`) builds the provider and the acceptance runner
+(`test/acc.Dockerfile`: OpenTofu 1.12.6, the Docker CLI and the harness's tools, pinned), then runs
+the provider through `tofu` (`dev_overrides` in a CLI configuration of its own) in that runner,
+capped at 4 GiB, driving the host's Docker through its socket, with Stowage's test harness:
+`STOWAGE_REPO` (default `~/stowage`) holds a built `bin/stowage` and its `test/lib.sh` (zot, a kind
+cluster `acc-k8s-<pid>` pulling from it, pinned kind, helm and kubectl). The runner mounts
+`~/.cache` (the work directory), `~/.docker` (the registry logins, buildx's state), this tree and
+Stowage's at their own paths, as the containers the suite starts are given host paths. It ships `examples/minimal` 1.0.0 and 2.0.0 and
+walks create, a plan with no change, a changed input, the upgrade, a plan with no change, the
+rollback (refused first without `allow_rollback`) and destroy, checking the cluster at each step
+and that no run leaves its private directory. It needs Docker, network access and a linux/amd64
+host; `PROVIDER_BIN` runs another provider binary.
 
 An acceptance test, `TestAccDockerLocal`, installs a real installer on this machine's Docker
 through OpenTofu: `TF_ACC=1 TF_ACC_TERRAFORM_PATH=<tofu> TF_ACC_PROVIDER_NAMESPACE=norvexlabs
@@ -354,13 +575,14 @@ sha256sum --check --ignore-missing terraform-provider-stowage_<version>_SHA256SU
 |---|---|
 | `main.go` | the plugin server |
 | `internal/provider` | provider configuration and `stowage_install` |
-| `internal/installer` | the machine interface's documents, exit mapping, the Docker target's scripts |
+| `internal/installer` | the machine interface's documents, exit mapping, the Docker and Kubernetes targets' scripts |
 | `internal/target` | `Runner`: this machine, or the system `ssh` with a pinned host key |
 | `examples/` | provider and resource examples (read by tfplugindocs) |
 | `.goreleaser.yml`, `terraform-registry-manifest.json` | the release's zips, checksums, signature and registry manifest |
 | `.github/workflows/` | `ci.yml` (check and build), `release.yml` (a pushed tag's release) |
 | `.githooks/` | the commit identity, push and private-words guards (`make hooks`) |
 | `test/hooks.sh` | the hooks' test |
+| `test/acc-k8s.sh` | the Kubernetes target's acceptance test (`make acc-k8s`) |
 | `keys/` | the release key's public half |
 | `docs/img/` | the logo, mark, icons and the repository's social preview |
 

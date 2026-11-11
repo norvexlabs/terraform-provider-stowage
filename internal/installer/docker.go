@@ -30,47 +30,49 @@ const (
 // the host. Arguments: work_dir, image, name, registry host, user (empty: no login).
 const FetchScript = `set -eu
 cd -- "$1"
-img=$2 name=$3 host=$4 user=$5
-old=$(umask)
+__stowage_img=$2 __stowage_name=$3 __stowage_host=$4 __stowage_user=$5
+__stowage_old=$(umask)
 umask 077
-d=$(mktemp -d)
-trap 'rm -rf "$d"' EXIT
+__stowage_d=$(mktemp -d)
+trap 'rm -rf "$__stowage_d"' EXIT
 trap 'exit 130' HUP INT TERM
-if [ -n "$user" ]; then
-  tar -xf - -C "$d"
-  DOCKER_CONFIG=$d/docker
+if [ -n "$__stowage_user" ]; then
+  tar -xf - -C "$__stowage_d"
+  DOCKER_CONFIG=$__stowage_d/docker
   export DOCKER_CONFIG
   mkdir "$DOCKER_CONFIG"
-  docker login --username "$user" --password-stdin "$host" < "$d/password" >&2
+  docker login --username "$__stowage_user" --password-stdin "$__stowage_host" < "$__stowage_d/password" >&2
 fi
-docker run --rm "$img" > "$d/script"
-[ -s "$d/script" ] || { echo "$img printed no bootstrap script" >&2; exit 1; }
-umask "$old"
-cat "$d/script" > "./.$name.sh.part"
-mv -f "./.$name.sh.part" "./$name.sh"
+docker run --rm "$__stowage_img" > "$__stowage_d/script"
+[ -s "$__stowage_d/script" ] || { echo "$__stowage_img printed no bootstrap script" >&2; exit 1; }
+umask "$__stowage_old"
+cat "$__stowage_d/script" > "./.$__stowage_name.sh.part"
+mv -f "./.$__stowage_name.sh.part" "./$__stowage_name.sh"
 `
 
 // RunScript runs a program in work_dir with files given on standard input: a tar of the files
 // named, each passed as --<name> <path> after the program's arguments, in a private directory
 // removed afterwards. The program runs with the caller's umask. Arguments: work_dir, the file
-// names (space-separated, may be empty), then the program and its arguments.
+// names (space-separated, may be empty), then the program and its arguments. The scripts' own
+// variables are named __stowage_*: an exported variable of another name passes to the program
+// unchanged.
 const RunScript = `set -eu
 cd -- "$1"
-files=$2
+__stowage_files=$2
 shift 2
-old=$(umask)
+__stowage_old=$(umask)
 umask 077
-d=$(mktemp -d)
-trap 'rm -rf "$d"' EXIT
+__stowage_d=$(mktemp -d)
+trap 'rm -rf "$__stowage_d"' EXIT
 trap 'exit 130' HUP INT TERM
-if [ -n "$files" ]; then
-  tar -xf - -C "$d"
-  for f in $files; do set -- "$@" "--$f" "$d/$f"; done
+if [ -n "$__stowage_files" ]; then
+  tar -xf - -C "$__stowage_d"
+  for __stowage_f in $__stowage_files; do set -- "$@" "--$__stowage_f" "$__stowage_d/$__stowage_f"; done
 fi
-umask "$old"
-rc=0
-"$@" || rc=$?
-exit "$rc"
+umask "$__stowage_old"
+__stowage_rc=0
+"$@" || __stowage_rc=$?
+exit "$__stowage_rc"
 `
 
 // StowScript runs the installer the install keeps, <work_dir>/<name>/<short>-stow (else the one
@@ -81,34 +83,34 @@ exit "$rc"
 // arguments.
 const StowScript = `set -eu
 cd -- "$1"
-dir=./$2 stow=./$2/$3-stow files=$4 withdir=$5
+__stowage_dir=./$2 __stowage_stow=./$2/$3-stow __stowage_files=$4 __stowage_withdir=$5
 shift 5
-[ -d "$dir" ] || { echo "stowage-provider: no install directory" >&2; exit 100; }
-if ! { [ -f "$stow" ] && [ -x "$stow" ]; }; then
+[ -d "$__stowage_dir" ] || { echo "stowage-provider: no install directory" >&2; exit 100; }
+if ! { [ -f "$__stowage_stow" ] && [ -x "$__stowage_stow" ]; }; then
   # Another short name since (a release that renamed its installer): the one *-stow kept.
-  found=
-  for f in "$dir"/*-stow; do
-    [ -f "$f" ] && [ -x "$f" ] || continue
-    [ -z "$found" ] || { echo "$stow: no installer kept there, and $dir holds more than one *-stow" >&2; exit 1; }
-    found=$f
+  __stowage_found=
+  for __stowage_f in "$__stowage_dir"/*-stow; do
+    [ -f "$__stowage_f" ] && [ -x "$__stowage_f" ] || continue
+    [ -z "$__stowage_found" ] || { echo "$__stowage_stow: no installer kept there, and $__stowage_dir holds more than one *-stow" >&2; exit 1; }
+    __stowage_found=$__stowage_f
   done
-  [ -n "$found" ] || { echo "$stow: no installer kept there" >&2; exit 1; }
-  stow=$found
+  [ -n "$__stowage_found" ] || { echo "$__stowage_stow: no installer kept there" >&2; exit 1; }
+  __stowage_stow=$__stowage_found
 fi
-[ -z "$withdir" ] || set -- "$@" --dir "$dir"
-old=$(umask)
+[ -z "$__stowage_withdir" ] || set -- "$@" --dir "$__stowage_dir"
+__stowage_old=$(umask)
 umask 077
-d=$(mktemp -d)
-trap 'rm -rf "$d"' EXIT
+__stowage_d=$(mktemp -d)
+trap 'rm -rf "$__stowage_d"' EXIT
 trap 'exit 130' HUP INT TERM
-if [ -n "$files" ]; then
-  tar -xf - -C "$d"
-  for f in $files; do set -- "$@" "--$f" "$d/$f"; done
+if [ -n "$__stowage_files" ]; then
+  tar -xf - -C "$__stowage_d"
+  for __stowage_f in $__stowage_files; do set -- "$@" "--$__stowage_f" "$__stowage_d/$__stowage_f"; done
 fi
-umask "$old"
-rc=0
-"$stow" "$@" || rc=$?
-exit "$rc"
+umask "$__stowage_old"
+__stowage_rc=0
+"$__stowage_stow" "$@" || __stowage_rc=$?
+exit "$__stowage_rc"
 `
 
 var (
@@ -155,6 +157,29 @@ type Docker struct {
 	WorkDir string
 	Name    string
 	Short   string
+}
+
+// Without is d whose runs on this machine leave out of OpenTofu's environment the input keys the
+// releases declare (but those the run needs itself, RunEnv): the installer reads an exported
+// variable of an input's name before an answers file. A remote target's ssh carries no
+// environment.
+func (d Docker) Without(releases ...*Describe) Docker {
+	f, ok := d.Runner.(target.EnvFilter)
+	if !ok {
+		return d
+	}
+	var keys []string
+	for _, desc := range releases {
+		keys = append(keys, InputEnv(desc)...)
+	}
+	d.Runner = f.WithoutEnv(keys)
+	return d
+}
+
+// Local says whether d runs on the machine running OpenTofu (in its environment).
+func (d Docker) Local() bool {
+	_, ok := d.Runner.(target.EnvFilter)
+	return ok
 }
 
 // Login is the pull account the installer image is fetched with.

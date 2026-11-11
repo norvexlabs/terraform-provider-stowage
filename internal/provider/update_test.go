@@ -349,6 +349,15 @@ func TestCreateWaitsForTheFirstInstall(t *testing.T) {
 	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "still installing when the create timeout ran out") {
 		t.Fatalf("timeout: %q", got)
 	}
+
+	// A status read the create timeout cuts says the same, not the read's own error.
+	h = newHarness(t, nil)
+	h.fake.set("status", reply{block: true})
+	config = h.dockerConfig(map[string]tftypes.Value{"timeouts": h.block("timeouts", map[string]tftypes.Value{"create": str("50ms")})})
+	a = h.apply(nil, h.plan(nil, config).PlannedState, config)
+	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "still installing when the create timeout ran out") {
+		t.Fatalf("a read cut by the timeout: %q", got)
+	}
 }
 
 func TestUpdateTimeout(t *testing.T) {

@@ -108,8 +108,8 @@ func (r *installResource) ValidateConfig(ctx context.Context, req resource.Valid
 			resp.Diagnostics.AddAttributeError(path.Root("vm").AtName("version"), "vm.version is required", "Give the release the VM runs.")
 		}
 	}
-	if m.Kubernetes != nil && m.Kubernetes.Namespace.IsNull() {
-		resp.Diagnostics.AddAttributeError(path.Root("kubernetes").AtName("namespace"), "kubernetes.namespace is required", "Give the namespace the release lives in.")
+	if m.Kubernetes != nil {
+		validateK8s(&m, &resp.Diagnostics)
 	}
 
 	inputs := stringMap(ctx, m.Inputs, &resp.Diagnostics)
@@ -245,10 +245,13 @@ func (r *installResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 		firstInstallOnly(&resp.Diagnostics, path.Root("vm").AtName("channel"), "vm.channel", state.VM.Channel.ValueString(), plan.VM.Channel.ValueString())
 	}
 	if known(plan.Installer) && (known(state.Installer) || imported(&state)) {
-		was := installName(&state)
-		now, _, _ := parseInstaller(plan.Installer.ValueString())
-		firstInstallOnly(&resp.Diagnostics, path.Root("installer"), "the installer's project", was, now)
+		// An imported release's project is told at the first apply, from its status.
+		if was := installName(&state); was != "" {
+			now, _, _ := parseInstaller(plan.Installer.ValueString())
+			firstInstallOnly(&resp.Diagnostics, path.Root("installer"), "the installer's project", was, now)
+		}
 	}
+	r.k8sModifyPlan(ctx, &plan, &state, resp)
 	r.planRollback(ctx, &plan, &state, &resp.Diagnostics)
 	planRemovals(ctx, &plan, &state, &resp.Diagnostics)
 	if r.data != nil && r.data.RegistryKnown && known(state.Registry) {
@@ -287,6 +290,9 @@ func installName(m *installModel) string {
 	if known(m.Installer) {
 		name, _, _ := parseInstaller(m.Installer.ValueString())
 		return name
+	}
+	if m.Kubernetes != nil {
+		return "" // <namespace>/<release> names no project
 	}
 	return baseName(m.ID.ValueString())
 }
@@ -403,7 +409,7 @@ func (r *installResource) docker(m *installModel, short string) (installer.Docke
 
 func notYet(diags *diag.Diagnostics, what string) {
 	diags.AddError(what+" is not implemented yet",
-		what+" is not implemented in this release of terraform-provider-stowage (see its TODO.md). The Docker target is.")
+		what+" is not implemented in this release of terraform-provider-stowage (see its TODO.md). The Docker and Kubernetes targets are.")
 }
 
 func addInstallerError(diags *diag.Diagnostics, summary string, err error) {
@@ -430,11 +436,7 @@ func (r *installResource) Create(ctx context.Context, req resource.CreateRequest
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	switch targetKind(&m) {
-	case "kubernetes":
-		notYet(&resp.Diagnostics, "The Kubernetes target")
-		return
-	case "vm":
+	if targetKind(&m) == "vm" {
 		notYet(&resp.Diagnostics, "The VM target")
 		return
 	}
@@ -467,6 +469,10 @@ func (r *installResource) Create(ctx context.Context, req resource.CreateRequest
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	if m.Kubernetes != nil {
+		r.k8sCreate(ctx, &m, in, resp)
+		return
+	}
 
 	d, err := r.docker(&m, "")
 	if err != nil {
@@ -478,9 +484,13 @@ func (r *installResource) Create(ctx context.Context, req resource.CreateRequest
 		return
 	}
 	refuseSecretInputs(&resp.Diagnostics, in.Inputs, desc)
+	if d.Local() {
+		refuseRunEnvInputs(&resp.Diagnostics, nil, in.Given, in.Inputs, in.SecretInputs)
+	}
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	d = d.Without(desc)
 	d.Short = desc.ShortName
 	// An install already in the directory (a create that failed or timed out after the install
 	// began, or one a destroy kept with its data) is run again, as the installer's re-run, which
@@ -574,6 +584,10 @@ func (r *installResource) fetchDescribe(ctx context.Context, d installer.Docker,
 func (r *installResource) settle(ctx context.Context, d installer.Docker) (*installer.Status, error) {
 	for {
 		st, err := d.Status(ctx)
+		if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			// The read was cut by the create timeout: the install is still installing.
+			return nil, fmt.Errorf("%s/%s is still installing when the create timeout ran out (timeouts.create; the read: %w): apply again once status --json no longer reports installing", d.WorkDir, d.Name, err)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -648,8 +662,19 @@ func applyStatus(m *installModel, st *installer.Status, read bool) {
 func (r *installResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
 	var m installModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &m)...)
-	if resp.Diagnostics.HasError() || m.Docker == nil {
-		return // only the Docker target is created, so only it is read
+	if resp.Diagnostics.HasError() || (m.Docker == nil && m.Kubernetes == nil) {
+		return // only the Docker and Kubernetes targets are created, so only they are read
+	}
+	if m.Kubernetes != nil {
+		timeout, diags := m.Timeouts.Read(ctx, readTimeout)
+		resp.Diagnostics.Append(diags...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		ctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		r.k8sRead(ctx, &m, &resp.State, &resp.Diagnostics)
+		return
 	}
 	if known(m.Docker.Host) && m.Docker.KnownHostsLine.IsNull() {
 		return // an imported state: the configuration gives the connection, at the first apply
@@ -738,11 +763,7 @@ func (r *installResource) Update(ctx context.Context, req resource.UpdateRequest
 		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 		return
 	}
-	switch targetKind(&plan) {
-	case "kubernetes":
-		notYet(&resp.Diagnostics, "The Kubernetes target")
-		return
-	case "vm":
+	if targetKind(&plan) == "vm" {
 		notYet(&resp.Diagnostics, "The VM target")
 		return
 	}
@@ -756,11 +777,16 @@ func (r *installResource) Update(ctx context.Context, req resource.UpdateRequest
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	u := &update{r: r, plan: &plan, state: &state, secrets: secrets, diags: &resp.Diagnostics}
-	u.run(ctx, func(m *installModel) bool {
+	save := func(m *installModel) bool {
 		resp.Diagnostics.Append(resp.State.Set(ctx, m)...)
 		return !resp.Diagnostics.HasError()
-	})
+	}
+	if plan.Kubernetes != nil {
+		r.k8sUpdate(ctx, &plan, &state, secrets, &resp.Diagnostics, save)
+		return
+	}
+	u := &update{r: r, plan: &plan, state: &state, secrets: secrets, diags: &resp.Diagnostics}
+	u.run(ctx, save)
 }
 
 // update applies a plan to a Docker install in DESIGN § 13's order: the inputs first, by a re-run
@@ -818,9 +844,13 @@ func (u *update) run(ctx context.Context, save func(*installModel) bool) {
 	}
 	rerun, up := u.split(ctx, running, next)
 	refuseSecretInputs(u.diags, stringMap(ctx, plan.Inputs, u.diags), running, next)
+	if d.Local() {
+		refuseRunEnvInputs(u.diags, nil, "", stringMap(ctx, plan.Inputs, u.diags), u.secrets)
+	}
 	if u.diags.HasError() {
 		return
 	}
+	d = d.Without(running, next)
 	switch {
 	case step == rollback && imported(state):
 		runs := "the installer of the release it runs (status --json installed.installer)"
@@ -1066,19 +1096,25 @@ func (u *update) settled(ctx context.Context, d installer.Docker, m *installMode
 	}
 	if err != nil {
 		addInstallerError(u.diags, "Reading the install", err)
-		m.Version, m.Revision, m.Channel, m.Status, m.Previous = u.state.Version, u.state.Revision, u.state.Channel, u.state.Status, u.state.Previous
-		if m.Status.IsNull() {
-			m.Status = types.StringValue("not installed")
-		}
-		if m.Previous.IsNull() || m.Previous.IsUnknown() {
-			m.Previous = types.ObjectNull(previousType)
-		}
-		if m.Channel.IsNull() {
-			m.Channel = types.StringValue("")
-		}
+		keepComputed(m, u.state)
 		return
 	}
 	applyStatus(m, st, false)
+}
+
+// keepComputed sets m's values read from the target to state's, when the read after an update
+// failed: a null status is not installed, a null channel empty.
+func keepComputed(m, state *installModel) {
+	m.Version, m.Revision, m.Channel, m.Status, m.Previous = state.Version, state.Revision, state.Channel, state.Status, state.Previous
+	if m.Status.IsNull() {
+		m.Status = types.StringValue("not installed")
+	}
+	if m.Previous.IsNull() || m.Previous.IsUnknown() {
+		m.Previous = types.ObjectNull(previousType)
+	}
+	if m.Channel.IsNull() {
+		m.Channel = types.StringValue("")
+	}
 }
 
 // fillUpdate sets what an update's state holds whatever the status: the short name, the ID, no
@@ -1108,6 +1144,10 @@ func portMap(ctx context.Context, m types.Map, diags *diag.Diagnostics) map[stri
 // <name>/<short>-stow`: the target and the install's directory. The configuration gives the
 // connection and the rest at the first apply, which reconfigures the install with it.
 func (r *installResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
+	if strings.HasPrefix(req.ID, "kubernetes:") {
+		r.k8sImport(ctx, req.ID, resp)
+		return
+	}
 	host, work, name, short, err := parseImportID(req.ID)
 	if err != nil {
 		resp.Diagnostics.AddError("Import ID", err.Error())
@@ -1179,12 +1219,8 @@ func (r *installResource) Delete(ctx context.Context, req resource.DeleteRequest
 			"This install is protected: set deletion_protection = false and apply, then destroy. delete_data = true also deletes its volumes.")
 		return
 	}
-	switch targetKind(&m) {
-	case "vm":
+	if targetKind(&m) == "vm" {
 		return // forgotten: removing the VM is its hypervisor resource's job
-	case "kubernetes":
-		notYet(&resp.Diagnostics, "The Kubernetes target")
-		return
 	}
 	timeout, diags := m.Timeouts.Delete(ctx, deleteTimeout)
 	resp.Diagnostics.Append(diags...)
@@ -1193,6 +1229,10 @@ func (r *installResource) Delete(ctx context.Context, req resource.DeleteRequest
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	if m.Kubernetes != nil {
+		r.k8sDelete(ctx, &m, &resp.Diagnostics)
+		return
+	}
 	d, err := r.docker(&m, m.ShortName.ValueString())
 	if err != nil {
 		resp.Diagnostics.AddError("Cannot reach the Docker target", err.Error())
@@ -1208,7 +1248,7 @@ func (r *installResource) Delete(ctx context.Context, req resource.DeleteRequest
 	if running == nil {
 		return
 	}
-	if _, err := d.Uninstall(ctx, m.DeleteData.ValueBool()); err != nil {
+	if _, err := d.Without(running).Uninstall(ctx, m.DeleteData.ValueBool()); err != nil {
 		addInstallerError(&resp.Diagnostics, "Uninstalling", err)
 	}
 }
