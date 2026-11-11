@@ -34,7 +34,7 @@ line, or what the provider trusts — always fixed now); **Should / Could** = de
 ## Build — Docker only
 
 ```bash
-make check     # GATE: gofmt, go vet, staticcheck, govulncheck, the hooks' test, go test -race (Dockerfile target checks)
+make check     # GATE: gofmt, go vet, staticcheck, govulncheck, the hooks' test, go test -race (Dockerfile target checks), then docs-check: docs/ regenerated in Docker must equal the committed one
 make build     # ./bin/terraform-provider-stowage — only after green checks
 make test      # fast iteration only; never the gate
 make docs      # docs/ by tfplugindocs from OpenTofu's schema of the build (templates/, examples/)

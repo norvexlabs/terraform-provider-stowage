@@ -9,7 +9,8 @@ repository's map. Using the provider is [README.md](README.md) and the generated
 Docker is the only requirement.
 
 ```bash
-make check   # GATE: gofmt, go vet, staticcheck, govulncheck, the hooks' test, go test -race (Dockerfile target checks)
+make check   # GATE: gofmt, go vet, staticcheck, govulncheck, the hooks' test, go test -race (Dockerfile target checks), then make docs-check
+make docs-check # docs/ regenerated in Docker (target docs-check: the pinned tofu, its checksum checked, and tfplugindocs) into a copy: any difference from docs/ fails
 make build   # ./bin/terraform-provider-stowage, only after green checks
 make install-local # the build in OpenTofu's implied local mirror (PLUGIN_DIR, default ~/.terraform.d/plugins): see docs/guides/install-without-registry.md
 make test    # fast loop, never the gate

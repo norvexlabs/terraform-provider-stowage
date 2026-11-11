@@ -9,7 +9,7 @@ REPO=$(cd "$(dirname "$0")/.." && pwd)
 . "$REPO/test/tofu.sh"
 BIN=${PROVIDER_BIN:-$REPO/bin/terraform-provider-stowage}
 [[ -x $BIN ]] || { echo "FAIL: $BIN is missing: run make build" >&2; exit 1; }
-TOFU=$(tofu_path)
+TOFU=${TOFU:-$(tofu_path)} # TOFU: a tofu of the pinned version given (the Docker stage of make docs-check)
 WORK=$(mktemp -d "${XDG_CACHE_HOME:-$HOME/.cache}/tps-schema.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/plugins" "$WORK/root"
@@ -29,13 +29,7 @@ terraform {
 HCL
 cd "$WORK/root"
 TF_CLI_CONFIG_FILE=$WORK/tofurc TF_IN_AUTOMATION=1 "$TOFU" providers schema -json >"$WORK/schema.json"
-python3 -I - "$WORK/schema.json" <<'PY'
-import json, sys
-doc = json.load(open(sys.argv[1]))
-schemas = doc.get("provider_schemas", {})
-addr = "registry.opentofu.org/norvexlabs/stowage"
-if addr not in schemas:
-    sys.exit(f"FAIL: tofu's schema has no {addr} (got {sorted(schemas)})")
-doc["provider_schemas"] = {"stowage": schemas[addr]}
-json.dump(doc, sys.stdout)
-PY
+# tofu prints the schema as one line: its provider_schemas key, renamed.
+key='"provider_schemas":{"registry.opentofu.org/norvexlabs/stowage":'
+grep -qF "$key" "$WORK/schema.json" || { echo "FAIL: tofu's schema has no registry.opentofu.org/norvexlabs/stowage" >&2; exit 1; }
+sed 's|"provider_schemas":{"registry.opentofu.org/norvexlabs/stowage":|"provider_schemas":{"stowage":|' "$WORK/schema.json"

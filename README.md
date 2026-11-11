@@ -136,7 +136,7 @@ full: [Docker](docs/guides/docker-target.md), [Kubernetes](docs/guides/kubernete
 ## Building and testing
 
 ```bash
-make check          # the gate: gofmt, vet, staticcheck, govulncheck, the hooks' test, go test -race
+make check          # the gate: gofmt, vet, staticcheck, govulncheck, the hooks' test, go test -race, docs/ in step
 make build          # ./bin/terraform-provider-stowage, after green checks
 make install-local  # the build in OpenTofu's local mirror
 make docs           # docs/ from OpenTofu's schema of the build (tfplugindocs)

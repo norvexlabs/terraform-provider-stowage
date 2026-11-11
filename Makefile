@@ -8,15 +8,23 @@ DOCKER_GO  := docker run --rm --memory 4g -u $(shell id -u):$(shell id -g) -e HO
               -e GOMODCACHE=/cache/mod -e GOFLAGS=-trimpath -v $(GOCACHE_DIR):/cache -v $(CURDIR):/src -w /src
 GO         := $(DOCKER_GO) golang:$(GO_VERSION)-bookworm
 
-.PHONY: all check build install-local release-check test hooks-test acc-docker acc-k8s acc-image acc-vm fmt tidy docs shell hooks clean
+.PHONY: all check docs-check build install-local release-check test hooks-test acc-docker acc-k8s acc-image acc-vm fmt tidy docs shell hooks clean
 
 all: check build
 
 $(GOCACHE_DIR):
 	mkdir -p $@
 
-check:            ## GATE: gofmt + vet + staticcheck + govulncheck + the hooks' test + race tests
+# The pinned OpenTofu, one source: test/tofu.sh.
+TOFU_VERSION := $(shell sed -n 's/^TOFU_VERSION=//p' test/tofu.sh)
+TOFU_SHA     := $(shell sed -n 's/^TOFU_SHA=//p' test/tofu.sh)
+
+check:            ## GATE: gofmt + vet + staticcheck + govulncheck + the hooks' test + race tests, then docs-check
 	$(BUILD) --target checks .
+	$(MAKE) docs-check
+
+docs-check:       ## docs/ regenerated in Docker from OpenTofu's schema of the build: any difference fails
+	$(BUILD) --build-arg TOFU_VERSION=$(TOFU_VERSION) --build-arg TOFU_SHA=$(TOFU_SHA) --target docs-check .
 
 build:            ## ./bin/terraform-provider-stowage (only after green checks)
 	$(BUILD) --target bin --output type=local,dest=bin .
