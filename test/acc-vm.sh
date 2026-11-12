@@ -68,8 +68,18 @@ PY
 vm_names
 "${S[@]}" ship --channel beta --disks 2>"$WORK/ship.log" || { tail -50 "$WORK/ship.log"; fail "ship 1.0.0"; }
 
-step "the site's mirror, TLS of its own CA, on the address TrueNAS reaches this host at"
 vm_ctl beta-1.0.0
+# Preflight, in seconds: every input the shipped release requires on the kairos shape is one the
+# root gives (GIVEN: its inputs, its secret inputs, and the domain inputs its domains fill, by
+# route: app → APP_DOMAIN, api → API_DOMAIN). An input with a condition (when) applies under the
+# root's TLS mode (internal) when its condition names tls, and is left to the installer otherwise.
+GIVEN=" ADMIN_EMAIL ACC_TOKEN APP_DOMAIN API_DOMAIN "
+"$CTL" describe --json >"$WORK/describe.json" 2>"$WORK/describe.log" || { cat "$WORK/describe.log"; fail "describe of the shipped release"; }
+missing=$(jq -r '.inputs[] | select(.required and (.shapes == [] or (.shapes | index("kairos") != null)) and (.when == "" or (.when | test("tls"))))
+	| .key' "$WORK/describe.json" | while read -r k; do [[ $GIVEN == *" $k "* ]] || printf '%s ' "$k"; done)
+[[ -z $missing ]] || fail "the root gives none of the inputs the release requires on kairos: $missing(add them to the seed's and the install's inputs, secret inputs or domains, and to GIVEN)"
+
+step "the site's mirror, TLS of its own CA, on the address TrueNAS reaches this host at"
 vm_mirror
 mirror "$WORK/r1.oci.tar" --disks qcow2
 INSTALLER=$REG/notes/notes-installer@$(digest_of notes/notes-installer:beta-1.0.0)
@@ -134,6 +144,7 @@ resource "stowage_vm_seed" "vm" {
   ssh_public_key = file("$KEY.pub")
   ssh_allow      = ["$MIRROR_IP/32"]
   tls            = "internal"
+  domains        = { app = "app.notes.test", api = "api.notes.test" }
   inputs         = { ADMIN_EMAIL = "admin@notes.test" }
   disk_dir       = "$WORK/disks"
 }
@@ -170,6 +181,7 @@ resource "stowage_install" "vm" {
   secret_inputs_wo         = { ACC_TOKEN = var.token }
   secret_inputs_wo_version = 1
   tls                      = "internal"
+  domains                  = { app = "app.notes.test", api = "api.notes.test" }
   allow_rollback           = var.allow_rollback
   deletion_protection      = var.deletion_protection
 
