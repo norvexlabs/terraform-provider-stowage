@@ -7,12 +7,12 @@
 #     TrueNAS's API, the pool, dataset and bridge, the domain the DHCP server registers host names
 #     under, an SSH key): given at run time, never written in the tree;
 #   - a Stowage checkout at STOWAGE_REPO (default ~/stowage) whose `make build` made bin/stowage, at
-#     a release with the machine interface (0.34.0 or later): its suite library runs zot, ships
+#     a release this provider reads (0.35.0 or later): its suite library runs zot, ships
 #     examples/minimal and its mirror;
 #   - this repository's `make build` (bin/terraform-provider-stowage), loaded by a dev_overrides
 #     CLI configuration of this run's own;
-#   - tofu ≥ 1.11, docker, jq, oras, zstd and xorriso on PATH, on a linux/amd64 machine TrueNAS
-#     reaches.
+#   - tofu ≥ 1.11, docker, ssh, jq, oras, zstd and xorriso on PATH, on a linux/amd64 machine TrueNAS
+#     reaches: `make acc-vm` runs it in the acceptance runner (test/acc.Dockerfile), which has them.
 #
 # What it runs, in one OpenTofu root (examples/resources/stowage_vm_seed's, its VM a host named by
 # DHCP under the env file's domain):

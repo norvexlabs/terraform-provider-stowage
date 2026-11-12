@@ -57,14 +57,16 @@ acc-docker: build ## acceptance: the Docker target against a real installer, thr
 # Stowage's ship pulls the base images with, and buildx's state.
 STOWAGE_REPO ?= $(HOME)/stowage
 ACC_IMAGE    := terraform-provider-stowage-acc
-ACC_RUN       = docker run --rm --memory 4g --network host -u $(shell id -u):$(shell id -g) \
+ACC_RUN_BASE  = docker run --rm --memory 4g --network host -u $(shell id -u):$(shell id -g) \
                 --group-add $(shell stat -c %g /var/run/docker.sock) -v /var/run/docker.sock:/var/run/docker.sock \
                 -e HOME=$(HOME) -v $(HOME)/.cache:$(HOME)/.cache -v $(HOME)/.docker:$(HOME)/.docker \
                 -v $(CURDIR):$(CURDIR):ro -v $(STOWAGE_REPO):$(STOWAGE_REPO):ro -e STOWAGE_REPO=$(STOWAGE_REPO) \
-                -w $(CURDIR) $(ACC_IMAGE)
+                -w $(CURDIR)
+ACC_RUN       = $(ACC_RUN_BASE) $(ACC_IMAGE)
 
 acc-image:
-	DOCKER_BUILDKIT=1 docker buildx build --load -t $(ACC_IMAGE) -f test/acc.Dockerfile test
+	DOCKER_BUILDKIT=1 docker buildx build --load --build-arg TOFU_VERSION=$(TOFU_VERSION) --build-arg TOFU_SHA=$(TOFU_SHA) \
+	  -t $(ACC_IMAGE) -f test/acc.Dockerfile test
 
 acc-k8s: build acc-image    ## the Kubernetes target through tofu on a kind cluster, against a real Stowage (STOWAGE_REPO, default ~/stowage), in the acceptance runner; prints PASS
 	mkdir -p $(HOME)/.cache $(HOME)/.docker
@@ -73,8 +75,16 @@ acc-k8s: build acc-image    ## the Kubernetes target through tofu on a kind clus
 hooks-test:       ## the hooks' branches (test/hooks.sh), on this machine; make check runs it too
 	bash test/hooks.sh
 
-acc-vm: build     ## the VM target against a real VM on TrueNAS: STOWAGE_VM_ENV=<file> [STOWAGE_REPO=<dir>] make acc-vm
-	bash test/acc-vm.sh
+# acc-vm runs in the acceptance runner too: the env file read-only, the SSH key it names
+# (DEV_VM_SSH_KEY, its .pub beside it) by its directory, read-only, at the same path; the host's
+# network (TrueNAS reaches the suite's mirror on this host's address).
+acc-vm: build acc-image ## the VM target against a real VM on TrueNAS, in the acceptance runner: STOWAGE_VM_ENV=<file> [STOWAGE_REPO=<dir>] make acc-vm
+	@test -r "$(STOWAGE_VM_ENV)" || { echo "FAIL: STOWAGE_VM_ENV=<file> is required (see test/acc-vm.sh)" >&2; exit 1; }
+	mkdir -p $(HOME)/.cache $(HOME)/.docker
+	key="$$(set -a; . "$(abspath $(STOWAGE_VM_ENV))"; printf '%s' "$$DEV_VM_SSH_KEY")"; \
+	  test -r "$$key" || { echo "FAIL: DEV_VM_SSH_KEY of STOWAGE_VM_ENV is not a readable file" >&2; exit 1; }; \
+	  $(ACC_RUN_BASE) -v "$(abspath $(STOWAGE_VM_ENV)):$(abspath $(STOWAGE_VM_ENV)):ro" -e STOWAGE_VM_ENV="$(abspath $(STOWAGE_VM_ENV))" \
+	    -v "$$(dirname "$$key"):$$(dirname "$$key"):ro" $(ACC_IMAGE) bash test/acc-vm.sh
 
 fmt: | $(GOCACHE_DIR)              ## rewrite sources with gofmt
 	$(GO) gofmt -w .

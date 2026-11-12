@@ -22,6 +22,7 @@ make hooks   # commit identity + .githooks
 make hooks-test  # the hooks' test (test/hooks.sh) on this machine; make check runs it too
 make release-check # goreleaser check + a snapshot release (zips, manifest, checksums; unsigned) in dist/, in Docker
 make acc-k8s # the Kubernetes target through tofu on a kind cluster, against a real Stowage, in a container; prints PASS
+make acc-vm  # the VM target and stowage_vm_seed on a real TrueNAS VM (STOWAGE_VM_ENV=<file>), in the same container; prints PASS
 ```
 
 **`make acc-docker`** (`STOWAGE_SRC=<a Stowage checkout ≥ 0.35.0, its ./bin/stowage built>`)
@@ -42,7 +43,8 @@ directory is under `~/.cache` (`ACC_LOGS=<dir>` keeps the logs). Needs Docker, c
 ssh, ssh-keygen and network access.
 
 `make acc-k8s` (`test/acc-k8s.sh`) builds the provider and the acceptance runner
-(`test/acc.Dockerfile`: OpenTofu 1.12.6, the Docker CLI and the harness's tools, pinned), then runs
+(`test/acc.Dockerfile`: OpenTofu of `test/tofu.sh`'s pin, the Docker CLI, ssh, xorriso, oras,
+zstd, jq and the harness's tools, pinned), then runs
 the provider through `tofu` (`dev_overrides` in a CLI configuration of its own) in that runner,
 capped at 4 GiB, driving the host's Docker through its socket, with Stowage's test harness:
 `STOWAGE_REPO` (default `~/stowage`) holds a built `bin/stowage` and its `test/lib.sh` (zot, a kind
@@ -53,6 +55,19 @@ walks create, a plan with no change, a changed input, the upgrade, a plan with n
 rollback (refused first without `allow_rollback`) and destroy, checking the cluster at each step
 and that no run leaves its private directory. It needs Docker, network access and a linux/amd64
 host; `PROVIDER_BIN` runs another provider binary.
+
+`make acc-vm` (`STOWAGE_VM_ENV=<file>`, the file Stowage's VM suites read, given at run time and
+never written in the tree; `STOWAGE_REPO`, a Stowage checkout ≥ 0.35.0 with `bin/stowage` built)
+runs `test/acc-vm.sh` in the same runner, capped at 4 GiB, with the host's network (TrueNAS reaches
+the suite's mirror on this host's address): the env file and the directory of the SSH key it names
+(`DEV_VM_SSH_KEY`, its `.pub` beside it) are mounted read-only at their own paths. It ships
+`examples/minimal` with its kairos shape and a secret input, carries it to a TLS mirror, and walks
+`examples/resources/stowage_vm_seed`'s root: the seed (its disk written by `disk_dir`, its ISO by
+xorriso), Stowage's TrueNAS module, the first install over SSH under the one-time key, the VM's own
+key and the one-time key's retirement, a plan with no change, a re-run, an upgrade and its reboot,
+the rollback (refused first without `allow_rollback`), and the destroy; it prints `PASS`. The host
+needs Docker, network access to TrueNAS and a linux/amd64 machine; every other tool is the
+runner's.
 
 An acceptance test, `TestAccDockerLocal`, installs a real installer on this machine's Docker
 through OpenTofu: `TF_ACC=1 TF_ACC_TERRAFORM_PATH=<tofu> TF_ACC_PROVIDER_NAMESPACE=norvexlabs
