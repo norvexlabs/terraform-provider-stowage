@@ -8,7 +8,7 @@ DOCKER_GO  := docker run --rm --memory 4g -u $(shell id -u):$(shell id -g) -e HO
               -e GOMODCACHE=/cache/mod -e GOFLAGS=-trimpath -v $(GOCACHE_DIR):/cache -v $(CURDIR):/src -w /src
 GO         := $(DOCKER_GO) golang:$(GO_VERSION)-bookworm
 
-.PHONY: all check docs-check build install-local release-check test hooks-test acc-docker acc-k8s acc-image acc-vm fmt tidy docs shell hooks clean
+.PHONY: all check docs-check build install-local release-check test hooks-test acc-docker acc-k8s acc-image acc-vm acc-vm-names fmt tidy docs shell hooks clean
 
 all: check build
 
@@ -75,16 +75,17 @@ acc-k8s: build acc-image    ## the Kubernetes target through tofu on a kind clus
 hooks-test:       ## the hooks' branches (test/hooks.sh), on this machine; make check runs it too
 	bash test/hooks.sh
 
-# acc-vm runs in the acceptance runner too: the env file read-only, the SSH key it names
-# (DEV_VM_SSH_KEY, its .pub beside it) by its directory, read-only, at the same path; the host's
-# network (TrueNAS reaches the suite's mirror on this host's address).
+# acc-vm runs in the acceptance runner too, with the host's network (TrueNAS reaches the suite's
+# mirror on this host's address). test/acc-vm-run.sh resolves STOWAGE_VM_ENV on the host (it may
+# source other files) and passes what it sets by name alone (`-e NAME`, values from its
+# environment), with the directory of the SSH key it names read-only at its own path.
+# `make acc-vm-names` prints those names, and runs nothing.
 acc-vm: build acc-image ## the VM target against a real VM on TrueNAS, in the acceptance runner: STOWAGE_VM_ENV=<file> [STOWAGE_REPO=<dir>] make acc-vm
-	@test -r "$(STOWAGE_VM_ENV)" || { echo "FAIL: STOWAGE_VM_ENV=<file> is required (see test/acc-vm.sh)" >&2; exit 1; }
 	mkdir -p $(HOME)/.cache $(HOME)/.docker
-	key="$$(set -a; . "$(abspath $(STOWAGE_VM_ENV))"; printf '%s' "$$DEV_VM_SSH_KEY")"; \
-	  test -r "$$key" || { echo "FAIL: DEV_VM_SSH_KEY of STOWAGE_VM_ENV is not a readable file" >&2; exit 1; }; \
-	  $(ACC_RUN_BASE) -v "$(abspath $(STOWAGE_VM_ENV)):$(abspath $(STOWAGE_VM_ENV)):ro" -e STOWAGE_VM_ENV="$(abspath $(STOWAGE_VM_ENV))" \
-	    -v "$$(dirname "$$key"):$$(dirname "$$key"):ro" $(ACC_IMAGE) bash test/acc-vm.sh
+	STOWAGE_VM_ENV="$(abspath $(STOWAGE_VM_ENV))" bash test/acc-vm-run.sh $(ACC_IMAGE) $(ACC_RUN_BASE)
+
+acc-vm-names:     ## the names of the variables STOWAGE_VM_ENV gives make acc-vm's runner (never a value)
+	@STOWAGE_VM_ENV="$(abspath $(STOWAGE_VM_ENV))" ACC_DRY=1 bash test/acc-vm-run.sh $(ACC_IMAGE) $(ACC_RUN_BASE)
 
 fmt: | $(GOCACHE_DIR)              ## rewrite sources with gofmt
 	$(GO) gofmt -w .

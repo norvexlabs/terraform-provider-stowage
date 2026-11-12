@@ -3,7 +3,8 @@
 # `tofu` (make acc-vm). Prints PASS.
 #
 # Needs:
-#   - STOWAGE_VM_ENV=<file>, the file Stowage's VM suites read (see the head of its test/vm.sh:
+#   - STOWAGE_VM_ENV=<file>, the file Stowage's VM suites read (make acc-vm resolves it on the host
+#     and passes what it sets by name, STOWAGE_VM_ENV_RESOLVED=1; see the head of Stowage's test/vm.sh:
 #     TrueNAS's API, the pool, dataset and bridge, the domain the DHCP server registers host names
 #     under, an SSH key): given at run time, never written in the tree;
 #   - a Stowage checkout at STOWAGE_REPO (default ~/stowage) whose `make build` made bin/stowage, at
@@ -41,6 +42,11 @@ done
 
 # shellcheck source=/dev/null
 . "$STOWAGE_REPO/test/vm.sh"
+if [[ -n ${STOWAGE_VM_ENV_RESOLVED:-} ]]; then
+	# make acc-vm resolved STOWAGE_VM_ENV on the host and passed what it sets by name: vm_env
+	# checks the environment as it is, a file of nothing to read (/dev/null).
+	STOWAGE_VM_ENV=/dev/null
+fi
 vm_env
 # shellcheck source=/dev/null
 . "$STOWAGE_REPO/test/lib.sh"

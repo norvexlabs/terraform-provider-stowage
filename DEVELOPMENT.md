@@ -23,6 +23,7 @@ make hooks-test  # the hooks' test (test/hooks.sh) on this machine; make check r
 make release-check # goreleaser check + a snapshot release (zips, manifest, checksums; unsigned) in dist/, in Docker
 make acc-k8s # the Kubernetes target through tofu on a kind cluster, against a real Stowage, in a container; prints PASS
 make acc-vm  # the VM target and stowage_vm_seed on a real TrueNAS VM (STOWAGE_VM_ENV=<file>), in the same container; prints PASS
+make acc-vm-names # the names of the variables STOWAGE_VM_ENV gives that container (never a value); runs nothing
 ```
 
 **`make acc-docker`** (`STOWAGE_SRC=<a Stowage checkout ≥ 0.35.0, its ./bin/stowage built>`)
@@ -59,8 +60,13 @@ host; `PROVIDER_BIN` runs another provider binary.
 `make acc-vm` (`STOWAGE_VM_ENV=<file>`, the file Stowage's VM suites read, given at run time and
 never written in the tree; `STOWAGE_REPO`, a Stowage checkout ≥ 0.35.0 with `bin/stowage` built)
 runs `test/acc-vm.sh` in the same runner, capped at 4 GiB, with the host's network (TrueNAS reaches
-the suite's mirror on this host's address): the env file and the directory of the SSH key it names
-(`DEV_VM_SSH_KEY`, its `.pub` beside it) are mounted read-only at their own paths. It ships
+the suite's mirror on this host's address). `test/acc-vm-run.sh` resolves the env file on the
+host (it may source other files the runner does not see) and passes the variables it sets or
+changes by name alone (`docker run -e NAME`, each value taken from its environment: never on a
+command line, in a file or printed); `make acc-vm-names` prints those names and runs nothing. The
+directory of the SSH key it names (`DEV_VM_SSH_KEY`, its `.pub` beside it) is mounted read-only
+at its own path; in the runner, `STOWAGE_VM_ENV_RESOLVED=1` tells `test/acc-vm.sh` to take the
+environment as it is. It ships
 `examples/minimal` with its kairos shape and a secret input, carries it to a TLS mirror, and walks
 `examples/resources/stowage_vm_seed`'s root: the seed (its disk written by `disk_dir`, its ISO by
 xorriso), Stowage's TrueNAS module, the first install over SSH under the one-time key, the VM's own
@@ -147,7 +153,7 @@ sha256sum --check --ignore-missing terraform-provider-stowage_<version>_SHA256SU
 | `.github/workflows/` | `ci.yml` (check and build), `release.yml` (a pushed tag's release) |
 | `.githooks/` | the commit identity, push and private-words guards (`make hooks`) |
 | `test/hooks.sh` | the hooks' test |
-| `test/acc-docker.sh`, `test/acc-k8s.sh`, `test/acc-vm.sh` | the targets' acceptance tests (`make acc-docker`, `acc-k8s`, `acc-vm`); `test/acc.Dockerfile` their runner |
+| `test/acc-docker.sh`, `test/acc-k8s.sh`, `test/acc-vm.sh` | the targets' acceptance tests (`make acc-docker`, `acc-k8s`, `acc-vm`); `test/acc.Dockerfile` their runner, `test/acc-vm-run.sh` acc-vm's launcher |
 | `test/tofu.sh`, `test/schema.sh` | the pinned OpenTofu; the provider's schema by it (`make docs`) |
 | `keys/` | the release key's public half |
 | `docs/` | the reference documentation `make docs` generates; `docs/img/` the logo, mark, icons and the repository's social preview |
