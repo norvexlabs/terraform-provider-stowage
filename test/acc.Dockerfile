@@ -1,6 +1,7 @@
 # The acceptance tests' runner: tofu, the Docker CLI (the suite drives the host's daemon through
 # its socket: zot, kind and the installers run beside this container), the system ssh the
-# provider reaches a VM with, and the tools Stowage's test harness and the VM root's scripts call
+# provider reaches a VM with, ip (the harness finds the address TrueNAS reaches this host at), and
+# the tools Stowage's test harness and the VM root's scripts call
 # (xorriso for the seed ISO, oras and zstd for disks, jq). Every piece pinned by digest or
 # checksum; tofu's pin is test/tofu.sh's, passed as build arguments by the Makefile.
 FROM docker.io/library/docker:28.5.2-cli@sha256:625d9431a9f54c5a2bc90f24f0e1c3d55b1349fd857dd85035f98c2c9acbdd4d AS docker
@@ -12,7 +13,7 @@ ARG ORAS_VERSION=1.3.6
 ARG ORAS_SHA256=66fb0ad7206f3f6fa77ed5b552049d364ccf4b50b1684554f731f76302b52ca0
 RUN test -n "${TOFU_VERSION}" && test -n "${TOFU_SHA}" \
     && apt-get update && apt-get install -y --no-install-recommends bash ca-certificates curl git jq python3 openssl \
-       openssh-client xorriso zstd \
+       openssh-client iproute2 xorriso zstd \
     && rm -rf /var/lib/apt/lists/* \
     && curl -fsSL -o /tmp/tofu.tgz "https://github.com/opentofu/opentofu/releases/download/v${TOFU_VERSION}/tofu_${TOFU_VERSION}_linux_amd64.tar.gz" \
     && echo "${TOFU_SHA}  /tmp/tofu.tgz" | sha256sum -c - \
