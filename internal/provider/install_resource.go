@@ -1192,7 +1192,7 @@ func (u *update) releaseStep(ctx context.Context, d installer.Docker, st *instal
 	if next == nil {
 		return stay, nil
 	}
-	if st.Installed != nil && next.Release.Version == st.Installed.Version && next.Release.Revision == st.Installed.Revision {
+	if st.Installed != nil && next.Release.Same(*st.Installed) {
 		// The same release: no upgrade, which would move it to a later revision. When the install
 		// records another digest of its installer, Read would put that one back at every refresh.
 		if rec := st.Installed.Installer; rec != "" {

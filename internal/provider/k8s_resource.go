@@ -490,7 +490,7 @@ func (r *installResource) k8sCreate(ctx context.Context, m *installModel, in ins
 		diags.AddError("The release runs another installer",
 			fmt.Sprintf("The release %s runs %s %s from %s: set installer to it, apply (the release is taken over), then change installer to upgrade it.", k8sID(k), name, existing.Installed.Version, existing.Installed.Installer))
 		return
-	case existing.Installed != nil && existing.Installed.Installer == "" && (existing.Installed.Version != desc.Release.Version || existing.Installed.Revision != desc.Release.Revision):
+	case existing.Installed != nil && existing.Installed.Installer == "" && !existing.Installed.Same(desc.Release):
 		diags.AddError("The release runs another release",
 			fmt.Sprintf("The release %s runs %s %s (revision %d), and records no installer; %s carries %s (revision %d): set installer to %s %s's, apply (the release is taken over), then change installer to upgrade it.",
 				k8sID(k), name, existing.Installed.Version, existing.Installed.Revision, ref, desc.Release.Version, desc.Release.Revision, name, existing.Installed.Version))
@@ -953,7 +953,7 @@ func (r *installResource) k8sUpdate(ctx context.Context, plan, state *installMod
 	if running == nil {
 		return
 	}
-	if st.Installed.Installer == "" && (running.Release.Version != st.Installed.Version || running.Release.Revision != st.Installed.Revision) {
+	if st.Installed.Installer == "" && !running.Release.Same(*st.Installed) {
 		diags.AddAttributeError(path.Root("installer"), "the release names no installer",
 			fmt.Sprintf("The release %s runs %s %s (revision %d) and records no installer; %s carries %s (revision %d): set installer to %s %s's, apply (the release is taken over), then change installer.",
 				k8sID(cur), name, st.Installed.Version, st.Installed.Revision, runningRef, running.Release.Version, running.Release.Revision, name, st.Installed.Version))
@@ -1121,7 +1121,7 @@ func (r *installResource) k8sReleaseStep(ctx context.Context, run *k8sRun, u *up
 	if next == nil {
 		return stay, nil, k
 	}
-	if next.Release.Version == st.Installed.Version && next.Release.Revision == st.Installed.Revision {
+	if next.Release.Same(*st.Installed) {
 		if rec := st.Installed.Installer; rec != "" {
 			u.diags.AddAttributeError(path.Root("installer"), "installer is another digest of the release installed",
 				fmt.Sprintf("%s carries %s %s (revision %d), which the release runs from %s: set installer to %s.", desired, next.Name, next.Release.Version, next.Release.Revision, rec, rec))

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -41,6 +42,23 @@ type vmFake struct {
 	// retireNoop: the retire op exits 0 but sshd goes on serving the one-time key (its reload not
 	// taken).
 	retireNoop bool
+	// unjudged, when set, is the status the VM answers until the journal served a boot.judged
+	// entry: a boot whose unit has not taken the install to the OS's release yet.
+	unjudged *reply
+	judged   bool
+}
+
+var bootIDField = regexp.MustCompile(`"boot_id":"([^"]*)"`)
+
+// fellBack is the journal of an upgrade to 1.2.0 whose trial boot the gate found unhealthy
+// (reason) and sent back to the passive system, boot, judged healthy there on 1.1.0.
+func fellBack(reason, boot string) reply {
+	return reply{stdout: judgedJSON(10, "boot-trial", "1.2.0", "went_back", reason, true, "") + judgedJSON(11, boot, "1.1.0", "healthy", "", false, "")}
+}
+
+// judgedJSON is a boot.judged entry of the journal.
+func judgedJSON(seq int, boot, version, verdict, reason string, onTrial bool, kept string) string {
+	return fmt.Sprintf(`{"seq":%d,"at":"t","kind":"boot.judged","boot_id":%q,"release":{"version":%q,"revision":1},"on_trial":%t,"verdict":%q,"reason":%q,"kept":%q}`+"\n", seq, boot, version, onTrial, verdict, reason, kept)
 }
 
 // hang, a reply's stderr, makes the run block until its context ends, as a run the deadline cuts.
@@ -62,6 +80,8 @@ func vmOp(argv []string) string {
 		return "describe"
 	case len(argv) == 3 && argv[1] == "status":
 		return "status"
+	case len(argv) == 5 && argv[1] == "events":
+		return "events"
 	case len(argv) > 4 && argv[0] == "sudo" && argv[2] == "systemctl":
 		return "boot"
 	case len(argv) == 5 && argv[0] == "sudo" && argv[3] == "host-key" && argv[4] == "--json":
@@ -75,7 +95,7 @@ func vmOp(argv []string) string {
 }
 
 func vmStatusJSON(version, boot string, extra string) string {
-	return fmt.Sprintf(`{"format":1,"name":"notes","os":{"version":%q,"revision":1},"installed":{"version":%q,"revision":1},"previous":null,"channel":"stable","inputs":["ADMIN_EMAIL"],"boot":"active","boot_id":%q%s}`, version, version, boot, extra)
+	return fmt.Sprintf(`{"format":1,"name":"notes","os":{"version":%q,"revision":1},"installed":{"version":%q,"revision":1},"previous":null,"channel":"stable","inputs":["ADMIN_EMAIL"],"events":0,"boot":"active","boot_id":%q%s}`, version, version, boot, extra)
 }
 
 const vmDescribe = `{"format":1,"name":"notes","short_name":"notes","release":{"version":"1.1.0","revision":1},"channel":"","shapes":["docker","kairos"],"inputs":[{"key":"ADMIN_EMAIL"},{"key":"API_KEY","secret":true}],"first_install_only":["address","registry","registry_ca","channel"],"routes":[]}`
@@ -153,8 +173,23 @@ func (r vmConn) Run(ctx context.Context, argv []string, stdin []byte) ([]byte, [
 	if q := f.queue[op]; len(q) > 0 {
 		rep, ok, f.queue[op] = q[0], true, q[1:]
 	}
+	if op == "status" && f.unjudged != nil && !f.judged && len(f.calls) > 1 {
+		rep, ok = *f.unjudged, true
+	}
+	if !ok && op == "events" {
+		// The gate's healthy verdict on the boot the VM settles in: the one its steady status
+		// (the reply set, after any queued) answers from.
+		boot := ""
+		if m := bootIDField.FindStringSubmatch(f.replies["status"].stdout); m != nil {
+			boot = m[1]
+		}
+		rep, ok = reply{stdout: judgedJSON(100, boot, "x", "healthy", "", false, "")}, true
+	}
 	if !ok {
 		return nil, []byte("unexpected call"), 99, nil
+	}
+	if op == "events" && strings.Contains(rep.stdout, `"boot.judged"`) {
+		f.judged = true
 	}
 	if rep.stderr == hang {
 		f.mu.Unlock()
@@ -474,8 +509,7 @@ func TestVMUpgradeAddsInputs(t *testing.T) {
 	f.reset()
 	f.then("status",
 		reply{stdout: vmStatusJSON("1.1.0", "boot-1", "")},
-		reply{exit: 255, stderr: "Connection closed"},
-		reply{stdout: vmStatusJSON("1.1.0", "boot-2", `,"on_trial":true`)}, // its upgrade not finished
+		reply{exit: 255, stderr: "Connection closed"}, // the status after the verdict, cut once
 	)
 	f.set("status", reply{stdout: vmStatusJSON("1.2.0", "boot-2", "")})
 	f.then("describe", reply{stdout: vmDescribe}, reply{stdout: describeOf("1.2.0", `{"key":"NEW_IN_12"},{"key":"NEW_TOKEN","secret":true}`)})
@@ -530,9 +564,10 @@ func TestVMUpgradeFallsBack(t *testing.T) {
 		reply{stdout: vmStatusJSON("1.1.0", "boot-2", `,"on_trial":true`)},
 	)
 	f.set("status", reply{stdout: vmStatusJSON("1.1.0", "boot-3", `,"fallback":true,"failed_boot":{"release":{"version":"1.2.0","revision":1},"at":"t","reason":"api not ready in 5m"}`)})
+	f.set("events", fellBack("api not ready in 5m", "boot-3"))
 	config := h.vmConfig("1.2.0", nil)
 	a := h.update(state, config)
-	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "api not ready in 5m") || !strings.Contains(got, "went back to 1.1.0") {
+	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "did not keep 1.2.0's boot (api not ready in 5m): the VM went back to the passive system") || !strings.Contains(got, "runs 1.1.0") {
 		t.Errorf("a fallback: %s", got)
 	}
 	if v := vmAttr(t, h, a.NewState, "version"); v != "1.1.0" {
@@ -540,6 +575,108 @@ func TestVMUpgradeFallsBack(t *testing.T) {
 	}
 	if p := h.plan(a.NewState, config); errorsOf(p.Diagnostics) != "" || vmAttr(t, h, p.PlannedState, "version") != "1.2.0" {
 		t.Errorf("the next plan does not propose the upgrade again: %s", errorsOf(p.Diagnostics))
+	}
+
+	// The trial boot's went_back is read before the passive boot's verdict: the wait goes on to
+	// that verdict, and reads the status after it.
+	h3, f3 := newVMHarness(t)
+	state = h3.create(h3.vmConfig("1.1.0", nil))
+	f3.reset()
+	f3.then("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", "")})
+	f3.set("status", reply{stdout: passiveStatus("1.1.0", "1.1.0", "boot-3", "")})
+	f3.then("events", reply{stdout: judgedJSON(10, "boot-trial", "1.2.0", "went_back", "api not ready in 5m", true, "")})
+	f3.set("events", reply{stdout: judgedJSON(11, "boot-3", "1.1.0", "healthy", "", false, "")})
+	a = h3.update(state, config)
+	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "went back to the passive system") || !strings.Contains(got, "runs 1.1.0") || vmAttr(t, h3, a.NewState, "version") != "1.1.0" {
+		t.Errorf("a fallback read mid-boot: %s, version %s", got, vmAttr(t, h3, a.NewState, "version"))
+	}
+
+	// The passive boot failed too, its unit never taking the install back: both verdicts said,
+	// never the upgrade taken as done.
+	h4, f4 := newVMHarness(t)
+	state = h4.create(h4.vmConfig("1.1.0", nil))
+	f4.reset()
+	f4.then("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", "")})
+	f4.set("status", reply{stdout: passiveStatus("1.1.0", "1.2.0", "boot-3", "")})
+	f4.set("events", reply{stdout: judgedJSON(10, "boot-trial", "1.2.0", "went_back", "api not ready in 5m", true, "") +
+		judgedJSON(11, "boot-3", "1.1.0", "kept_unhealthy", "the boot unit failed", false, "the boot is not on trial: there is nothing to go back to")})
+	a = h4.update(state, config)
+	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "did not keep 1.2.0's boot (api not ready in 5m)") || !strings.Contains(got, "1.1.0's boot unhealthy: the boot unit failed") || !strings.Contains(got, "runs 1.2.0") || strings.Contains(got, "re-run") {
+		t.Errorf("a failed passive boot after a fallback: %s", got)
+	}
+
+	// A kept boot on trial: the gate's reason and why it kept the boot.
+	h6, f6 := newVMHarness(t)
+	state = h6.create(h6.vmConfig("1.1.0", nil))
+	f6.reset()
+	f6.then("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", "")})
+	f6.set("status", reply{stdout: vmStatusJSON("1.2.0", "boot-2", "")})
+	f6.set("events", reply{stdout: judgedJSON(10, "boot-2", "1.2.0", "kept_unhealthy", "api not ready", true, "a rollback barrier")})
+	a = h6.update(state, config)
+	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "It kept that boot, as going back is refused: a rollback barrier") || !strings.Contains(got, "no plan changes that") || strings.Contains(got, "re-run") || vmAttr(t, h6, a.NewState, "version") != "1.2.0" {
+		t.Errorf("a kept boot: %s", got)
+	}
+
+	// A went_back whose reboot never came (marking the boot good failed): the wait runs out
+	// naming the verdict; a journal that started again is read on from its last entry.
+	h7, f7 := newVMHarness(t)
+	state = h7.create(h7.vmConfig("1.1.0", nil))
+	f7.reset()
+	f7.then("status", reply{stdout: strings.Replace(vmStatusJSON("1.1.0", "boot-1", ""), `"boot_id"`, `"events":900,"boot_id"`, 1)})
+	f7.set("status", reply{stdout: vmStatusJSON("1.2.0", "boot-2", "")})
+	f7.then("events", reply{stdout: `{"seq":1,"at":"t","kind":"boot.started","boot_id":"boot-2"}` + "\n" + judgedJSON(2, "boot-2", "1.2.0", "went_back", "marking the boot good failed: read-only", true, "")})
+	f7.set("events", reply{})
+	a = h7.update(state, h7.vmConfig("1.2.0", map[string]tftypes.Value{"timeouts": h7.block("timeouts", map[string]tftypes.Value{"update": str("300ms")})}))
+	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "had not come back") || !strings.Contains(got, "did not keep 1.2.0's boot (marking the boot good failed: read-only)") || !strings.Contains(got, "the VM still runs that boot") {
+		t.Errorf("a went_back without its reboot: %s", got)
+	}
+	if ev := f7.callsOf("events"); len(ev) < 2 || ev[0].argv[3] != "900" || ev[1].argv[3] != "2" {
+		t.Errorf("the journal's cursor: %v", ev)
+	}
+
+	// The same, the new release adding an input: the error says its re-run comes next; a verdict
+	// without a reason or a release still reads.
+	h9, f9 := newVMHarness(t)
+	state = h9.create(h9.vmConfig("1.1.0", nil))
+	f9.reset()
+	f9.then("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", "")})
+	f9.set("status", reply{stdout: vmStatusJSON("1.2.0", "boot-2", "")})
+	f9.then("describe", reply{stdout: vmDescribe}, reply{stdout: describeOf("1.2.0", `{"key":"NEW_IN_12"}`)})
+	f9.set("events", reply{stdout: `{"seq":4,"kind":"boot.judged","boot_id":"boot-2","on_trial":true,"verdict":"kept_unhealthy"}` + "\n"})
+	a = h9.update(state, h9.vmConfig("1.2.0", map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@b", "NEW_IN_12": "x"})}))
+	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "found a release's boot unhealthy: no reason given. It kept that boot, as going back is refused: no reason given") || !strings.Contains(got, "What 1.2.0 adds (inputs, domains, ports) was not given: the next plan proposes that re-run") {
+		t.Errorf("a kept boot adding an input: %s", got)
+	}
+
+	// The wait's own account at a timeout: no verdict yet, then a verdict on a boot the VM no
+	// longer runs.
+	for name, c := range map[string]struct{ events, want string }{
+		"no verdict":     {"", "the journal holds no verdict yet on a boot after the change's"},
+		"another boot":   {judgedJSON(3, "boot-2", "1.2.0", "healthy", "", true, ""), "the gate judged boot boot-2, and the VM answers from boot boot-3"},
+		"went back, off": {judgedJSON(3, "boot-2", "1.2.0", "went_back", "", true, ""), "the gate did not keep boot boot-2; the VM answers from boot boot-3, not judged yet"},
+	} {
+		hc, fc := newVMHarness(t)
+		state = hc.create(hc.vmConfig("1.1.0", nil))
+		fc.reset()
+		fc.then("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", "")})
+		fc.set("status", reply{stdout: vmStatusJSON("1.2.0", "boot-3", "")})
+		fc.set("events", reply{stdout: c.events})
+		a = hc.update(state, hc.vmConfig("1.2.0", map[string]tftypes.Value{"timeouts": hc.block("timeouts", map[string]tftypes.Value{"update": str("300ms")})}))
+		if got := errorsOf(a.Diagnostics); !strings.Contains(got, c.want) {
+			t.Errorf("%s: %s", name, got)
+		}
+	}
+
+	// GRUB fell back before the gate judged the trial boot: no went_back, the passive boot judged
+	// healthy; the error says Kairos fell back.
+	h8, f8 := newVMHarness(t)
+	state = h8.create(h8.vmConfig("1.1.0", nil))
+	f8.reset()
+	f8.then("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", "")})
+	f8.set("status", reply{stdout: passiveStatus("1.1.0", "1.1.0", "boot-3", "")})
+	a = h8.update(state, config)
+	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "Kairos booted the passive system") || !strings.Contains(got, "runs 1.1.0") {
+		t.Errorf("a fallback with no verdict: %s", got)
 	}
 
 	// A reboot never followed: the error, and state saved as before the upgrade.
@@ -562,6 +699,7 @@ func TestVMUpgradeLastReadFails(t *testing.T) {
 	f.reset()
 	f.then("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", "")}, reply{stdout: vmStatusJSON("1.2.0", "boot-2", "")})
 	f.set("status", reply{exit: 1, stderr: "the host daemon does not answer"})
+	f.set("events", reply{stdout: judgedJSON(3, "boot-2", "1.2.0", "healthy", "", true, "")})
 	f.then("describe", reply{stdout: vmDescribe}, reply{stdout: describeOf("1.2.0", `{"key":"NEW_IN_12"}`)})
 	a := h.update(state, h.vmConfig("1.2.0", map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@b", "NEW_IN_12": "x"})}))
 	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "the host daemon does not answer") {
@@ -598,6 +736,74 @@ func TestVMRollback(t *testing.T) {
 	both := h.vmConfig("1.1.0", map[string]tftypes.Value{"allow_rollback": boolean(true), "inputs": strMap(map[string]string{"ADMIN_EMAIL": "c@d"})})
 	if got := errorsOf(h.plan(state, both).Diagnostics); !strings.Contains(got, "a rollback goes alone") || !strings.Contains(got, "vm.version goes back to previous.version") {
 		t.Errorf("a rollback with an input change: %s", got)
+	}
+}
+
+// passiveStatus is a passive boot's status: the OS carries os, the install runs installed — the
+// release the rollback left until the boot unit takes it back.
+func passiveStatus(os, installed, boot, extra string) string {
+	s := strings.Replace(vmStatusJSON(installed, boot, `,"boot":"passive","fallback":true`+extra), `"os":{"version":"`+installed+`"`, `"os":{"version":"`+os+`"`, 1)
+	return s
+}
+
+// TestVMRollbackWaitsForTheBoot: a rollback's passive boot answers before its boot unit has taken
+// the install back; the provider reads on until the install runs the OS's release.
+func TestVMRollbackWaitsForTheBoot(t *testing.T) {
+	t.Parallel()
+	h, f := newVMHarness(t)
+	withPrev := strings.Replace(vmStatusJSON("1.2.0", "boot-1", ""), `"previous":null`, `"previous":{"version":"1.1.0","revision":1}`, 1)
+	f.set("describe", reply{stdout: describeOf("1.2.0", "")})
+	f.set("status", reply{stdout: withPrev})
+	state := h.create(h.vmConfig("1.2.0", nil))
+	f.reset()
+	f.then("status", reply{stdout: strings.Replace(withPrev, `"boot_id"`, `"events":7,"boot_id"`, 1)})
+	f.set("status", reply{stdout: passiveStatus("1.1.0", "1.1.0", "boot-2", "")})
+	f.mu.Lock()
+	f.unjudged = &reply{stdout: passiveStatus("1.1.0", "1.2.0", "boot-2", "")} // until the gate judged it
+	f.mu.Unlock()
+	f.then("events", reply{}, reply{}) // the gate has not judged the passive boot yet
+	a := h.update(state, h.vmConfig("1.1.0", map[string]tftypes.Value{"allow_rollback": boolean(true)}))
+	if got := errorsOf(a.Diagnostics); got != "" {
+		t.Fatal(got)
+	}
+	if v := vmAttr(t, h, a.NewState, "version"); v != "1.1.0" || len(f.callsOf("events")) < 3 {
+		t.Errorf("version %s after %d journal reads", v, len(f.callsOf("events")))
+	}
+	if ev := f.callsOf("events"); len(ev) == 0 || !slices.Equal(ev[0].argv, []string{"notes-stow", "events", "--after", "7", "--json"}) {
+		t.Errorf("the journal read from the status's last entry: %v", ev)
+	}
+
+	// The passive boot's unit refused to go back: the gate's failed boot ends the wait, and the
+	// error says the VM runs 1.2.0.
+	h2, f2 := newVMHarness(t)
+	f2.set("describe", reply{stdout: describeOf("1.2.0", "")})
+	f2.set("status", reply{stdout: withPrev})
+	state = h2.create(h2.vmConfig("1.2.0", nil))
+	f2.reset()
+	f2.then("status", reply{stdout: withPrev}, reply{stdout: passiveStatus("1.1.0", "1.2.0", "boot-2", "")})
+	f2.set("status", reply{stdout: passiveStatus("1.1.0", "1.2.0", "boot-2", `,"failed_boot":{"release":{"version":"1.1.0","revision":1},"at":"t","reason":"the boot unit failed"}`)})
+	f2.set("events", reply{stdout: judgedJSON(5, "boot-2", "1.1.0", "kept_unhealthy", "the boot unit failed", false, "the boot is not on trial: there is nothing to go back to")})
+	a = h2.update(state, h2.vmConfig("1.1.0", map[string]tftypes.Value{"allow_rollback": boolean(true), "timeouts": h2.block("timeouts", map[string]tftypes.Value{"update": str("2s")})}))
+	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "the boot unit failed") || !strings.Contains(got, "runs 1.2.0") || strings.Contains(got, "had not come back") {
+		t.Errorf("a refused rollback boot: %s", got)
+	}
+	if v := vmAttr(t, h2, a.NewState, "version"); v != "1.2.0" {
+		t.Errorf("state's vm.version after a refused rollback boot: %s", v)
+	}
+
+	// The boot took the install back, then the gate found it unhealthy: the error says the
+	// gate's verdict, and that the VM runs 1.1.0.
+	h3, f3 := newVMHarness(t)
+	f3.set("describe", reply{stdout: describeOf("1.2.0", "")})
+	f3.set("status", reply{stdout: withPrev})
+	state = h3.create(h3.vmConfig("1.2.0", nil))
+	f3.reset()
+	f3.then("status", reply{stdout: withPrev})
+	f3.set("status", reply{stdout: passiveStatus("1.1.0", "1.1.0", "boot-2", `,"failed_boot":{"release":{"version":"1.1.0","revision":1},"at":"t","reason":"api not ready"}`)})
+	f3.set("events", reply{stdout: judgedJSON(5, "boot-2", "1.1.0", "kept_unhealthy", "api not ready", false, "the boot is not on trial: there is nothing to go back to")})
+	a = h3.update(state, h3.vmConfig("1.1.0", map[string]tftypes.Value{"allow_rollback": boolean(true)}))
+	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "1.1.0's boot unhealthy: api not ready") || !strings.Contains(got, "runs 1.1.0") {
+		t.Errorf("an unhealthy rolled-back boot: %s", got)
 	}
 }
 
@@ -803,6 +1009,7 @@ func TestVMUpgradeReadsTheOwnKey(t *testing.T) {
 	a = h2.apply(nil, h2.plan(nil, config).PlannedState, config)
 	f2.then("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", "")})
 	f2.set("status", reply{stdout: vmStatusJSON("1.1.0", "boot-2", `,"fallback":true,"failed_boot":{"release":{"version":"1.2.0","revision":1},"at":"t","reason":"not ready"}`)})
+	f2.set("events", fellBack("not ready", "boot-2"))
 	fb := h2.update(a.NewState, h2.vmConfig("1.2.0", nil))
 	if got := errorsOf(fb.Diagnostics); !strings.Contains(got, "not ready") || vmAttr(t, h2, fb.NewState, "host_key_line") != ownLine {
 		t.Errorf("a fallback: %s, host_key_line %s", got, vmAttr(t, h2, fb.NewState, "host_key_line"))
@@ -951,6 +1158,18 @@ func TestVMNoBootIDRefusesFirst(t *testing.T) {
 	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "no boot_id") || slices.Contains(f.ops(), "install") || slices.Contains(f.ops(), "upgrade") {
 		t.Errorf("%s ops %q", got, f.ops())
 	}
+	// No event journal: the gate's verdict could not be read, so nothing runs either.
+	f.reset()
+	f.set("status", reply{stdout: strings.Replace(vmStatusJSON("1.1.0", "boot-1", ""), `"events":0`, `"events":null,"events_error":"the event journal cannot be read: permission denied"`, 1)})
+	a = h.update(state, h.vmConfig("1.2.0", nil))
+	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "no event journal") || !strings.Contains(got, "permission denied") || slices.Contains(f.ops(), "upgrade") {
+		t.Errorf("%s ops %q", got, f.ops())
+	}
+	f.set("status", reply{stdout: strings.Replace(vmStatusJSON("1.1.0", "boot-1", ""), `"events":0`, `"events":null`, 1)})
+	a = h.update(state, h.vmConfig("1.2.0", nil))
+	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "no events_error either") {
+		t.Errorf("no events_error: %s", got)
+	}
 }
 
 // TestImportFirstApplyIsConsistent: a Docker install's import and first apply, held to
@@ -980,6 +1199,7 @@ func TestVMUnreadSeedAfterReboot(t *testing.T) {
 	f.reset()
 	f.then("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", "")})
 	f.set("status", reply{stdout: vmStatusJSON("1.1.0", "boot-2", `,"fallback":true,"failed_boot":{"release":{"version":"1.2.0","revision":1},"at":"t","reason":"not ready"}`)})
+	f.set("events", fellBack("not ready", "boot-2"))
 	up := h.apply(a.NewState, h.plan(a.NewState, h.vmConfig("1.2.0", nil)).PlannedState, h.vmConfig("1.2.0", nil))
 	if got := errorsOf(up.Diagnostics); !strings.Contains(got, "not ready") || vmAttr(t, h, up.NewState, "seed_boot_id") != "<null>" {
 		t.Errorf("%s seed_boot_id %s", got, vmAttr(t, h, up.NewState, "seed_boot_id"))
@@ -1052,6 +1272,7 @@ func TestVMImportedSavesItsConnection(t *testing.T) {
 		"the upgrade falls back": func(f *vmFake) {
 			f.then("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", "")})
 			f.set("status", reply{stdout: vmStatusJSON("1.1.0", "boot-2", `,"fallback":true,"failed_boot":{"release":{"version":"1.2.0","revision":1},"at":"t","reason":"not ready"}`)})
+			f.set("events", fellBack("not ready", "boot-2"))
 		},
 	} {
 		t.Run(name, func(t *testing.T) {

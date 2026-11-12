@@ -9,6 +9,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/hashicorp/terraform-plugin-log/tflogtest"
 )
 
 const edKey = "AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
@@ -53,10 +55,6 @@ func TestParseVMStatus(t *testing.T) {
 		if _, err := ParseVMStatus([]byte(c.in)); err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s: %v, want %q", name, err, c.want)
 		}
-	}
-	a, b := &FailedBoot{Reason: "x"}, &FailedBoot{Reason: "x"}
-	if !a.Same(b) || a.Same(nil) || !(*FailedBoot)(nil).Same(nil) || a.Same(&FailedBoot{Reason: "y"}) {
-		t.Error("Same")
 	}
 }
 
@@ -360,5 +358,63 @@ func TestRetireHostKeyObjectFirst(t *testing.T) {
 	var nr *NotRetiredError
 	if key, err := (VM{Runner: r, Short: "notes"}).RetireHostKey(context.Background()); key == "" || !errors.As(err, &nr) {
 		t.Fatalf("%q %v", key, err)
+	}
+}
+
+// TestVMRunsLogged: the status and the reboot verbs are logged at debug with their command and
+// standard output; a verb's standard error, its run's free-text log, is not — its size alone.
+func TestVMRunsLogged(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	ctx := tflogtest.RootLogger(context.Background(), &buf)
+	r := &vmRecorder{stdout: vmStatus, stderr: "daemon note"}
+	v := VM{Runner: r, Short: "notes"}
+	if _, err := v.Status(ctx); err != nil {
+		t.Fatal(err)
+	}
+	r.stdout, r.stderr = `{"format":1,"result":"done","release":{"version":"1.1.0","revision":1}}`, "provision printed s3cr3t-value"
+	if _, err := v.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got := buf.String()
+	for _, want := range []string{"notes-stow status --json", `\"boot_id\":\"b1\"`, "daemon note", "sudo -n notes-stow rollback --yes --json", `\"result\":\"done\"`, `"stderr_bytes":30`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the log lacks %s:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "s3cr3t-value") {
+		t.Errorf("a verb's standard error is logged:\n%s", got)
+	}
+}
+
+// TestVMEvents: the journal's entries after N, one JSON object per line; a line that is not an
+// entry and a failed run are errors.
+func TestVMEvents(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	r := &vmRecorder{stdout: `{"seq":4,"at":"t","kind":"boot.started","boot_id":"b2","slot":"passive"}
+{"seq":5,"at":"t","kind":"boot.judged","boot_id":"b2","release":{"version":"1.0.0","revision":1},"on_trial":false,"verdict":"healthy"}
+`}
+	v := VM{Runner: r, Short: "notes"}
+	evs, err := v.Events(ctx, 3)
+	if err != nil || !slices.Equal(r.argv, []string{"notes-stow", "events", "--after", "3", "--json"}) {
+		t.Fatalf("events: %v %q", err, r.argv)
+	}
+	if len(evs) != 2 || evs[1].Kind != EvBootJudged || evs[1].Verdict != VerdictHealthy || evs[1].BootID != "b2" || evs[1].Release.Version != "1.0.0" || evs[1].Seq != 5 {
+		t.Errorf("parsed %+v", evs)
+	}
+	r.stdout = ""
+	if evs, err := v.Events(ctx, 5); err != nil || len(evs) != 0 {
+		t.Errorf("no entry: %v %v", evs, err)
+	}
+	for name, out := range map[string]string{"not JSON": "seq 5\n", "no kind": `{"seq":5}` + "\n", "no seq": `{"kind":"boot.judged"}` + "\n"} {
+		r.stdout = out
+		if _, err := v.Events(ctx, 0); err == nil {
+			t.Errorf("%s is taken", name)
+		}
+	}
+	r.stdout, r.stderr, r.exit = "", "the host daemon does not answer", 1
+	if _, err := v.Events(ctx, 0); err == nil || !strings.Contains(err.Error(), "does not answer") {
+		t.Errorf("a failed run: %v", err)
 	}
 }

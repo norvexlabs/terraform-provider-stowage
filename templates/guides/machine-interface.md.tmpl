@@ -34,6 +34,10 @@ description: |-
     other than `done`/`nothing`, a refusal with exit 0, exit 3 without a refusal or with `result`
     `done`, a `release` without `version` — is a failure naming the breach (`the installer breaks
     the machine interface`), never a refusal or a success.
+- On a VM, the event journal (`<short>-stow events --after N --json`, one entry per line, each
+  with its `kind`) is read after an upgrade's or a rollback's reboot for the health gate's
+  `boot.judged` verdicts; a line that is not an entry, or a run that fails, is an error the wait
+  tries again.
 - **Unknown fields are tolerated** (an installer adds fields without moving `format`); a known
   field of the wrong type, data after the object, a missing `name` or `version`, and a
   `describe` `short_name` that is not one path element (`[a-z0-9][a-z0-9._-]*`) are errors.

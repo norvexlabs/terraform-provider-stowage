@@ -21,7 +21,12 @@ follow [SemVer](https://semver.org/).
   on. `secrets_wo` goes to the VM's first install, for a seed that awaits it. A change of inputs
   re-runs the install; a new `vm.version` upgrades the VM and follows its reboot until the health
   gate judged it, a fallback or a kept failed boot being an error that saves the release the VM
-  runs; `previous.version` with `allow_rollback` rolls it back. Read reports the release the VM
+  runs; `previous.version` with `allow_rollback` rolls it back. Either reboot is followed to the
+  health gate's verdict on the boot the VM settles in, read from the VM's event journal (a
+  fallback's passive boot judged in turn), and an unhealthy verdict is an error naming the gate's
+  reasons; a release change on a VM whose status names no event journal is refused before it
+  runs. The VM's status, journal, upgrade and rollback runs are logged at debug level
+  (`TF_LOG_PROVIDER=DEBUG`), the verbs' standard output only. Read reports the release the VM
   runs; destroy forgets the install; import takes `vm:<host>/<short>-stow`. `vm.short_name` and
   `vm.channel` are first-install only, a channel other than the VM's refused; a VM without the
   installer state names (a release that renamed it) is told apart from another failure, with the

@@ -81,7 +81,9 @@ argument.
      The refusals that need no change come first: a rollback without `allow_rollback`, a secret
      input in `inputs`, a rollback with other changes, an imported state's `vm.channel` other than
      the VM's (`vm.channel is not the VM's`), and a release change on a status without `boot_id`
-     (`The VM reports no boot_id`: its reboot could not be followed). Then the keys,
+     (`The VM reports no boot_id`: its reboot could not be followed) or without `events` (`The VM
+     reports no event journal`, with its `events_error`: the health gate's verdict could not be
+     read). Then the keys,
      before anything else changes on the VM: when state has no `vm.host_key_line` yet (it could
      not be read at create; an imported state), the VM's own key is learnt under the
      configuration's key as at create (step 5: the verb, the one-time key retired and the
@@ -108,14 +110,33 @@ argument.
      reboot beginning); or the **rollback**, `sudo -n <short>-stow rollback --yes --json`, alone (a
      change of inputs, secret inputs, TLS mode, domains or ports with it is an error, `a rollback
      goes alone`). The VM's upgrade takes no input.
-  5. The reboot followed: `status --json` every 10 seconds (ssh failing meanwhile) until its
-     `boot_id` is another than before and `on_trial` is false (the health gate judged the new
-     boot), within the update timeout. A status without `boot_id` is an error (the reboot cannot
-     be followed). When the VM then runs another release than `vm.version`, or its `failed_boot`
-     is a new one of that release (a boot the gate kept, as going back was refused), it is an
-     error naming the gate's reason — `The VM's health gate found <v>'s boot unhealthy: <reason>`,
-     then that it went back to the release it runs, or the kept boot's reason — and state saves
-     the release the VM runs, so the next plan proposes the change again.
+  5. The reboot followed to the health gate's verdict: every 10 seconds (ssh failing
+     meanwhile), the event journal after the entry the status before the change named
+     (`<short>-stow events --after <events> --json`), until the last boot it judges after the
+     change's has a verdict other than `went_back`; then `status --json`, and the wait ends when
+     the VM answers from that boot. The gate judges every boot once its boot unit has taken the
+     install to the release the OS carries (a rollback's passive boot answers before that, never
+     on trial), so the verdict, never the status alone, ends the wait. A `went_back` verdict (an
+     upgrade's trial boot not kept) is waited past: the passive system's boot is judged in turn.
+     All within the update timeout; when it runs out, the error says what was waited on and names
+     the `went_back` verdicts read (one whose reboot failed leaves the VM in that boot, which the
+     error says), and state stays as step 3 saved it. When the VM then runs another release than
+     `vm.version`, or the last verdict is `kept_unhealthy`, it is an error naming each verdict —
+     `The VM's health gate did not keep <v>'s boot (<reason>): the VM went back to the passive
+     system.` (or `…, and the VM still runs that boot: its next boot goes to the passive system.`),
+     `Kairos booted the passive system: the upgrade's boot failed before the health gate judged
+     it` (an upgrade's fallback with no verdict), `The VM's health gate found <v>'s boot
+     unhealthy: <reason>.`, with `It kept that boot, as going back is refused: <why>.` for a boot
+     on trial — then `After its reboot the VM runs <release> (wanted: <vm.version>).`; state
+     saves the release the VM runs, so the next plan proposes the change again — or, when it
+     runs `vm.version` unhealthy, says no plan changes that (fix what the gate found), and that
+     the next plan proposes the re-run of what the new release adds, when it adds something.
+     At debug level (`TF_LOG_PROVIDER=DEBUG`, or `TF_LOG_PROVIDER_STOWAGE` for this
+     provider alone), each `status --json`, `events --json`, `upgrade` and `rollback` run on the
+     VM is logged as `ran on the VM`: the command, its exit, its standard output (the status,
+     which names input keys and never a value, the journal's entries, or the verb's JSON result;
+     its first 16 KiB), and the standard error of the reads; a verb's standard error, its run's
+     free-text log, is logged by its size alone.
   6. After an upgrade, `describe --json` of the new release, then the re-run again with what it
      adds: the inputs and secret inputs the old release did not declare, and the `domains` and
      `ports` of routes state does not record. An input given a non-empty value the new release

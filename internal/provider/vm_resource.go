@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -211,19 +212,93 @@ func (r *installResource) settleVM(ctx context.Context, v installer.VM) (*instal
 	return st, err
 }
 
-// rebooted reads the VM until it answers from a boot other than before, its health gate's trial
-// over: the reboot an upgrade or a rollback scheduled, followed.
-func (r *installResource) rebooted(ctx context.Context, v installer.VM, before string) (*installer.VMStatus, error) {
+// bootVerdict is what followed a reboot, from the VM's event journal: the health gate's verdict
+// on the boot the VM settled in (healthy or kept_unhealthy; zero when none was read), the
+// went_back verdicts of the boots judged on the way, the boot the VM ran at the last read, and
+// whether that boot is Kairos's fallback (the passive system); back: the change was a rollback,
+// whose passive boot is the fallback by choice.
+type bootVerdict struct {
+	final    installer.Event
+	wentBack []installer.Event
+	boot     string
+	fallback bool
+	back     bool
+}
+
+// rebooted reads the VM until the health gate judged a boot other than before's and the VM
+// stays in it: the reboot an upgrade or a rollback scheduled, followed to its verdict. The gate
+// judges every boot, after its boot unit has taken the install to the release the OS carries (a
+// rollback's passive boot answers before that; it is never on trial), so the verdict, never the
+// status alone, ends the wait. Each poll reads the journal after the entry before's status named;
+// a boot whose last verdict is went_back is waited on (the gate reboots it into the passive
+// system, whose boot is judged in turn; a went_back whose reboot failed leaves the VM in that
+// boot, and the wait runs out naming it). The status is read once a verdict ends the wait,
+// which it does when the VM runs the boot judged; on a timeout, the error names the verdicts read.
+func (r *installResource) rebooted(ctx context.Context, v installer.VM, before *installer.VMStatus, back bool) (*installer.VMStatus, *bootVerdict, error) {
 	var st *installer.VMStatus
-	err := r.wait(ctx, "the VM had not come back from its reboot with its health gate's trial over", resourceTimeout, func() (bool, error) {
-		s, err := v.Status(ctx)
+	var after int64
+	if before.Events != nil {
+		after = *before.Events
+	}
+	var judged []installer.Event // each boot's last verdict, boots after before's, in the journal's order
+	err := r.wait(ctx, "the VM had not come back from its reboot with the health gate's verdict on its boot", resourceTimeout, func() (bool, error) {
+		evs, err := v.Events(ctx, after)
 		if err != nil {
 			return false, err // rebooting: ssh fails, or the daemon is not up yet
 		}
+		for _, e := range evs {
+			after = e.Seq // as Stowage's own reader: a journal that started again is read on from its entries
+			if e.Kind != installer.EvBootJudged || e.BootID == "" || e.BootID == before.BootID {
+				continue
+			}
+			if i := slices.IndexFunc(judged, func(j installer.Event) bool { return j.BootID == e.BootID }); i >= 0 {
+				judged[i] = e
+			} else {
+				judged = append(judged, e)
+			}
+		}
+		if len(judged) == 0 {
+			return false, errors.New("the journal holds no verdict yet on a boot after the change's")
+		}
+		e := judged[len(judged)-1]
+		if e.Verdict == installer.VerdictWentBack {
+			s, err := v.Status(ctx)
+			if err != nil {
+				return false, err
+			}
+			st = s // the boot the VM runs, for the timeout's account
+			if s.BootID == e.BootID {
+				return false, fmt.Errorf("the gate did not keep boot %s, and the VM still runs it", e.BootID)
+			}
+			return false, fmt.Errorf("the gate did not keep boot %s; the VM answers from boot %s, not judged yet", e.BootID, s.BootID)
+		}
+		s, err := v.Status(ctx)
+		if err != nil {
+			return false, err // the verdicts are kept: the next poll reads on
+		}
 		st = s
-		return s.BootID != "" && s.BootID != before && !s.OnTrial, nil
+		if s.BootID != e.BootID {
+			return false, fmt.Errorf("the gate judged boot %s, and the VM answers from boot %s", e.BootID, s.BootID)
+		}
+		return true, nil
 	})
-	return st, err
+	verdict := &bootVerdict{back: back}
+	for _, e := range judged {
+		if e.Verdict == installer.VerdictWentBack {
+			verdict.wentBack = append(verdict.wentBack, e)
+		}
+	}
+	if st != nil {
+		verdict.boot, verdict.fallback = st.BootID, st.Fallback
+	}
+	if err != nil {
+		if d := verdictDetail("", "", verdict); d != "" {
+			err = fmt.Errorf("%w. %s", err, d)
+		}
+		return st, verdict, err
+	}
+	verdict.final = judged[len(judged)-1]
+	return st, verdict, nil
 }
 
 // applyVMStatus puts the VM's status into m: on a read, the release the VM runs replaces
@@ -576,13 +651,14 @@ func (u *vmUpdate) release(ctx context.Context, final, was *installModel, st *in
 		return
 	}
 	var now *installer.VMStatus
+	var verdict *bootVerdict
 	reboots := !(res != nil && res.Result == "nothing")
 	if !reboots {
 		if now, err = u.v.Status(ctx); err != nil {
 			addInstallerError(u.diags, "Reading the VM", err)
 			return // state stays as before the upgrade
 		}
-	} else if now, err = u.r.rebooted(ctx, u.v, st.BootID); err != nil {
+	} else if now, verdict, err = u.r.rebooted(ctx, u.v, st, back); err != nil {
 		u.diags.AddError(verb, err.Error())
 		return // state stays as before the upgrade: the response holds it
 	}
@@ -610,7 +686,7 @@ func (u *vmUpdate) release(ctx context.Context, final, was *installModel, st *in
 		*was = keyed
 		if err != nil {
 			u.diags.AddError("Cannot reach the VM", err.Error())
-			u.failed(was, now, "", desired)
+			u.failed(was, now, "", desired, nil, false)
 			return
 		}
 		u.v = v
@@ -619,8 +695,8 @@ func (u *vmUpdate) release(ctx context.Context, final, was *installModel, st *in
 	if now.Installed != nil {
 		runs = now.Installed.Version
 	}
-	if runs != desired || (now.FailedBoot != nil && !now.FailedBoot.Same(st.FailedBoot) && now.FailedBoot.Release.Version == desired) {
-		u.failed(was, now, verb, desired)
+	if runs != desired || (verdict != nil && verdict.final.Verdict != installer.VerdictHealthy) {
+		u.failed(was, now, verb, desired, verdict, !later.Empty())
 		return
 	}
 	if !later.Empty() {
@@ -629,17 +705,17 @@ func (u *vmUpdate) release(ctx context.Context, final, was *installModel, st *in
 		next, err := u.v.Describe(ctx)
 		if err != nil {
 			addInstallerError(u.diags, "Reading the VM's installer of "+desired, err)
-			u.failed(was, now, "", desired)
+			u.failed(was, now, "", desired, nil, false)
 			return
 		}
 		refuseSecretInputs(u.diags, later.Inputs, next)
 		if u.diags.HasError() {
-			u.failed(was, now, "", desired)
+			u.failed(was, now, "", desired, nil, false)
 			return
 		}
 		if _, err := u.v.Install(ctx, installer.VMInstall{Change: later}); err != nil {
 			addInstallerError(u.diags, "Giving the VM what "+desired+" adds", err)
-			u.failed(was, now, "", desired)
+			u.failed(was, now, "", desired, nil, false)
 			return
 		}
 		// A status that cannot be read now keeps the one read after the reboot: the release the
@@ -659,9 +735,10 @@ func (u *vmUpdate) release(ctx context.Context, final, was *installModel, st *in
 	u.save(final)
 }
 
-// failed saves was with the release the VM runs and says why it is not desired: the health
-// gate's verdict when it judged the new boot. verb empty: the error is said already.
-func (u *vmUpdate) failed(was *installModel, st *installer.VMStatus, verb, desired string) {
+// failed saves was with the release the VM runs and says why it is not desired, or runs it
+// unhealthy: the health gate's verdicts when a reboot was followed (v). verb empty: the error is
+// said already. adds: the new release adds what a re-run gives (inputs, domains, ports).
+func (u *vmUpdate) failed(was *installModel, st *installer.VMStatus, verb, desired string, v *bootVerdict, adds bool) {
 	m := *was
 	if st != nil {
 		applyVMStatus(&m, st, true)
@@ -672,19 +749,54 @@ func (u *vmUpdate) failed(was *installModel, st *installer.VMStatus, verb, desir
 		if st != nil && st.Installed != nil {
 			runs = st.Installed.Version
 		}
-		detail := fmt.Sprintf("After its reboot the VM runs %s, not %s.", runs, desired)
-		if st != nil && st.FailedBoot != nil && st.FailedBoot.Release.Version == desired {
-			fb := st.FailedBoot
-			detail = fmt.Sprintf("The VM's health gate found %s's boot unhealthy: %s.", desired, fb.Reason)
-			if fb.Kept != "" {
-				detail += fmt.Sprintf(" It kept that boot, as going back is refused: %s.", fb.Kept)
-			} else {
-				detail += fmt.Sprintf(" The VM went back to %s.", runs)
+		next := " State holds the release the VM runs: the next plan proposes the change again."
+		if runs == desired {
+			next = " State holds " + desired + ", the release the VM runs, unhealthy: no plan changes that; fix what the gate found."
+			if adds {
+				next += " What " + desired + " adds (inputs, domains, ports) was not given: the next plan proposes that re-run."
 			}
 		}
-		u.diags.AddError(verb+" failed", detail+" State holds the release the VM runs: the next plan proposes the change again. `<short>-stow status` and `events` on the VM tell more.")
+		u.diags.AddError(verb+" failed", verdictDetail(runs, desired, v)+next+" `<short>-stow status` and `events` on the VM tell more.")
 	}
 	u.save(&m)
+}
+
+// verdictDetail says why the VM runs runs, not desired, or runs it unhealthy, from the gate's
+// verdicts v (nil: no reboot was followed); desired empty: the verdicts alone, a wait that ran out.
+func verdictDetail(runs, desired string, v *bootVerdict) string {
+	if v == nil {
+		return fmt.Sprintf("The VM runs %s, not %s.", runs, desired)
+	}
+	var parts []string
+	for _, w := range v.wentBack {
+		why := cmp.Or(w.Reason, "no reason given")
+		if w.BootID == v.boot {
+			parts = append(parts, fmt.Sprintf("The VM's health gate did not keep %s's boot (%s), and the VM still runs that boot: its next boot goes to the passive system.", eventRelease(w), why))
+		} else {
+			parts = append(parts, fmt.Sprintf("The VM's health gate did not keep %s's boot (%s): the VM went back to the passive system.", eventRelease(w), why))
+		}
+	}
+	if len(v.wentBack) == 0 && v.fallback && !v.back {
+		parts = append(parts, "Kairos booted the passive system: the upgrade's boot failed before the health gate judged it (its console or `journalctl -b -1` on the VM tells why).")
+	}
+	switch f := v.final; {
+	case f.Verdict == installer.VerdictKeptUnhealthy && f.OnTrial != nil && *f.OnTrial:
+		parts = append(parts, fmt.Sprintf("The VM's health gate found %s's boot unhealthy: %s. It kept that boot, as going back is refused: %s.", eventRelease(f), cmp.Or(f.Reason, "no reason given"), cmp.Or(f.Kept, "no reason given")))
+	case f.Verdict == installer.VerdictKeptUnhealthy:
+		parts = append(parts, fmt.Sprintf("The VM's health gate found %s's boot unhealthy: %s.", eventRelease(f), cmp.Or(f.Reason, "no reason given")))
+	}
+	if desired != "" {
+		parts = append(parts, fmt.Sprintf("After its reboot the VM runs %s (wanted: %s).", runs, desired))
+	}
+	return strings.Join(parts, " ")
+}
+
+// eventRelease is the version an event names, "a release" when it names none.
+func eventRelease(e installer.Event) string {
+	if e.Release == nil {
+		return "a release"
+	}
+	return e.Release.Version
 }
 
 func (r *installResource) readVM(ctx context.Context, m *installModel, resp *resource.ReadResponse) {
@@ -792,6 +904,11 @@ func (r *installResource) updateVM(ctx context.Context, req resource.UpdateReque
 	if step != stay && st.BootID == "" {
 		resp.Diagnostics.AddError("The VM reports no boot_id",
 			"Its status has no boot_id, so the release change's reboot could not be followed: nothing was run. Read `<short>-stow status` on the VM.")
+		return
+	}
+	if step != stay && st.Events == nil {
+		resp.Diagnostics.AddError("The VM reports no event journal",
+			fmt.Sprintf("Its status has no events (%s), so the health gate's verdict on the release change's reboot could not be read: nothing was run. Read `<short>-stow status` on the VM.", cmp.Or(st.EventsError, "no events_error either")))
 		return
 	}
 	// The keys, before anything else changes on the VM: its own, when state has none yet (it

@@ -212,11 +212,48 @@ tf() { (cd "$ROOT" && tofu "$@"); }
 destroyed=
 # A run that fails destroys the VM still: the install forgotten (its delete runs nothing), the module destroyed.
 CLEANUP=("[[ -n \$destroyed ]] || (cd $ROOT && tofu state rm stowage_install.vm >>$WORK/destroy.log 2>&1; tofu destroy -auto-approve >>$WORK/destroy.log 2>&1)" "${CLEANUP[@]}")
+# A run killed mid-apply leaves apply_logged's raw debug log: removed here.
+CLEANUP=("rm -f $WORK/*.raw.log" "${CLEANUP[@]}")
 tf init -input=false >"$WORK/init.log" 2>&1 || { cat "$WORK/init.log"; fail "tofu init"; }
 
 step "apply: the seed, the VM, its first install over SSH under the one-time key"
 tf apply -input=false -auto-approve >"$WORK/apply1.log" 2>&1 || { tail -80 "$WORK/apply1.log"; fail "the first apply"; }
 on() { ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$WORK/known_hosts" -o HostKeyAlias=acc-vm -i "$KEY" -o IdentitiesOnly=yes "ops@$ADDR" -- "$@"; }
+# apply_logged <name> <tofu apply arguments…> runs the apply with the provider's debug log on
+# (TF_LOG_PROVIDER opens OpenTofu's provider log; the TrueNAS and external providers are turned
+# off; one logging otherwise still could), keeps from it this provider's "ran on the VM" entries alone — the command, its exit, its
+# standard output, and the indented `  | …` lines of a multi-line field — in $WORK/<name>.vm.log,
+# and removes the raw log, which another provider could have written a credential to.
+apply_logged() {
+	local name=$1 rc=0
+	shift
+	TF_LOG_PROVIDER=DEBUG TF_LOG_PROVIDER_TRUENAS=OFF TF_LOG_PROVIDER_EXTERNAL=OFF TF_LOG_PATH="$WORK/$name.raw.log" \
+		tf apply "$@" >"$WORK/$name.log" 2>&1 || rc=$?
+	if [[ -f $WORK/$name.raw.log ]]; then
+		awk '/ran on the VM/ { on = 1; print; next } on && /^[[:space:]]+\|/ { print; next } { on = 0 }' "$WORK/$name.raw.log" >"$WORK/$name.vm.log" || true
+		rm -f "$WORK/$name.raw.log"
+	fi
+	return "$rc"
+}
+
+# vm_dump [<name>] prints, before the teardown, what the provider ran on the VM in apply <name>
+# (apply_logged's entries) and the VM's own account: its status, its event journal and this
+# boot's boot unit and health gate.
+vm_dump() {
+	if [[ -n ${1:-} && -f $WORK/$1.vm.log ]]; then
+		printf -- '--- the provider on the VM (%s)\n' "$1" >&2
+		tail -400 "$WORK/$1.vm.log" >&2
+	fi
+	printf -- '--- status --json\n' >&2
+	on notes-stow status --json >&2 || true
+	printf -- '--- events (the last 100)\n' >&2
+	on notes-stow events --json | tail -100 >&2 || true
+	local b
+	for b in -1 0; do # the boot before (a trial boot that fell back) and this one
+		printf -- '--- journal: notes.service, notes-health.service (boot %s)\n' "$b" >&2
+		on sudo -n journalctl -b "$b" --no-pager -u notes.service -u notes-health.service | tail -120 >&2 || true
+	done
+}
 own=$(tf output -raw host_key_line)
 [[ $own == "$ADDR ssh-ed25519 "* ]] || fail "host_key_line is $own"
 printf 'acc-vm %s\n' "${own#* }" >"$WORK/known_hosts"
@@ -259,7 +296,7 @@ printf '1.0.1\n' >"$P/VERSION"
 printf '### Changed\n- Release 1.0.1.\n' >"$P/changes/1.0.1.md"
 "${S[@]}" ship --channel beta 2>"$WORK/ship-1.0.1.log" || { tail -50 "$WORK/ship-1.0.1.log"; fail "ship 1.0.1"; }
 mirror "$WORK/r2.oci.tar" --disks none
-TF_VAR_release_version=1.0.1 tf apply -input=false -auto-approve >"$WORK/apply3.log" 2>&1 || { tail -80 "$WORK/apply3.log"; fail "the upgrade"; }
+TF_VAR_release_version=1.0.1 apply_logged apply3 -input=false -auto-approve || { tail -80 "$WORK/apply3.log"; vm_dump apply3; fail "the upgrade"; }
 [[ $(tf output -raw version) == 1.0.1 ]] || fail "state's version after the upgrade: $(tf output -raw version)"
 [[ -z $(tf output -raw seed_boot_id 2>/dev/null || true) ]] || fail "seed_boot_id is set after the upgrade's reboot"
 [[ $(on cat /proc/sys/kernel/random/boot_id) != "$boot" ]] || fail "the upgrade did not reboot the VM"
@@ -273,9 +310,9 @@ if [[ $rc == 0 ]] || ! grep -q 'a rollback needs allow_rollback' "$WORK/plan2.lo
 	cat "$WORK/plan2.log"
 	fail "a rollback without allow_rollback is not a plan error"
 fi
-TF_VAR_release_version=1.0.0 TF_VAR_allow_rollback=true tf apply -input=false -auto-approve >"$WORK/apply4.log" 2>&1 || { tail -80 "$WORK/apply4.log"; fail "the rollback"; }
-[[ $(tf output -raw version) == 1.0.0 ]] || fail "state's version after the rollback: $(tf output -raw version)"
-on sudo notes-stow status --json | jq -e '.installed.version == "1.0.0" and .boot == "passive"' >/dev/null || fail "the VM is not on 1.0.0, in its passive system"
+TF_VAR_release_version=1.0.0 TF_VAR_allow_rollback=true apply_logged apply4 -input=false -auto-approve || { tail -80 "$WORK/apply4.log"; vm_dump apply4; fail "the rollback"; }
+[[ $(tf output -raw version) == 1.0.0 ]] || { vm_dump apply4; fail "state's version after the rollback: $(tf output -raw version)"; }
+on notes-stow status --json | jq -e '.installed.version == "1.0.0" and .boot == "passive"' >/dev/null || { vm_dump apply4; fail "the VM is not on 1.0.0, in its passive system"; }
 
 step "destroy: the install forgotten, the VM destroyed by its module"
 TF_VAR_release_version=1.0.0 TF_VAR_deletion_protection=false tf apply -input=false -auto-approve -target=stowage_install.vm >"$WORK/apply5.log" 2>&1 || { tail -40 "$WORK/apply5.log"; fail "deletion_protection off"; }

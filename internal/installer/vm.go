@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 
+	"github.com/hashicorp/terraform-plugin-log/tflog"
 	"github.com/norvexlabs/terraform-provider-stowage/internal/target"
 )
 
@@ -89,6 +92,64 @@ type VMStatus struct {
 	// BootID is the kernel's id of this boot: it changes at every reboot. Empty when the VM
 	// cannot read it.
 	BootID string `json:"boot_id"`
+	// Events is the event journal's last entry number (0 before the first); nil when the journal
+	// cannot be read, EventsError then saying why.
+	Events      *int64 `json:"events"`
+	EventsError string `json:"events_error"`
+}
+
+// Event is an entry of the VM's event journal (`events --json`), the fields the provider reads:
+// a boot.judged entry is the health gate's verdict on one boot (healthy, went_back or
+// kept_unhealthy), its reason, and why a boot found unhealthy keeps running.
+type Event struct {
+	Seq     int64    `json:"seq"`
+	Kind    string   `json:"kind"`
+	BootID  string   `json:"boot_id"`
+	Release *Release `json:"release"`
+	OnTrial *bool    `json:"on_trial"`
+	Verdict string   `json:"verdict"`
+	Reason  string   `json:"reason"`
+	Kept    string   `json:"kept"`
+}
+
+// The health gate's verdicts on a boot.
+const (
+	EvBootJudged         = "boot.judged"
+	VerdictHealthy       = "healthy"
+	VerdictWentBack      = "went_back"
+	VerdictKeptUnhealthy = "kept_unhealthy"
+)
+
+// Events runs the VM's `<short>-stow events --after N --json`: the journal's entries after N, one
+// JSON object per line.
+func (v VM) Events(ctx context.Context, after int64) ([]Event, error) {
+	ctl, err := v.ctl()
+	if err != nil {
+		return nil, err
+	}
+	argv := []string{ctl, "events", "--after", fmt.Sprint(after), "--json"}
+	stdout, stderr, exit, err := v.Runner.Run(ctx, argv, nil)
+	logRun(ctx, argv, stdout, stderr, true, exit, err)
+	if err != nil {
+		return nil, fmt.Errorf("events: %w", err)
+	}
+	if exit != 0 {
+		return nil, &FailedError{Verb: "events", Exit: exit, Stderr: tail(stderr)}
+	}
+	var out []Event
+	dec := json.NewDecoder(bytes.NewReader(stdout))
+	for {
+		var e Event
+		if err := dec.Decode(&e); errors.Is(err, io.EOF) {
+			return out, nil
+		} else if err != nil {
+			return nil, fmt.Errorf("events --json: %w", err)
+		}
+		if e.Kind == "" || e.Seq <= 0 {
+			return nil, fmt.Errorf("events --json: an entry without a kind or a seq")
+		}
+		out = append(out, e)
+	}
 }
 
 // FailedBoot is a boot the health gate found unhealthy: the release it ran, when, why, and why
@@ -98,14 +159,6 @@ type FailedBoot struct {
 	At      string  `json:"at"`
 	Reason  string  `json:"reason"`
 	Kept    string  `json:"kept"`
-}
-
-// Same says whether f and g name the same failed boot (both nil included).
-func (f *FailedBoot) Same(g *FailedBoot) bool {
-	if f == nil || g == nil {
-		return f == g
-	}
-	return f.Release == g.Release && f.At == g.At && f.Reason == g.Reason && f.Kept == g.Kept
 }
 
 // ParseVMStatus reads the VM's `status --json`.
@@ -140,7 +193,9 @@ func (v VM) Status(ctx context.Context) (*VMStatus, error) {
 	if err != nil {
 		return nil, err
 	}
-	stdout, stderr, exit, err := v.Runner.Run(ctx, []string{ctl, "status", "--json"}, nil)
+	argv := []string{ctl, "status", "--json"}
+	stdout, stderr, exit, err := v.Runner.Run(ctx, argv, nil)
+	logRun(ctx, argv, stdout, stderr, true, exit, err)
 	if err != nil {
 		return nil, fmt.Errorf("status: %w", err)
 	}
@@ -217,7 +272,9 @@ func (v VM) rebooting(ctx context.Context, verb string, args ...string) (*Result
 	if err != nil {
 		return nil, err
 	}
-	stdout, stderr, exit, err := v.Runner.Run(ctx, append([]string{"sudo", "-n", ctl}, args...), nil)
+	argv := append([]string{"sudo", "-n", ctl}, args...)
+	stdout, stderr, exit, err := v.Runner.Run(ctx, argv, nil)
+	logRun(ctx, argv, stdout, stderr, false, exit, err)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", verb, err)
 	}
@@ -225,6 +282,34 @@ func (v VM) rebooting(ctx context.Context, verb string, args ...string) (*Result
 		return nil, fmt.Errorf("%s: %w (%s)", verb, ErrCut, tail(stderr))
 	}
 	return Outcome(verb, stdout, stderr, exit)
+}
+
+// logRun logs, at debug level, a command of the machine interface and its standard output (its
+// first 16 KiB): the status (input keys alone, never a value), the event journal's entries (the
+// daemon's and the gate's records: kinds, releases, verdicts and their reasons), or the upgrade's
+// or the rollback's JSON result. withStderr is set for the reads, whose standard error is the
+// daemon's own error; a verb's standard error is its run's free-text log, of which the size alone
+// is logged. TF_LOG_PROVIDER_STOWAGE=DEBUG shows the entries.
+func logRun(ctx context.Context, argv []string, stdout, stderr []byte, withStderr bool, exit int, err error) {
+	fields := map[string]any{"argv": strings.Join(argv, " "), "exit": exit, "stdout": head(stdout)}
+	if withStderr {
+		fields["stderr"] = tail(stderr)
+	} else {
+		fields["stderr_bytes"] = len(stderr)
+	}
+	if err != nil {
+		fields["error"] = err.Error()
+	}
+	tflog.Debug(ctx, "ran on the VM", fields)
+}
+
+// head is b's first 16 KiB, cut on a character: a JSON document's leading fields are the ones read.
+func head(b []byte) string {
+	const max = 16 << 10
+	if len(b) <= max {
+		return string(b)
+	}
+	return strings.ToValidUTF8(string(b[:max]), "") + "…"
 }
 
 // HostKey reads the VM's own ed25519 host key, `ssh-ed25519 <base64>`, through the connection,

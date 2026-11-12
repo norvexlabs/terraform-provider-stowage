@@ -56,6 +56,10 @@ type Release struct {
 	Installer string `json:"installer,omitempty"`
 }
 
+// Same says whether r and o are one release: the version and the revision (never the installer
+// that carries it).
+func (r Release) Same(o Release) bool { return r.Version == o.Version && r.Revision == o.Revision }
+
 func (r *Release) check(doc, field string) error {
 	if r == nil {
 		return nil
