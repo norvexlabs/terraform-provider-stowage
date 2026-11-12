@@ -66,6 +66,7 @@ ACC_RUN       = $(ACC_RUN_BASE) $(ACC_IMAGE)
 
 acc-image:
 	DOCKER_BUILDKIT=1 docker buildx build --load --build-arg TOFU_VERSION=$(TOFU_VERSION) --build-arg TOFU_SHA=$(TOFU_SHA) \
+	  --build-arg UID=$(shell id -u) --build-arg GID=$(shell id -g) --build-arg HOME_DIR=$(HOME) \
 	  -t $(ACC_IMAGE) -f test/acc.Dockerfile test
 
 acc-k8s: build acc-image    ## the Kubernetes target through tofu on a kind cluster, against a real Stowage (STOWAGE_REPO, default ~/stowage), in the acceptance runner; prints PASS

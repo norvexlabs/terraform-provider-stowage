@@ -45,7 +45,8 @@ ssh, ssh-keygen and network access.
 
 `make acc-k8s` (`test/acc-k8s.sh`) builds the provider and the acceptance runner
 (`test/acc.Dockerfile`: OpenTofu of `test/tofu.sh`'s pin, the Docker CLI, ssh, xorriso, oras,
-zstd, jq and the harness's tools, pinned), then runs
+zstd, jq and the harness's tools, pinned, and a passwd entry for the caller's uid and gid with
+`HOME` as its home, built in from `id -u`/`id -g`: OpenSSH refuses a uid it cannot name), then runs
 the provider through `tofu` (`dev_overrides` in a CLI configuration of its own) in that runner,
 capped at 4 GiB, driving the host's Docker through its socket, with Stowage's test harness:
 `STOWAGE_REPO` (default `~/stowage`) holds a built `bin/stowage` and its `test/lib.sh` (zot, a kind

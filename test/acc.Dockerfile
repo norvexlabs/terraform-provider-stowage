@@ -23,5 +23,14 @@ RUN test -n "${TOFU_VERSION}" && test -n "${TOFU_SHA}" \
     && echo "${ORAS_SHA256}  /tmp/oras.tgz" | sha256sum -c - \
     && tar -xzf /tmp/oras.tgz -C /usr/local/bin oras && rm /tmp/oras.tgz \
     && oras version
+# The user the runs run as (`docker run -u UID:GID`), its home the run's HOME: OpenSSH refuses a
+# uid with no passwd entry ("No user exists for uid"). The Makefile passes the caller's.
+ARG UID
+ARG GID
+ARG HOME_DIR
+RUN test -n "${UID}" && test -n "${GID}" && test -n "${HOME_DIR}" \
+    && { getent group "${GID}" >/dev/null || groupadd -g "${GID}" acc; } \
+    && { getent passwd "${UID}" >/dev/null || useradd -u "${UID}" -g "${GID}" -d "${HOME_DIR}" -M -N -s /bin/bash acc; } \
+    && getent passwd "${UID}"
 COPY --from=docker /usr/local/bin/docker /usr/local/bin/docker
 COPY --from=docker /usr/local/libexec/docker/cli-plugins /usr/local/libexec/docker/cli-plugins
