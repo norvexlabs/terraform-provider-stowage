@@ -36,24 +36,35 @@ const (
 // it replaces): the login changes where the client reads credentials, never which daemon it talks
 // to. KEY is a registry host or Docker Hub's key (ValidRegistryHost), safe in JSON as it is; the
 // base64 of the login is too. A password file that is missing or empty, or no base64, stops the
-// script before anything runs.
+// script before anything runs. Each call adds its entry to the same configuration. __stowage_mirror
+// logs in the mirror's login when the tar carried one (mirror-host, mirror-user, mirror-password:
+// MirrorFiles), never a file flag.
 const LoginScript = `__stowage_from=${DOCKER_CONFIG:-${HOME:-/nonexistent}/.docker}
 case $__stowage_from in /*) ;; *) __stowage_from=$PWD/$__stowage_from ;; esac
+__stowage_auths=
 __stowage_login() {
   [ -s "$3" ] || { echo "stowage-provider: the login's password did not arrive" >&2; exit 1; }
   command -v base64 >/dev/null || { echo "stowage-provider: base64 is missing: a login needs it" >&2; exit 1; }
-  __stowage_ctx=$(docker context show 2>/dev/null || true)
-  DOCKER_CONFIG=$__stowage_d/docker
-  export DOCKER_CONFIG
-  mkdir "$DOCKER_CONFIG"
-  if [ -d "$__stowage_from/contexts" ]; then ln -s "$__stowage_from/contexts" "$DOCKER_CONFIG/contexts"; fi
+  if [ -z "$__stowage_auths" ]; then
+    __stowage_ctx=$(docker context show 2>/dev/null || true)
+    DOCKER_CONFIG=$__stowage_d/docker
+    export DOCKER_CONFIG
+    mkdir "$DOCKER_CONFIG"
+    if [ -d "$__stowage_from/contexts" ]; then ln -s "$__stowage_from/contexts" "$DOCKER_CONFIG/contexts"; fi
+    case $__stowage_ctx in
+    "" | default) __stowage_cur= ;;
+    *) __stowage_cur=',"currentContext":"'$__stowage_ctx'"' ;;
+    esac
+  fi
   __stowage_auth=$({ printf '%s:' "$2"; cat "$3"; } | base64 | tr -d '\n')
   [ -n "$__stowage_auth" ] || { echo "stowage-provider: the login could not be encoded" >&2; exit 1; }
-  case $__stowage_ctx in
-  "" | default) __stowage_cur= ;;
-  *) __stowage_cur=',"currentContext":"'$__stowage_ctx'"' ;;
-  esac
-  printf '{"auths":{"%s":{"auth":"%s"}}%s}\n' "$1" "$__stowage_auth" "$__stowage_cur" > "$DOCKER_CONFIG/config.json"
+  __stowage_auths=${__stowage_auths:+$__stowage_auths,}'"'$1'":{"auth":"'$__stowage_auth'"}'
+  printf '{"auths":{%s}%s}\n' "$__stowage_auths" "$__stowage_cur" > "$DOCKER_CONFIG/config.json"
+}
+__stowage_mirror() {
+  if [ -f "$__stowage_d/mirror-password" ]; then
+    __stowage_login "$(cat "$__stowage_d/mirror-host")" "$(cat "$__stowage_d/mirror-user")" "$__stowage_d/mirror-password"
+  fi
 }
 `
 
@@ -115,13 +126,13 @@ if [ -n "$__stowage_kubeconfig" ]; then KUBECONFIG=$__stowage_kubeconfig; export
 shift 4
 `
 	}
-	pre, extract, logIn := "", `if [ -n "$__stowage_files" ]; then
-`, ""
+	pre, extract, logIn := LoginScript, `if [ -n "$__stowage_files" ]; then
+`, "__stowage_mirror\n"
 	if login || kube {
-		pre = LoginScript
 		extract = `if [ -n "$__stowage_files" ] || [ -n "$__stowage_user" ]; then
 `
 		logIn = `if [ -n "$__stowage_user" ]; then __stowage_login "$__stowage_host" "$__stowage_user" "$__stowage_d/login-password"; fi
+__stowage_mirror
 `
 	}
 	return `set -eu
@@ -132,7 +143,10 @@ __stowage_d=$(mktemp -d)
 trap 'rm -rf "$__stowage_d"' EXIT
 trap 'exit 130' HUP INT TERM
 ` + extract + `  tar -xf - -C "$__stowage_d"
-  for __stowage_f in $__stowage_files; do set -- "$@" "--$__stowage_f" "$__stowage_d/$__stowage_f"; done
+  for __stowage_f in $__stowage_files; do
+    case $__stowage_f in mirror-*) continue ;; esac
+    set -- "$@" "--$__stowage_f" "$__stowage_d/$__stowage_f"
+  done
 fi
 ` + logIn + `umask "$__stowage_old"
 __stowage_rc=0
@@ -186,8 +200,8 @@ func loginInput(files map[string]string, login *Login) (names, host, user string
 // does. Exit NotInstalled: no install directory. Arguments: work_dir, name, short, the file
 // names (space-separated, may be empty), "dir" or "" (append --dir), then the installer's
 // arguments.
-const StowScript = `set -eu
-cd -- "$1"
+var StowScript = `set -eu
+` + LoginScript + `cd -- "$1"
 __stowage_dir=./$2 __stowage_stow=./$2/$3-stow __stowage_files=$4 __stowage_withdir=$5
 shift 5
 [ -d "$__stowage_dir" ] || { echo "stowage-provider: no install directory" >&2; exit 100; }
@@ -210,8 +224,12 @@ trap 'rm -rf "$__stowage_d"' EXIT
 trap 'exit 130' HUP INT TERM
 if [ -n "$__stowage_files" ]; then
   tar -xf - -C "$__stowage_d"
-  for __stowage_f in $__stowage_files; do set -- "$@" "--$__stowage_f" "$__stowage_d/$__stowage_f"; done
+  for __stowage_f in $__stowage_files; do
+    case $__stowage_f in mirror-*) continue ;; esac
+    set -- "$@" "--$__stowage_f" "$__stowage_d/$__stowage_f"
+  done
 fi
+__stowage_mirror
 umask "$__stowage_old"
 __stowage_rc=0
 "$__stowage_stow" "$@" || __stowage_rc=$?
@@ -262,6 +280,32 @@ type Docker struct {
 	WorkDir string
 	Name    string
 	Short   string
+	// Mirror, when set, is the mirror's own login every run of the installer reads the mirror
+	// with (MirrorFiles).
+	Mirror *Login
+}
+
+// MirrorFiles is files with the mirror's login added (mirror-host, mirror-user, mirror-password),
+// which the scripts log in from a Docker configuration of their own (__stowage_mirror) and never
+// pass as a flag; files as they are without one.
+func MirrorFiles(files map[string]string, mirror *Login) (map[string]string, error) {
+	if mirror == nil {
+		return files, nil
+	}
+	if !ValidRegistryHost(mirror.Host) || mirror.Username == "" || mirror.Password == "" {
+		return nil, fmt.Errorf("the mirror's login: %q is not a registry host, or its user or password is empty", mirror.Host)
+	}
+	out := maps.Clone(files)
+	if out == nil {
+		out = map[string]string{}
+	}
+	for _, k := range []string{"mirror-host", "mirror-user", "mirror-password"} {
+		if _, ok := out[k]; ok {
+			return nil, fmt.Errorf("%s is the mirror login's file, never a flag's", k)
+		}
+	}
+	out["mirror-host"], out["mirror-user"], out["mirror-password"] = AuthKey(mirror.Host), mirror.Username, mirror.Password
+	return out, nil
 }
 
 // Without is d whose runs on this machine leave out of OpenTofu's environment the input keys the
@@ -398,6 +442,9 @@ func (d Docker) InstallArgv(in Install) ([]string, []byte, error) {
 			files[name] = v
 		}
 	}
+	if files, err = MirrorFiles(files, d.Mirror); err != nil {
+		return nil, nil, err
+	}
 	names, stdin, err := filesInput(files)
 	if err != nil {
 		return nil, nil, err
@@ -430,6 +477,10 @@ func filesInput(files map[string]string) (string, []byte, error) {
 
 // run runs args in work_dir by RunScript, with files on standard input.
 func (d Docker) run(ctx context.Context, files map[string]string, args ...string) ([]byte, []byte, int, error) {
+	files, err := MirrorFiles(files, d.Mirror)
+	if err != nil {
+		return nil, nil, -1, err
+	}
 	names, stdin, err := filesInput(files)
 	if err != nil {
 		return nil, nil, -1, err
@@ -441,6 +492,10 @@ func (d Docker) run(ctx context.Context, files map[string]string, args ...string
 func (d Docker) stow(ctx context.Context, files map[string]string, withDir bool, args ...string) ([]byte, []byte, int, error) {
 	if !ValidShortName(d.Short) {
 		return nil, nil, -1, fmt.Errorf("short_name %q in state is not an installer's short name: import the install again (tofu state rm, then tofu import)", d.Short)
+	}
+	files, err := MirrorFiles(files, d.Mirror)
+	if err != nil {
+		return nil, nil, -1, err
 	}
 	names, stdin, err := filesInput(files)
 	if err != nil {

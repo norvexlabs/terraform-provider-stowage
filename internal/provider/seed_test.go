@@ -223,3 +223,18 @@ func TestSeedLoginIsTheInstallerRegistrys(t *testing.T) {
 		}
 	}
 }
+
+// The seed reads a mirror with its own login (in the tar), the pull account never sent there.
+func TestSeedMirrorLogin(t *testing.T) {
+	t.Parallel()
+	s := newSeedHarness(t, map[string]tftypes.Value{"username": str("pull"), "password": str("pull-" + secretVal),
+		"registry": str("mirror.lan:5000/site"), "registry_username": str("site"), "registry_password": str("site-" + secretVal)})
+	if d := errorsOf(s.create(s.config(nil)).Diagnostics); d != "" {
+		t.Fatal(d)
+	}
+	seed := s.fake.callsOf("install")[0]
+	files := untarAll(t, seed.stdin)
+	if seed.argv[6] != "" || files["mirror-host"] != "mirror.lan:5000" || files["mirror-password"] != "site-"+secretVal || strings.Contains(string(seed.stdin), "pull-"+secretVal) {
+		t.Fatalf("seed %q %q", seed.argv[6:8], files)
+	}
+}

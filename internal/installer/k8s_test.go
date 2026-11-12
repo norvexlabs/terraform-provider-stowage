@@ -2,6 +2,8 @@ package installer
 
 import (
 	"context"
+	"encoding/base64"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -230,5 +232,44 @@ func TestLoginKeepsARelativeDockerConfigsContexts(t *testing.T) {
 		`exec sh -c "$0" sh "$@"`, RunLoginScript, dir, "", "mirror.lan", "u", "sh", "-c", `ls "$DOCKER_CONFIG/contexts"`}, stdin)
 	if err != nil || exit != 0 || strings.TrimSpace(string(out)) != "meta" {
 		t.Fatalf("%q %s %d %v", out, stderr, exit, err)
+	}
+}
+
+// The mirror's login travels in the tar (mirror-host, mirror-user, mirror-password), never as a
+// flag: the scripts write it into the run's own Docker configuration, beside a run's own login
+// when it has one, each under its key.
+func TestMirrorLoginInTheScripts(t *testing.T) {
+	t.Parallel()
+	dir, bin, home := t.TempDir(), t.TempDir(), t.TempDir()
+	testutil.WriteExecutable(t, filepath.Join(bin, "docker"), "#!/bin/sh\n")
+	files, err := MirrorFiles(map[string]string{"given": "g"}, &Login{Host: "mirror.lan:5000", Username: "site", Password: "m1rror"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	names, stdin, err := filesInput(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prog := []string{"sh", "-c", `cat "$DOCKER_CONFIG/config.json"; printf '|%s' "$*"`, "prog"}
+	env := []string{"env", "-u", "DOCKER_CONFIG", "PATH=" + bin + ":/usr/bin:/bin", "HOME=" + home}
+	out, stderr, exit, err := target.Local{}.Run(context.Background(), append(append(env, "sh", "-c", RunScript, "sh", dir, names), prog...), stdin)
+	mirrorAuth := base64.StdEncoding.EncodeToString([]byte("site:m1rror"))
+	if err != nil || exit != 0 || !strings.HasPrefix(string(out), `{"auths":{"mirror.lan:5000":{"auth":"`+mirrorAuth+`"}}}`) ||
+		strings.Contains(string(out), "--mirror") || !strings.Contains(string(out), "|--given ") {
+		t.Fatalf("RunScript: %q %s %d %v", out, stderr, exit, err)
+	}
+	// With the run's own login too (K8sScript's): both entries.
+	all := maps.Clone(files)
+	all["login-password"] = "pw"
+	stdin, _ = tarFiles(all)
+	out, stderr, exit, err = target.Local{}.Run(context.Background(), append(append(env, "sh", "-c", K8sScript, "sh", dir, "", names, "registry.example.com", "pull"), prog...), stdin)
+	if err != nil || exit != 0 || !strings.Contains(string(out), `"registry.example.com":{"auth":"`) || !strings.Contains(string(out), `"mirror.lan:5000":{"auth":"`+mirrorAuth+`"}`) {
+		t.Fatalf("K8sScript: %q %s %d %v", out, stderr, exit, err)
+	}
+	if _, err := MirrorFiles(nil, &Login{Host: `a"b`, Username: "u", Password: "p"}); err == nil {
+		t.Fatal("a host that is no registry host is taken")
+	}
+	if f, _ := MirrorFiles(map[string]string{"x": "y"}, nil); len(f) != 1 {
+		t.Fatalf("no mirror: %v", f)
 	}
 }

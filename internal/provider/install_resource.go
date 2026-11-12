@@ -497,7 +497,7 @@ func (r *installResource) docker(m *installModel, short string) (installer.Docke
 		return installer.Docker{}, err
 	}
 	// Left out, the home the create resolved: every ID built from it is state's.
-	return installer.Docker{Runner: run, WorkDir: homeWorkDir(m.ID, d), Name: name, Short: short}, nil
+	return installer.Docker{Runner: run, WorkDir: homeWorkDir(m.ID, d), Name: name, Short: short, Mirror: r.data.mirrorLogin()}, nil
 }
 
 func addInstallerError(diags *diag.Diagnostics, summary string, err error) {
@@ -755,11 +755,7 @@ func withoutFirstInstallOnly(in *installer.Install, names []string) {
 // of d's project and offer the Docker shape. Nil, with the error in diags, otherwise.
 func (r *installResource) fetchDescribe(ctx context.Context, d installer.Docker, ref string, diags *diag.Diagnostics) *installer.Describe {
 	_, host, _ := parseInstaller(ref)
-	var login *installer.Login
-	if r.data.Username != "" {
-		login = &installer.Login{Host: host, Username: r.data.Username, Password: r.data.Password}
-	}
-	if err := d.Fetch(ctx, ref, login); err != nil {
+	if err := d.Fetch(ctx, ref, r.data.fetchLogin(host)); err != nil {
 		addInstallerError(diags, "Fetching the installer", err)
 		return nil
 	}

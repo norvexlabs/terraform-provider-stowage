@@ -123,9 +123,13 @@ func registryHostOf(prefix string) string {
 	return host
 }
 
-// pullLogin is the provider's pull account for the host of the registry m's release pulls from:
-// the one state records (the provider's at the install), else the provider's.
+// pullLogin is the login image_pull_login writes the cluster's pull Secret from: the mirror's own
+// (registry_username), else the provider's pull account for the host of the registry m's release
+// pulls from — the one state records (the provider's at the install), else the provider's.
 func (r *installResource) pullLogin(m *installModel) *installer.Login {
+	if l := r.data.mirrorLogin(); l != nil {
+		return l // the mirror's own login, for the Secret the cluster pulls from it with
+	}
 	reg := r.registry()
 	if known(m.Registry) && m.Registry.ValueString() != "" {
 		reg = m.Registry.ValueString()
@@ -140,7 +144,7 @@ func (r *installResource) planPullLogin(plan, state *installModel, diags *diag.D
 		return
 	}
 	p := path.Root("kubernetes").AtName("image_pull_login")
-	if r.data.Username == "" && !r.data.UsernameUnknown {
+	if r.data.Username == "" && r.data.RegistryUsername == "" && !r.data.UsernameUnknown {
 		diags.AddAttributeError(p, "image_pull_login needs the pull account", "Give the provider's username and password: the cluster's pull Secret is written from them.")
 	}
 	held := state != nil && known(state.Registry) && state.Registry.ValueString() != ""
@@ -226,6 +230,7 @@ func (r *installResource) k8sStart(ctx context.Context, m *installModel, name st
 	run := &k8sRun{r: r, dir: dir}
 	run.k = k8sDriver(m, name)
 	run.k.Runner = installer.Filtered(runner)
+	run.k.Mirror = r.data.mirrorLogin()
 	if m.Kubernetes.ImagePullLogin.ValueBool() {
 		run.k.PullLogin = r.pullLogin(m)
 	}
@@ -870,13 +875,10 @@ func untrustedFix(k installer.K8s, configured string) string {
 	return fmt.Sprintf("If it is this release's own reference from another registry (a mirror's, an alias), set installer to it, or the provider's registry to its registry. Else install the configured release over it by hand (%s's `k8s upgrade --namespace %s --release %s`), or remove it (`k8s uninstall`), then refresh; or `tofu state rm` this resource to forget it.", configured, k.Namespace, k.ReleaseName())
 }
 
-// login is the provider's pull account for ref's registry, nil without one.
+// login is the login ref's fetch runs with (fetchLogin), nil without one.
 func (run *k8sRun) login(ref string) *installer.Login {
-	if run.r.data.Username == "" {
-		return nil
-	}
 	_, host, _ := parseInstaller(ref)
-	return &installer.Login{Host: host, Username: run.r.data.Username, Password: run.r.data.Password}
+	return run.r.data.fetchLogin(host)
 }
 
 // k8sUpdate applies a plan to a release in DESIGN § 13's order: the inputs first, by `k8s upgrade

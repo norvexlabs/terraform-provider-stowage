@@ -42,6 +42,9 @@ follow [SemVer](https://semver.org/).
   records the install's own, so the next plan shows a drift as an error.
 - `stowage_install` data source: a Docker install's or a VM's `status --json`, read without
   managing it.
+- `registry_username` and `registry_password`: a mirror's own login, for every run that reads the
+  mirror (a Docker target's installer, the Kubernetes runs, the seed, a fetch from it), on standard
+  input alone.
 - `stowage_vm_seed` reads a mirror on another host than the installer's with the machine's own
   Docker login, never with the installer registry's pull account.
 - `plan_dry_run`: on Docker, a plan changing the release runs its upgrade's (or rollback's)

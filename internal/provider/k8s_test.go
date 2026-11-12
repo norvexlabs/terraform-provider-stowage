@@ -1334,3 +1334,20 @@ func TestK8sImagePullLogin(t *testing.T) {
 		}
 	}
 }
+
+// Every Kubernetes run carries the mirror's login; image_pull_login writes the Secret from it.
+func TestK8sMirrorLogin(t *testing.T) {
+	t.Parallel()
+	h := k8sHarness(t, map[string]tftypes.Value{"registry": str("mirror.lan:5000/site"), "registry_username": str("site"), "registry_password": str("site-" + secretVal)})
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
+	login := h.block("kubernetes", map[string]tftypes.Value{"namespace": str("notes"), "image_pull_login": boolean(true)})
+	h.create(h.k8sConfig(map[string]tftypes.Value{"kubernetes": login}))
+	install := h.fake.callsOf("k8s-install")[0]
+	if !contains(install.argv, "--image-pull-login") || install.argv[7] != "mirror.lan:5000" || install.argv[8] != "site" || untarAll(t, install.stdin)["login-password"] != "site-"+secretVal {
+		t.Fatalf("install %q", install.argv)
+	}
+	st := h.fake.callsOf("k8s-status")[0]
+	if untarAll(t, st.stdin)["mirror-password"] != "site-"+secretVal {
+		t.Fatalf("status run without the mirror's login: %q", st.argv)
+	}
+}

@@ -70,8 +70,11 @@ type K8s struct {
 	Namespace  string
 	Release    string
 	// PullLogin, when set, is the login an install or upgrade writes the cluster's pull Secret
-	// from (`--image-pull-login`): the provider's pull account for the mirror's host.
+	// from (`--image-pull-login`): the mirror's login (Mirror) when one is given, else the
+	// provider's pull account, for the mirror's host.
 	PullLogin *Login
+	// Mirror, when set, is the mirror's own login every run reads the mirror with (MirrorFiles).
+	Mirror *Login
 }
 
 // Filtered is r leaving HelmEnv out of its programs' environment, when it can (EnvFilter: the
@@ -164,6 +167,13 @@ func (k K8s) run(ctx context.Context, files map[string]string, args ...string) (
 
 // runLogin is run with the program given login's Docker configuration (K8sScript), when set.
 func (k K8s) runLogin(ctx context.Context, login *Login, files map[string]string, args ...string) ([]byte, []byte, int, error) {
+	// The mirror's login, but when the run's own login is that host's (the same one, given once).
+	if k.Mirror != nil && !(login != nil && strings.EqualFold(login.Host, k.Mirror.Host)) {
+		var err error
+		if files, err = MirrorFiles(files, k.Mirror); err != nil {
+			return nil, nil, -1, err
+		}
+	}
 	names, host, user, stdin, err := loginInput(files, login)
 	if err != nil {
 		return nil, nil, -1, err

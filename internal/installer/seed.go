@@ -193,6 +193,11 @@ func (d Docker) Seed(ctx context.Context, a SeedArgs, login *Login) (*Seed, erro
 	if err != nil {
 		return nil, err
 	}
+	if d.Mirror != nil && !(login != nil && strings.EqualFold(login.Host, d.Mirror.Host)) {
+		if files, err = MirrorFiles(files, d.Mirror); err != nil {
+			return nil, err
+		}
+	}
 	names, host, user, stdin, err := loginInput(files, login)
 	if err != nil {
 		return nil, err

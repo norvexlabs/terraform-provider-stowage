@@ -267,12 +267,8 @@ func (r *seedResource) Create(ctx context.Context, req resource.CreateRequest, r
 		resp.Diagnostics.AddError("Running the installer here", err.Error())
 		return
 	}
-	d := installer.Docker{Runner: run, WorkDir: work, Name: name}
-	var login *installer.Login
-	if r.data.Username != "" {
-		login = &installer.Login{Host: host, Username: r.data.Username, Password: r.data.Password}
-	}
-	if err := d.Fetch(ctx, ref, login); err != nil {
+	d := installer.Docker{Runner: run, WorkDir: work, Name: name, Mirror: r.data.mirrorLogin()}
+	if err := d.Fetch(ctx, ref, r.data.fetchLogin(host)); err != nil {
 		addInstallerError(&resp.Diagnostics, "Fetching the installer", err)
 		return
 	}
@@ -336,6 +332,9 @@ func (r *seedResource) Create(ctx context.Context, req resource.CreateRequest, r
 func (r *seedResource) seedLogin(refHost string) *installer.Login {
 	if r.data.Username == "" {
 		return nil
+	}
+	if m := r.data.mirrorLogin(); m != nil && strings.EqualFold(m.Host, refHost) {
+		return nil // that host is the mirror's: its own login, which the run gets (Docker.Mirror)
 	}
 	if r.data.Registry != "" && !strings.EqualFold(registryHostOf(r.data.Registry), refHost) {
 		return nil

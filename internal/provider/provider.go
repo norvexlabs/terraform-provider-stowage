@@ -16,6 +16,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
+	"github.com/norvexlabs/terraform-provider-stowage/internal/installer"
 	"github.com/norvexlabs/terraform-provider-stowage/internal/target"
 )
 
@@ -51,6 +52,8 @@ type Data struct {
 	Password   string
 	Registry   string
 	RegistryCA string
+	// RegistryUsername and RegistryPassword: the mirror's own login ("" for none).
+	RegistryUsername, RegistryPassword string
 	// RegistryKnown is false while the configuration's registry is not known yet (it depends
 	// on another resource): the plan-time comparison with the install's is then skipped.
 	RegistryKnown bool
@@ -71,6 +74,26 @@ type Data struct {
 	CacheDir string
 }
 
+// fetchLogin is the login an installer image's fetch from host runs with: the mirror's own when
+// host is the mirror's, else the provider's pull account (the installer registry's); nil without.
+func (d *Data) fetchLogin(host string) *installer.Login {
+	if m := d.mirrorLogin(); m != nil && strings.EqualFold(m.Host, host) {
+		return m
+	}
+	if d == nil || d.Username == "" {
+		return nil
+	}
+	return &installer.Login{Host: host, Username: d.Username, Password: d.Password}
+}
+
+// mirrorLogin is the mirror's own login for the host of the provider's registry; nil without one.
+func (d *Data) mirrorLogin() *installer.Login {
+	if d == nil || d.RegistryUsername == "" || d.Registry == "" {
+		return nil
+	}
+	return &installer.Login{Host: registryHostOf(d.Registry), Username: d.RegistryUsername, Password: d.RegistryPassword}
+}
+
 // defaultPoll is how often a create reads an install still installing.
 const defaultPoll = 10 * time.Second
 
@@ -83,11 +106,14 @@ type stowageProvider struct {
 }
 
 type providerModel struct {
-	Username   types.String  `tfsdk:"username"`
-	Password   types.String  `tfsdk:"password"`
-	Registry   types.String  `tfsdk:"registry"`
-	RegistryCA types.String  `tfsdk:"registry_ca"`
-	Kubernetes *k8sConnModel `tfsdk:"kubernetes"`
+	Username   types.String `tfsdk:"username"`
+	Password   types.String `tfsdk:"password"`
+	Registry   types.String `tfsdk:"registry"`
+	RegistryCA types.String `tfsdk:"registry_ca"`
+	// RegistryUsername and RegistryPassword are the mirror's (registry's) own login.
+	RegistryUsername types.String  `tfsdk:"registry_username"`
+	RegistryPassword types.String  `tfsdk:"registry_password"`
+	Kubernetes       *k8sConnModel `tfsdk:"kubernetes"`
 }
 
 // New returns the provider's constructor, reaching targets with DefaultRunner.
@@ -148,6 +174,15 @@ func (p *stowageProvider) Schema(_ context.Context, _ provider.SchemaRequest, re
 				Optional:            true,
 				MarkdownDescription: "PEM of the certificate authority the mirror's certificate chains to (the installer's `--registry-ca`), sent on standard input.",
 			},
+			"registry_username": schema.StringAttribute{
+				Optional:            true,
+				MarkdownDescription: "The mirror's own login, with `registry_password`, for the host of `registry` alone: every run on the machine running OpenTofu or a Docker target that reads the mirror (a Docker target's installer, the Kubernetes runs, `stowage_vm_seed`'s) gets it in a Docker configuration of its own, removed afterwards, the password on standard input. Needs `registry`. Left out, the mirror is read with the machine's own Docker login (`username` is the installer registry's, never sent to another host). A VM reads the mirror by itself, with what its seed gave it.",
+			},
+			"registry_password": schema.StringAttribute{
+				Optional:            true,
+				Sensitive:           true,
+				MarkdownDescription: "The mirror's password or token, with `registry_username`. Sent on standard input only.",
+			},
 		},
 		Blocks: map[string]schema.Block{"kubernetes": k8sConnBlock()},
 	}
@@ -164,6 +199,16 @@ func (p *stowageProvider) Configure(ctx context.Context, req provider.ConfigureR
 			"Give both the pull account's username and its password, or neither.")
 		return
 	}
+	if !m.RegistryUsername.IsUnknown() && !m.RegistryPassword.IsUnknown() && (m.RegistryUsername.ValueString() == "") != (m.RegistryPassword.ValueString() == "") {
+		resp.Diagnostics.AddAttributeError(path.Root("registry_username"), "registry_username and registry_password go together",
+			"Give both the mirror's username and its password, or neither.")
+		return
+	}
+	if m.RegistryUsername.ValueString() != "" && !m.Registry.IsUnknown() && m.Registry.ValueString() == "" {
+		resp.Diagnostics.AddAttributeError(path.Root("registry_username"), "registry_username needs registry",
+			"The mirror's login is for the host of the provider's registry: give registry, or leave the login out.")
+		return
+	}
 	if ca := m.RegistryCA.ValueString(); ca != "" && !strings.Contains(ca, "-----BEGIN CERTIFICATE-----") {
 		resp.Diagnostics.AddAttributeError(path.Root("registry_ca"), "registry_ca is not PEM",
 			"Give the certificate authority's PEM (-----BEGIN CERTIFICATE-----), e.g. file(\"mirror-ca.pem\").")
@@ -176,18 +221,20 @@ func (p *stowageProvider) Configure(ctx context.Context, req provider.ConfigureR
 		}
 	}
 	d := &Data{
-		Kubernetes:      m.Kubernetes,
-		Username:        m.Username.ValueString(),
-		Password:        m.Password.ValueString(),
-		Registry:        strings.TrimSuffix(m.Registry.ValueString(), "/"), // as the installer records it
-		RegistryCA:      m.RegistryCA.ValueString(),
-		RegistryKnown:   !m.Registry.IsUnknown(),
-		RegistryCAKnown: !m.RegistryCA.IsUnknown(),
-		UsernameUnknown: m.Username.IsUnknown(),
-		NewRunner:       p.newRunner,
-		Poll:            p.poll,
-		TempDir:         p.tmp,
-		CacheDir:        p.cache,
+		Kubernetes:       m.Kubernetes,
+		Username:         m.Username.ValueString(),
+		Password:         m.Password.ValueString(),
+		Registry:         strings.TrimSuffix(m.Registry.ValueString(), "/"), // as the installer records it
+		RegistryCA:       m.RegistryCA.ValueString(),
+		RegistryUsername: m.RegistryUsername.ValueString(),
+		RegistryPassword: m.RegistryPassword.ValueString(),
+		RegistryKnown:    !m.Registry.IsUnknown(),
+		RegistryCAKnown:  !m.RegistryCA.IsUnknown(),
+		UsernameUnknown:  m.Username.IsUnknown(),
+		NewRunner:        p.newRunner,
+		Poll:             p.poll,
+		TempDir:          p.tmp,
+		CacheDir:         p.cache,
 	}
 	resp.ResourceData = d
 	resp.DataSourceData = d

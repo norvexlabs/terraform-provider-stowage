@@ -1,10 +1,12 @@
 package provider
 
 import (
+	"context"
 	"slices"
 	"strings"
 	"testing"
 
+	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
 )
 
@@ -204,5 +206,57 @@ func TestRegistryTrailingSlash(t *testing.T) {
 	o := newHarness(t, map[string]tftypes.Value{"registry": str("mirror.lan/notes")})
 	if got := errorsOf(o.plan(state, o.dockerConfig(nil)).Diagnostics); got != "" {
 		t.Fatalf("the same registry without its slash: %q", got)
+	}
+}
+
+// registry_username / registry_password: the mirror's own login, in the tar of every installer run
+// on a Docker target (never an argument), the fetch from the installer's registry with the pull
+// account alone; without them, no mirror login.
+func TestMirrorLoginOnDocker(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, map[string]tftypes.Value{"registry": str("mirror.lan:5000/site"), "username": str("pull"), "password": str("pull-" + secretVal),
+		"registry_username": str("site"), "registry_password": str("site-" + secretVal)})
+	h.create(h.dockerConfig(nil))
+	for _, c := range h.fake.calls {
+		if strings.Contains(strings.Join(c.argv, " "), secretVal) {
+			t.Fatalf("a password on a command line: %q", c.argv)
+		}
+	}
+	install := h.fake.callsOf("install")[0]
+	files := untarAll(t, install.stdin)
+	if files["mirror-host"] != "mirror.lan:5000" || files["mirror-user"] != "site" || files["mirror-password"] != "site-"+secretVal || strings.Contains(string(install.stdin), "pull-"+secretVal) {
+		t.Fatalf("install's tar %q", files)
+	}
+	fetch := h.fake.callsOf("fetch")[0]
+	if fetch.argv[7] != "registry.example.com" || fetch.argv[8] != "pull" || strings.Contains(string(fetch.stdin), "site-"+secretVal) {
+		t.Fatalf("fetch %q", fetch.argv)
+	}
+	o := newHarness(t, map[string]tftypes.Value{"registry": str("mirror.lan:5000/site")})
+	o.create(o.dockerConfig(nil))
+	if in := o.fake.callsOf("install")[0]; in.stdin != nil && untarAll(t, in.stdin)["mirror-password"] != "" {
+		t.Fatal("a mirror login without registry_username")
+	}
+}
+
+// The mirror's login goes together, and needs registry.
+func TestMirrorLoginConfig(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	for name, c := range map[string]struct {
+		cfg  map[string]tftypes.Value
+		want string
+	}{
+		"no password": {map[string]tftypes.Value{"registry": str("m.lan/s"), "registry_username": str("site")}, "registry_username and registry_password go together"},
+		"no registry": {map[string]tftypes.Value{"registry_username": str("site"), "registry_password": str("p")}, "registry_username needs registry"},
+		"both":        {map[string]tftypes.Value{"registry": str("m.lan/s"), "registry_username": str("site"), "registry_password": str("p")}, ""},
+	} {
+		cfg := h.dv(h.ptyp, fill(h.ptyp, c.cfg))
+		resp, err := h.srv.ConfigureProvider(context.Background(), &tfprotov6.ConfigureProviderRequest{Config: &cfg})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := errorsOf(resp.Diagnostics); (c.want == "" && got != "") || !strings.Contains(got, c.want) {
+			t.Errorf("%s: %q", name, got)
+		}
 	}
 }
