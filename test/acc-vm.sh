@@ -10,8 +10,8 @@
 #   - a Stowage checkout at STOWAGE_REPO (default ~/stowage) whose `make build` made bin/stowage, at
 #     a release this provider reads (0.35.0 or later): its suite library runs zot, ships
 #     examples/minimal and its mirror;
-#   - this repository's `make build` (bin/terraform-provider-stowage), loaded by a dev_overrides
-#     CLI configuration of this run's own;
+#   - this repository's `make build` (bin/terraform-provider-stowage), installed by tofu init from
+#     a filesystem mirror of this run's own;
 #   - tofu ≥ 1.11, docker, ssh, jq, oras, zstd and xorriso on PATH, on a linux/amd64 machine TrueNAS
 #     reaches: `make acc-vm` runs it in the acceptance runner (test/acc.Dockerfile), which has them.
 #
@@ -75,14 +75,22 @@ mirror "$WORK/r1.oci.tar" --disks qcow2
 INSTALLER=$REG/notes/notes-installer@$(digest_of notes/notes-installer:beta-1.0.0)
 [[ $INSTALLER == *@sha256:* ]] || fail "no digest of the installer"
 
-step "the OpenTofu root: this provider by dev_overrides, the seed, the disk and ISO, Stowage's TrueNAS module, the install"
+step "the OpenTofu root: this provider from a filesystem mirror, the seed, the disk and ISO, Stowage's TrueNAS module, the install"
 ROOT=$WORK/root
 mkdir -p "$ROOT" "$WORK/disks"
 cp "$PROV"/examples/resources/stowage_vm_seed/*.sh "$ROOT/"
+# The provider built here, from a filesystem mirror of this run's own (dev_overrides would leave
+# tofu init querying the registry for it, which the root's other providers need init for).
+MIRRORDIR=$WORK/providers/registry.opentofu.org/norvexlabs/stowage/0.1.0/linux_amd64
+mkdir -p "$MIRRORDIR"
+cp "$PROV/bin/terraform-provider-stowage" "$MIRRORDIR/terraform-provider-stowage_v0.1.0"
 cat >"$WORK/tofurc" <<EOF
 provider_installation {
-  dev_overrides { "registry.opentofu.org/norvexlabs/stowage" = "$PROV/bin" }
-  direct {}
+  filesystem_mirror {
+    path    = "$WORK/providers"
+    include = ["registry.opentofu.org/norvexlabs/stowage"]
+  }
+  direct { exclude = ["registry.opentofu.org/norvexlabs/stowage"] }
 }
 EOF
 export TF_CLI_CONFIG_FILE=$WORK/tofurc TF_IN_AUTOMATION=1
@@ -113,7 +121,7 @@ variable "token" {
   sensitive = true
   ephemeral = true
 }
-variable "version" { type = string }
+variable "release_version" { type = string }
 variable "admin" { type = string }
 variable "allow_rollback" { default = false }
 variable "deletion_protection" { default = true }
@@ -171,7 +179,7 @@ resource "stowage_install" "vm" {
     private_key_file = "$KEY"
     known_hosts_line = stowage_vm_seed.vm.known_hosts_line
     short_name       = stowage_vm_seed.vm.short_name
-    version          = var.version
+    version          = var.release_version
   }
 
   timeouts {
@@ -187,7 +195,7 @@ output "seed_boot_id" { value = stowage_install.vm.vm.seed_boot_id }
 output "version" { value = stowage_install.vm.version }
 output "fingerprint" { value = stowage_vm_seed.vm.fingerprint }
 EOF
-export TF_VAR_pull_token=$PULL_TOKEN TF_VAR_token=$TOKEN TF_VAR_admin=admin@notes.test TF_VAR_version=1.0.0
+export TF_VAR_pull_token=$PULL_TOKEN TF_VAR_token=$TOKEN TF_VAR_admin=admin@notes.test TF_VAR_release_version=1.0.0
 tf() { (cd "$ROOT" && tofu "$@"); }
 destroyed=
 # A run that fails destroys the VM still: the install forgotten (its delete runs nothing), the module destroyed.
@@ -239,27 +247,27 @@ printf '1.0.1\n' >"$P/VERSION"
 printf '### Changed\n- Release 1.0.1.\n' >"$P/changes/1.0.1.md"
 "${S[@]}" ship --channel beta 2>"$WORK/ship-1.0.1.log" || { tail -50 "$WORK/ship-1.0.1.log"; fail "ship 1.0.1"; }
 mirror "$WORK/r2.oci.tar" --disks none
-TF_VAR_version=1.0.1 tf apply -input=false -auto-approve >"$WORK/apply3.log" 2>&1 || { tail -80 "$WORK/apply3.log"; fail "the upgrade"; }
+TF_VAR_release_version=1.0.1 tf apply -input=false -auto-approve >"$WORK/apply3.log" 2>&1 || { tail -80 "$WORK/apply3.log"; fail "the upgrade"; }
 [[ $(tf output -raw version) == 1.0.1 ]] || fail "state's version after the upgrade: $(tf output -raw version)"
 [[ -z $(tf output -raw seed_boot_id 2>/dev/null || true) ]] || fail "seed_boot_id is set after the upgrade's reboot"
 [[ $(on cat /proc/sys/kernel/random/boot_id) != "$boot" ]] || fail "the upgrade did not reboot the VM"
 seed_refused || fail "the VM serves its one-time key again after the upgrade's reboot"
-export TF_VAR_version=1.0.1
+export TF_VAR_release_version=1.0.1
 
 step "vm.version back to 1.0.0: refused without allow_rollback, the rollback with it"
 rc=0
-TF_VAR_version=1.0.0 tf plan -input=false >"$WORK/plan2.log" 2>&1 || rc=$?
+TF_VAR_release_version=1.0.0 tf plan -input=false >"$WORK/plan2.log" 2>&1 || rc=$?
 if [[ $rc == 0 ]] || ! grep -q 'a rollback needs allow_rollback' "$WORK/plan2.log"; then
 	cat "$WORK/plan2.log"
 	fail "a rollback without allow_rollback is not a plan error"
 fi
-TF_VAR_version=1.0.0 TF_VAR_allow_rollback=true tf apply -input=false -auto-approve >"$WORK/apply4.log" 2>&1 || { tail -80 "$WORK/apply4.log"; fail "the rollback"; }
+TF_VAR_release_version=1.0.0 TF_VAR_allow_rollback=true tf apply -input=false -auto-approve >"$WORK/apply4.log" 2>&1 || { tail -80 "$WORK/apply4.log"; fail "the rollback"; }
 [[ $(tf output -raw version) == 1.0.0 ]] || fail "state's version after the rollback: $(tf output -raw version)"
 on sudo notes-stow status --json | jq -e '.installed.version == "1.0.0" and .boot == "passive"' >/dev/null || fail "the VM is not on 1.0.0, in its passive system"
 
 step "destroy: the install forgotten, the VM destroyed by its module"
-TF_VAR_version=1.0.0 TF_VAR_deletion_protection=false tf apply -input=false -auto-approve -target=stowage_install.vm >"$WORK/apply5.log" 2>&1 || { tail -40 "$WORK/apply5.log"; fail "deletion_protection off"; }
-TF_VAR_version=1.0.0 TF_VAR_deletion_protection=false tf destroy -input=false -auto-approve >"$WORK/destroy.log" 2>&1 || { tail -60 "$WORK/destroy.log"; fail "tofu destroy"; }
+TF_VAR_release_version=1.0.0 TF_VAR_deletion_protection=false tf apply -input=false -auto-approve -target=stowage_install.vm >"$WORK/apply5.log" 2>&1 || { tail -40 "$WORK/apply5.log"; fail "deletion_protection off"; }
+TF_VAR_release_version=1.0.0 TF_VAR_deletion_protection=false tf destroy -input=false -auto-approve >"$WORK/destroy.log" 2>&1 || { tail -60 "$WORK/destroy.log"; fail "tofu destroy"; }
 # shellcheck disable=SC2034 # read by the cleanup above
 destroyed=1
 
