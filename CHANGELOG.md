@@ -42,6 +42,8 @@ follow [SemVer](https://semver.org/).
   records the install's own, so the next plan shows a drift as an error.
 - `stowage_install` data source: a Docker install's or a VM's `status --json`, read without
   managing it.
+- `stowage_vm_seed` reads a mirror on another host than the installer's with the machine's own
+  Docker login, never with the installer registry's pull account.
 - `plan_dry_run`: on Docker, a plan changing the release runs its upgrade's (or rollback's)
   `--dry-run` on the target, so the installer's refusal is a plan error.
 - Reference documentation in `docs/`, generated from OpenTofu's own schema of the provider

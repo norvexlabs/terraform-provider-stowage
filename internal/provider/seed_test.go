@@ -197,3 +197,29 @@ func TestSeedValidateUnknownInput(t *testing.T) {
 		t.Fatalf("a bad key: %q", got)
 	}
 }
+
+// The seed's run logs the pull account in to the installer's registry alone: a provider registry
+// on another host (a mirror) is read with the machine's own login, the account never sent there.
+func TestSeedLoginIsTheInstallerRegistrys(t *testing.T) {
+	t.Parallel()
+	for name, c := range map[string]struct {
+		registry, wantHost, wantUser string
+	}{
+		"no registry":            {"", "registry.example.com", "pull"},
+		"the installer's host":   {"registry.example.com/mirror", "registry.example.com", "pull"},
+		"a mirror on other host": {"mirror.lan:5000/site", "", ""},
+	} {
+		cfg := map[string]tftypes.Value{"username": str("pull"), "password": str(secretVal)}
+		if c.registry != "" {
+			cfg["registry"] = str(c.registry)
+		}
+		s := newSeedHarness(t, cfg)
+		if d := errorsOf(s.create(s.config(nil)).Diagnostics); d != "" {
+			t.Fatalf("%s: %s", name, d)
+		}
+		seed := s.fake.callsOf("install")[0]
+		if seed.argv[6] != c.wantHost || seed.argv[7] != c.wantUser || (c.wantUser == "") == strings.Contains(string(seed.stdin), secretVal) {
+			t.Errorf("%s: login %q %q", name, seed.argv[6], seed.argv[7])
+		}
+	}
+}

@@ -328,17 +328,19 @@ func (r *seedResource) Create(ctx context.Context, req resource.CreateRequest, r
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }
 
-// seedLogin is the provider's pull account for the registry the seed reads its disks from: the
-// provider's registry (a mirror), else the installer's own (refHost); nil without an account.
+// seedLogin is the provider's pull account for the seed's own reads of the registry (its disks),
+// when that registry is the installer's: the account is the installer registry's (refHost), as
+// the fetch's. A provider registry on another host (a mirror) is read with the machine's own
+// Docker login, as no login is given then (the pull account is not that registry's: a mirror
+// refuses another's credentials); nil without an account.
 func (r *seedResource) seedLogin(refHost string) *installer.Login {
 	if r.data.Username == "" {
 		return nil
 	}
-	host := refHost
-	if r.data.Registry != "" {
-		host = registryHostOf(r.data.Registry)
+	if r.data.Registry != "" && !strings.EqualFold(registryHostOf(r.data.Registry), refHost) {
+		return nil
 	}
-	return &installer.Login{Host: host, Username: r.data.Username, Password: r.data.Password}
+	return &installer.Login{Host: refHost, Username: r.data.Username, Password: r.data.Password}
 }
 
 // seedArgs is m as vm seed's flags, with the provider's registry and its CA.

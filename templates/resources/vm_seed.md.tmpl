@@ -27,10 +27,12 @@ afterwards (logged in with the provider's `username`/`password` as on a Docker t
 `describe --json` (`name` compared with the image's, shapes must include `kairos` when it lists
 any), then `sh <name>.sh vm seed --json --platform=<platform> [--flag=value]… [--set K=V]…
 [--registry=<provider registry>] [--await-secrets] [--disk-dir=<dir>]`, the SSH key and the
-provider's `registry_ca` as `--ssh-key` and `--registry-ca` files on standard input. With the
-provider's `username`, the seed reads the registry (its disks) with that login, for the host of
-the provider's `registry` (else the installer's), in a Docker configuration of its own written as
-the fetch's is: the machine's own `~/.docker` logins are not read then. The installer
+provider's `registry_ca` as `--ssh-key` and `--registry-ca` files on standard input. The
+provider's `username` is the installer registry's pull account: the seed reads its disks with
+it, in a Docker configuration of its own written as the fetch's is, when it reads them from that
+registry's host (no provider `registry`, or one on that host); a provider `registry` on another
+host (a mirror) is read with the machine's own Docker login (`~/.docker`, or `DOCKER_CONFIG`), the
+pull account never sent there, as a mirror refuses another registry's credentials. The installer
 refuses (exit 3, its refusal's object on standard output: the diagnostic's summary its reason, its
 detail the fix) a `platform` the registry holds no disk for, naming those it offers, a secret input
 in `inputs`, and a release whose front offers no TLS mode a VM takes; it fails (exit 1) when the
