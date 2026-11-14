@@ -425,11 +425,11 @@ func TestVMRetireFails(t *testing.T) {
 	if c := f.lastConn(); c.KnownHostsLine != ownLine || !slices.Equal(c.AlsoKnownHostsLines, []string{seedLine}) {
 		t.Errorf("a connection before the reboot %+v", c)
 	}
-	// Another host key while the one-time key is still accepted: vm.known_hosts_line, saved by an
-	// apply that does not read, is the way on, no new import.
+	// Another host key while the one-time key is still accepted beside the own one: the own key
+	// state holds is the one a read needs, so a changed own key is a new import.
 	f.set("status", reply{exit: 255, stderr: "Host key verification failed."})
-	if got := errorsOf(h.read(state).Diagnostics); !strings.Contains(got, "serves another host key") || !strings.Contains(got, "state's vm.known_hosts_line") ||
-		!strings.Contains(got, "tofu apply -refresh=false") || strings.Contains(got, "tofu import") {
+	if got := errorsOf(h.read(state).Diagnostics); !strings.Contains(got, "serves another host key") || !strings.Contains(got, "the seed's line beside it") ||
+		!strings.Contains(got, "`tofu import` it again (`vm:192.0.2.7/notes-stow`)") || strings.Contains(got, "tofu apply -refresh=false`, which saves") {
 		t.Errorf("another key before the retirement: %q", got)
 	}
 	f.set("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", "")})
@@ -1028,6 +1028,14 @@ func TestVMUpgradeReadsTheOwnKey(t *testing.T) {
 		t.Fatalf("%s %s", d, vmAttr(t, h, a.NewState, "host_key_line"))
 	}
 	state := a.NewState
+	// Another host key while no own key is recorded: a read accepts state's vm.known_hosts_line
+	// alone, which an apply that does not read saves; no import.
+	f.set("status", reply{exit: 255, stderr: "Host key verification failed."})
+	if got := errorsOf(h.read(state).Diagnostics); !strings.Contains(got, "state's vm.known_hosts_line alone") ||
+		!strings.Contains(got, "tofu apply -refresh=false`, which saves") || strings.Contains(got, "tofu import") {
+		t.Errorf("another key with no own key recorded: %q", got)
+	}
+	f.set("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", "")})
 	// The key still cannot be read: the upgrade is refused before it runs.
 	f.reset()
 	f.set("retire", reply{exit: 1, stderr: "sudo: a password is required"})

@@ -925,11 +925,13 @@ func (r *installResource) Read(ctx context.Context, req resource.ReadRequest, re
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }
 
-// sshLoginRefused matches ssh's own refusal of a login, "user@host: Permission denied (publickey,password).",
-// by its list of authentication methods: a program's EACCES ("…: Permission denied (os error 13)")
-// is not one. ssh that could not load a key file says so before it ("Load key …: Permission
+// sshLoginRefused matches ssh's own refusals of a login: "user@host: Permission denied
+// (publickey,password).", by its list of authentication methods (a program's EACCES, "…:
+// Permission denied (os error 13)", is not one), and the server's "Too many authentication
+// failures" (an agent offering more keys than it tries) or "No more authentication methods
+// available". ssh that could not load a key file says so before it ("Load key …: Permission
 // denied"), then refuses the login the same way: the detail shows both.
-var sshLoginRefused = regexp.MustCompile(`: Permission denied \((publickey|password|keyboard-interactive|hostbased|gssapi-[a-z-]+)(,(publickey|password|keyboard-interactive|hostbased|gssapi-[a-z-]+))*\)`)
+var sshLoginRefused = regexp.MustCompile(`: Permission denied \((publickey|password|keyboard-interactive|hostbased|gssapi-[a-z-]+)(,(publickey|password|keyboard-interactive|hostbased|gssapi-[a-z-]+))*\)|Too many authentication failures|No more authentication methods available`)
 
 // unreachable is a read's error for a remote target ssh did not reach (exit 255: ssh's own failure,
 // or the program's own exit 255). The install stays in state whatever ssh met: nothing a read sees
