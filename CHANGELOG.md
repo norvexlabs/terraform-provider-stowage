@@ -17,9 +17,10 @@ change before 1.0, each change named here.
 - `delete_data = true` with a `vm` block is refused at validation (`delete_data is not the VM's`): a
   VM's destroy forgets the install and deletes nothing, its data going with the VM.
 - A read of a Docker host or VM that ssh fails (exit 255) is an error naming what ssh met and the
-  way on: `ssh's login to … was refused` (the right user and key file, then `tofu apply
+  way on: `ssh's login to … was refused` (a fix of the user or key file saved by `tofu apply
   -refresh=false`, which saves a change of the connection alone), `… serves another host key` (on
-  Docker the new key the same way; on a VM a new install, or the new key and a new import), else
+  Docker, and on a VM whose own key is not recorded yet, the new key the same way; else on a VM a
+  new install, or the new key and a new import), else
   `Cannot reach … to read the install` (plan again once it answers); each names `tofu state rm`
   for a target known to be gone and `-refresh=false` for one plan. The install stays in state, as
   a host down for a while is not told from one gone.

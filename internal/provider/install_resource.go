@@ -925,10 +925,11 @@ func (r *installResource) Read(ctx context.Context, req resource.ReadRequest, re
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }
 
-// sshLoginRefused matches ssh's own refusal of a login ("user@host: Permission denied (publickey).");
-// a local key file ssh cannot read ("Load key …: Permission denied") or a program's EACCES is not
-// one.
-var sshLoginRefused = regexp.MustCompile(`: Permission denied \(`)
+// sshLoginRefused matches ssh's own refusal of a login, "user@host: Permission denied (publickey,password).",
+// by its list of authentication methods: a program's EACCES ("…: Permission denied (os error 13)")
+// is not one. ssh that could not load a key file says so before it ("Load key …: Permission
+// denied"), then refuses the login the same way: the detail shows both.
+var sshLoginRefused = regexp.MustCompile(`: Permission denied \((publickey|password|keyboard-interactive|hostbased|gssapi-[a-z-]+)(,(publickey|password|keyboard-interactive|hostbased|gssapi-[a-z-]+))*\)`)
 
 // unreachable is a read's error for a remote target ssh did not reach (exit 255: ssh's own failure,
 // or the program's own exit 255). The install stays in state whatever ssh met: nothing a read sees
@@ -945,9 +946,10 @@ func unreachable(diags *diag.Diagnostics, kind, block, host, keyWay string, err 
 	switch {
 	case sshLoginRefused.MatchString(msg):
 		summary = fmt.Sprintf("ssh's login to the %s %s was refused", kind, host)
-		way = fmt.Sprintf("ssh's message names the host that refused it (a jump host's own, through an ssh configuration). "+
-			"A read logs in with the connection state holds: give the right %s.user and %s.private_key_file (or load the ssh agent's key), "+
-			"then `tofu apply -refresh=false`, which saves a change of the connection alone without running anything on the target.", block, block)
+		way = fmt.Sprintf("ssh's message names the host that refused it (a jump host's own, through an ssh configuration) and a key file it could not load (`Load key …`). "+
+			"A read logs in with the connection state holds: a fix outside the configuration (the ssh agent's key, the keys the host accepts) needs a plan again alone; "+
+			"a fix of %s.user or %s.private_key_file is saved by `tofu apply -refresh=false`, which saves a change of the connection alone without running anything on the target, "+
+			"then a plan reads the install again.", block, block)
 	case strings.Contains(msg, "Host key verification failed") || strings.Contains(msg, "REMOTE HOST IDENTIFICATION HAS CHANGED"):
 		summary = fmt.Sprintf("The %s %s serves another host key", kind, host)
 		way = keyWay

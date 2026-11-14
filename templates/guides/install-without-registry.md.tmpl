@@ -36,7 +36,8 @@ gpg --dearmor <norvexlabs-gpg-public.asc >release-key.gpg &&
 gpgv --keyring ./release-key.gpg "terraform-provider-stowage_${v}_SHA256SUMS.sig" "terraform-provider-stowage_${v}_SHA256SUMS" &&
 grep "_${platform}.zip\$" "terraform-provider-stowage_${v}_SHA256SUMS" | sha256sum --check &&   # macOS: shasum -a 256 --check
 mkdir -p ~/.terraform.d/plugins/registry.opentofu.org/norvexlabs/stowage &&
-cp "terraform-provider-stowage_${v}_${platform}.zip" ~/.terraform.d/plugins/registry.opentofu.org/norvexlabs/stowage/
+cp "terraform-provider-stowage_${v}_${platform}.zip" ~/.terraform.d/plugins/registry.opentofu.org/norvexlabs/stowage/ &&
+echo "installed $v ($platform)" || echo "NOT INSTALLED: a check above failed" >&2
 ```
 
 On Windows the directory is `%APPDATA%\terraform.d\plugins\registry.opentofu.org\norvexlabs\stowage`.

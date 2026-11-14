@@ -340,12 +340,13 @@ func TestReadFollowsTheTarget(t *testing.T) {
 		t.Fatal("an unreachable host's install is forgotten")
 	}
 	// ssh's message picks the way on, and that one alone: a refused login, another host key, else
-	// no connection (a local key file ssh cannot read is not a refused login).
+	// no connection (a program's EACCES is not a refused login).
 	login, key, none := "ssh's login to the Docker host app.example was refused", "The Docker host app.example serves another host key", "Cannot reach the Docker host app.example"
 	for stderr, c := range map[string]struct{ want, not []string }{
-		"ops@app.example: Permission denied (publickey).": {[]string{login, "docker.user and docker.private_key_file", "tofu apply -refresh=false"}, []string{key, none, "known_hosts_line"}},
+		"ops@app.example: Permission denied (publickey).": {[]string{login, "docker.user or docker.private_key_file", "tofu apply -refresh=false"}, []string{key, none, "known_hosts_line"}},
 		"Host key verification failed.":                   {[]string{key, "docker.known_hosts_line", "tofu apply -refresh=false"}, []string{login, none, "docker.user"}},
-		`Load key "/keys/ops": Permission denied`:         {[]string{none}, []string{login, key, "docker.user", "known_hosts_line"}},
+		"Load key \"/keys/ops\": Permission denied\nops@app.example: Permission denied (publickey,password).": {[]string{login, "Load key"}, []string{key, none}},
+		"open /srv/notes/.env: Permission denied (os error 13)":                                               {[]string{none}, []string{login, key, "docker.user", "known_hosts_line"}},
 	} {
 		h.fake.replies["status"] = reply{exit: 255, stderr: stderr}
 		r := h.read(state)

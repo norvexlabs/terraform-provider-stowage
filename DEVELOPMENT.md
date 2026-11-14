@@ -143,11 +143,14 @@ The release key: fingerprint `686D3351040F9F4463D9D3AC0C705E9BAA4F4981`, RSA 409
 are given. To check a release by hand:
 
 ```bash
-gpg --show-keys --with-colons keys/norvexlabs-gpg-public.asc | awk -F: '$1=="pub"{n++} $1=="fpr"&&!f{f=$10} END{print n, f}'
-# must print "1 686D3351040F9F4463D9D3AC0C705E9BAA4F4981": one key, the release key; else stop
-gpg --dearmor <keys/norvexlabs-gpg-public.asc >release-key.gpg   # verified against it alone, never your keyring's
-gpgv --keyring ./release-key.gpg terraform-provider-stowage_<version>_SHA256SUMS.sig terraform-provider-stowage_<version>_SHA256SUMS
-sha256sum --check --ignore-missing terraform-provider-stowage_<version>_SHA256SUMS
+# each step only once the one before succeeded: one key in the file, the release key; the
+# signature by it alone (never your keyring's keys); the checksums
+[ "$(gpg --show-keys --with-colons keys/norvexlabs-gpg-public.asc | awk -F: '$1=="pub"{n++} $1=="fpr"&&!f{f=$10} END{print n, f}')" = \
+  "1 686D3351040F9F4463D9D3AC0C705E9BAA4F4981" ] &&
+gpg --dearmor <keys/norvexlabs-gpg-public.asc >release-key.gpg &&
+gpgv --keyring ./release-key.gpg terraform-provider-stowage_<version>_SHA256SUMS.sig terraform-provider-stowage_<version>_SHA256SUMS &&
+sha256sum --check --ignore-missing terraform-provider-stowage_<version>_SHA256SUMS &&
+echo "verified" || echo "NOT VERIFIED: a check above failed" >&2
 ```
 
 ## Repository

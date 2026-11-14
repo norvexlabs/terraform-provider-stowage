@@ -818,10 +818,16 @@ func (r *installResource) readVM(ctx context.Context, m *installModel, resp *res
 	st, err := v.Status(ctx)
 	if err != nil {
 		if sshFailed(err) {
-			unreachable(&resp.Diagnostics, "VM", "vm", m.VM.Host.ValueString(),
-				"A read accepts the VM's own key state holds (vm.host_key_line) alone. A VM made again from its seed is a new install: `tofu state rm` this resource, "+
-					"and the next apply installs it under the seed's key. A VM whose key changed: check the new key on its console, give it in vm.known_hosts_line, "+
-					"then `tofu state rm` this resource and `tofu import` it again (`"+m.ID.ValueString()+"`).", err)
+			keyWay := "A read accepts the VM's own key state holds (vm.host_key_line) alone. A VM made again from its seed is a new install: `tofu state rm` this resource, " +
+				"and the next apply installs it under the seed's key. A VM whose key changed: check the new key on its console, give it in vm.known_hosts_line, " +
+				"then `tofu state rm` this resource and `tofu import` it again (`" + vmID(m) + "`)."
+			if !known(m.VM.HostKeyLine) || known(m.VM.SeedBootID) {
+				// The connection accepts state's vm.known_hosts_line (installResource.vm), which an apply that
+				// does not read saves.
+				keyWay = "A read accepts the key in state's vm.known_hosts_line (the VM's own key is not recorded yet, or its one-time key is not retired): " +
+					"check the new key on the VM's console, give it in vm.known_hosts_line, then `tofu apply -refresh=false`, which saves a change of the connection alone without running anything on the VM."
+			}
+			unreachable(&resp.Diagnostics, "VM", "vm", m.VM.Host.ValueString(), keyWay, err)
 			return
 		}
 		addInstallerError(&resp.Diagnostics, "Reading the VM", renamed(ctx, v, err))

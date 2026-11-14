@@ -361,7 +361,8 @@ func TestVMCreate(t *testing.T) {
 	}
 	f.set("status", reply{exit: 255, stderr: "ops@192.0.2.7: Permission denied (publickey)."})
 	if got := errorsOf(h.read(state).Diagnostics); !strings.Contains(got, "ssh's login to the VM 192.0.2.7 was refused") ||
-		!strings.Contains(got, "vm.user and vm.private_key_file") || strings.Contains(got, "docker.") || strings.Contains(got, "made again") {
+		!strings.Contains(got, "vm.user or vm.private_key_file") || !strings.Contains(got, "tofu apply -refresh=false") ||
+		strings.Contains(got, "docker.") || strings.Contains(got, "made again") {
 		t.Errorf("a VM refusing the login: %q", got)
 	}
 	f.set("status", reply{exit: 1, stderr: "status: the daemon is down"})
@@ -371,15 +372,26 @@ func TestVMCreate(t *testing.T) {
 	f.set("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", "")})
 	// known_hosts_line may go once the own key is in state.
 	noLine := fill(h.typ, map[string]tftypes.Value{"vm": h.block("vm", map[string]tftypes.Value{
-		"host": str("192.0.2.7"), "user": str("ops"), "version": str("1.1.0"), "short_name": str("notes")}),
+		"host": str("192.0.2.9"), "user": str("deploy"), "private_key_file": str("/keys/deploy"), "version": str("1.1.0"), "short_name": str("notes")}),
 		"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@b"}), "secret_inputs_wo_version": num(1), "deletion_protection": boolean(false)})
 	if d := errorsOf(h.validate(noLine)); d != "" {
 		t.Fatalf("no known_hosts_line after the install: %s", d)
 	}
+	f.reset()
 	a2 := h.update(state, noLine)
 	if d := errorsOf(a2.Diagnostics); d != "" {
 		t.Fatal(d)
 	}
+	// A change of the connection alone (the way on of a refused login) runs nothing on the VM.
+	if ops := f.ops(); len(ops) != 0 || vmAttr(t, h, a2.NewState, "user") != "deploy" || vmAttr(t, h, a2.NewState, "private_key_file") != "/keys/deploy" {
+		t.Errorf("a connection change: ops %q, vm %v", ops, h.attrs(a2.NewState)["vm"])
+	}
+	// Another key on the VM at its new address: the import named is the address a read uses.
+	f.set("status", reply{exit: 255, stderr: "Host key verification failed."})
+	if got := errorsOf(h.read(a2.NewState).Diagnostics); !strings.Contains(got, "`vm:192.0.2.9/notes-stow`") {
+		t.Errorf("another key after a new address: %q", got)
+	}
+	f.set("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", "")})
 	if vmAttr(t, h, a2.NewState, "host_key_line") != ownLine || vmAttr(t, h, a2.NewState, "seed_boot_id") != "<null>" {
 		t.Errorf("an update of the provider's own settings changed the VM's keys: %v", h.attrs(a2.NewState)["vm"])
 	}
@@ -413,6 +425,14 @@ func TestVMRetireFails(t *testing.T) {
 	if c := f.lastConn(); c.KnownHostsLine != ownLine || !slices.Equal(c.AlsoKnownHostsLines, []string{seedLine}) {
 		t.Errorf("a connection before the reboot %+v", c)
 	}
+	// Another host key while the one-time key is still accepted: vm.known_hosts_line, saved by an
+	// apply that does not read, is the way on, no new import.
+	f.set("status", reply{exit: 255, stderr: "Host key verification failed."})
+	if got := errorsOf(h.read(state).Diagnostics); !strings.Contains(got, "serves another host key") || !strings.Contains(got, "state's vm.known_hosts_line") ||
+		!strings.Contains(got, "tofu apply -refresh=false") || strings.Contains(got, "tofu import") {
+		t.Errorf("another key before the retirement: %q", got)
+	}
+	f.set("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", "")})
 	// An upgrade's reboot retires it: the update's reads go on under the VM's own key.
 	f.reset()
 	f.then("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", "")})

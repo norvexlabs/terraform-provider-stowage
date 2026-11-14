@@ -62,13 +62,14 @@ another name reaches the installer unchanged. Over ssh no environment is carried
   A read ssh fails (exit 255) is an error, and the install stays in state whatever ssh met:
   nothing a read sees tells a host gone for good from one down for a while. A read connects as
   state holds the connection; ssh's message picks the summary and the way on: its refusal of the
-  login (`… : Permission denied (…)`) — `ssh's login to the Docker host <host> was refused` (the
-  right `docker.user` and `docker.private_key_file`, or the agent's key, then `tofu apply
-  -refresh=false`, which saves a change of the connection alone without running anything on the
-  target); `Host key verification failed` or a changed identification — `The Docker host <host>
+  login (`user@host: Permission denied (publickey,…)`, its authentication methods listed; after a
+  key file it could not load, `Load key …`, too) — `ssh's login to the Docker host <host> was
+  refused` (a fix outside the configuration, the agent's key or the keys the host accepts: plan
+  again; a fix of `docker.user` or `docker.private_key_file`: `tofu apply -refresh=false`, which
+  saves a change of the connection alone without running anything on the target, then plan); `Host key verification failed` or a changed identification — `The Docker host <host>
   serves another host key` (the new key, checked on its console, in `docker.known_hosts_line`, then
-  `tofu apply -refresh=false` the same way); anything else, a local key file ssh cannot read
-  included — `Cannot reach the Docker host <host> to read the install` (plan again once it
+  `tofu apply -refresh=false` the same way); anything else, a program's own `Permission denied
+  (os error 13)` included — `Cannot reach the Docker host <host> to read the install` (plan again once it
   answers). Each detail ends on the ways common to all: only once the host is known to be gone,
   `tofu state rm` (nothing runs on the target, the next apply installs again, and state's record
   of the install — its previous release, its inputs — is lost); one plan without the read, `tofu
