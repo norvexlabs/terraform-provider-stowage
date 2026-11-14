@@ -10,8 +10,9 @@
 # Walks: create (1.0.0, the cluster reached by host and client certificate, a kubeconfig written
 # for each run) → a plan shows no change → a changed input (k8s upgrade --given, the pod's
 # environment changed) → ship 2.0.0, its installer upgrades → a plan shows no change → back to
-# 1.0.0's installer with allow_rollback (k8s rollback) → destroy (k8s uninstall --data). Needs
-# tofu, Docker, network access, a linux/amd64 host.
+# 1.0.0's installer with allow_rollback (k8s rollback) → the state forgotten, the release imported
+# and its first apply → a destroy refused by deletion_protection → destroy (k8s uninstall --data).
+# Needs tofu, Docker, network access, a linux/amd64 host.
 set -euo pipefail
 
 PROV=$(cd "$(dirname "$0")/.." && pwd)
@@ -67,7 +68,7 @@ provider "stowage" {
 resource "stowage_install" "notes" {
   installer           = "$1"
   inputs              = { ADMIN_EMAIL = "$2" }
-  deletion_protection = false
+  deletion_protection = ${PROTECT:-false}
   delete_data         = true
   ${3:-}
   kubernetes {
@@ -153,6 +154,27 @@ config "$I1" ops@notes.test "allow_rollback = true"
 tf apply -auto-approve -no-color >"$WORK/apply4.log" 2>&1 || { cat "$WORK/apply4.log"; cluster_logs >&2; fail "tofu apply (rollback)"; }
 runs 1.0.0
 [[ $(st version) == 1.0.0 && $(st installer) == "$I1" ]] || fail "state after the rollback: version $(st version), installer $(st installer)"
+
+step "import: the state forgotten, the release imported by its ID, its first apply, then a plan with no change"
+tf state rm stowage_install.notes >"$WORK/rm.log" 2>&1 || { cat "$WORK/rm.log"; fail "tofu state rm"; }
+tf import -input=false stowage_install.notes "kubernetes:$NS/notes" >"$WORK/import.log" 2>&1 || { cat "$WORK/import.log"; fail "tofu import"; }
+[[ $(st id) == notes/notes && $(st registry) == null ]] || fail "state after the import: id $(st id), registry $(st registry)"
+tf apply -auto-approve -no-color >"$WORK/apply5.log" 2>&1 || { cat "$WORK/apply5.log"; cluster_logs >&2; fail "tofu apply (the import's first)"; }
+runs 1.0.0
+[[ $(st version) == 1.0.0 && $(st installer) == "$I1" && $(st registry) != null ]] ||
+	fail "state after the import's apply: version $(st version), installer $(st installer), registry $(st registry)"
+[[ $(kubectl exec -n "$NS" deploy/notes-web -- printenv ADMIN_EMAIL) == ops@notes.test ]] || fail "the import's apply changed ADMIN_EMAIL"
+rc=0; tf plan -detailed-exitcode -no-color >"$WORK/plan4.log" 2>&1 || rc=$?
+[[ $rc == 0 ]] || { cat "$WORK/plan4.log"; fail "tofu plan after the import's apply exited $rc, not 0 (no change)"; }
+
+step "a destroy refused by deletion_protection: the release kept"
+PROTECT=true config "$I1" ops@notes.test "allow_rollback = true"
+tf apply -auto-approve -no-color >"$WORK/apply6.log" 2>&1 || { cat "$WORK/apply6.log"; fail "tofu apply (deletion_protection on)"; }
+rc=0; tf destroy -auto-approve -no-color >"$WORK/destroy1.log" 2>&1 || rc=$?
+[[ $rc != 0 ]] && grep -q 'deletion_protection is on' "$WORK/destroy1.log" || { cat "$WORK/destroy1.log"; fail "the destroy was not refused by deletion_protection"; }
+runs 1.0.0
+config "$I1" ops@notes.test "allow_rollback = true"
+tf apply -auto-approve -no-color >"$WORK/apply7.log" 2>&1 || { cat "$WORK/apply7.log"; fail "tofu apply (deletion_protection off)"; }
 
 step "destroy: k8s uninstall --data"
 tf destroy -auto-approve -no-color >"$WORK/destroy.log" 2>&1 || { cat "$WORK/destroy.log"; cluster_logs >&2; fail "tofu destroy"; }

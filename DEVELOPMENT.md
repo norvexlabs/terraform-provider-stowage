@@ -54,7 +54,9 @@ cluster `acc-k8s-<pid>` pulling from it, pinned kind, helm and kubectl). The run
 `~/.cache` (the work directory), `~/.docker` (the registry logins, buildx's state), this tree and
 Stowage's at their own paths, as the containers the suite starts are given host paths. It ships `examples/minimal` 1.0.0 and 2.0.0 and
 walks create, a plan with no change, a changed input, the upgrade, a plan with no change, the
-rollback (refused first without `allow_rollback`) and destroy, checking the cluster at each step
+rollback (refused first without `allow_rollback`), the state forgotten and the release imported
+(`kubernetes:<namespace>/<release>`) with its first apply and a plan with no change, a destroy
+refused by `deletion_protection` (the release kept) and destroy, checking the cluster at each step
 and that no run leaves its private directory. It needs Docker, network access and a linux/amd64
 host; `PROVIDER_BIN` runs another provider binary.
 

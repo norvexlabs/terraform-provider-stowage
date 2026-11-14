@@ -11,11 +11,13 @@ installable and verifiable by a user. A finished item is deleted, not ticked.
    init` finds `norvexlabs/stowage` without a local mirror; then README's and the install guide's
    "not in a registry yet" go. 0.1.0 is released on GitHub, signed; the registry has no
    `norvexlabs/stowage` yet.
-2. **Acceptance coverage of import and destroy safety off Docker**: `make acc-docker` walks an
-   import and its first apply, `deletion_protection`'s refusal, a secret input and a refused
-   upgrade; `make acc-k8s` walks none of them, and `make acc-vm` no import
-   (`vm:<host>/<short>-stow`). Add them to `test/acc-k8s.sh` and `test/acc-vm.sh` and run both
-   (acc-vm needs TrueNAS, ~1 h): until then those paths are proven by unit tests alone.
+2. **Acceptance coverage of the VM's import**: `make acc-docker` and `make acc-k8s` walk an import
+   and its first apply and `deletion_protection`'s refusal; `make acc-vm` neither (an import is
+   `vm:<host>/<short>-stow`). Add them to `test/acc-vm.sh` and run it (TrueNAS, ~1 h): until then
+   the VM's import is proven by unit tests alone.
+3. **Acceptance coverage of a secret input and a refused upgrade on Kubernetes**: `make acc-docker`
+   walks both, `make acc-k8s` neither (`examples/minimal` has no secret input: acc-docker adds
+   one to its copy).
 
 ## Should
 
