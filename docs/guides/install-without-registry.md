@@ -50,8 +50,10 @@ installs it with `tofu init`, which records the zip's hash in `.terraform.lock.h
 
 ## The implied local mirror (`make install-local`)
 
+Build, then copy into `~/.terraform.d/plugins`:
+
 ```bash
-make install-local   # build, then copy into ~/.terraform.d/plugins
+make install-local
 ```
 
 This copies `bin/terraform-provider-stowage` to

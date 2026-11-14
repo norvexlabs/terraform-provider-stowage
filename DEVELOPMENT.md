@@ -8,23 +8,23 @@ repository's map. Using the provider is [README.md](README.md) and the generated
 
 Docker is the only requirement.
 
-```bash
-make check   # GATE: gofmt, go vet, staticcheck, govulncheck, the hooks' test, go test -race (Dockerfile target checks), then make docs-check
-make docs-check # docs/ regenerated in Docker (target docs-check: the pinned tofu, its checksum checked, and tfplugindocs) into a copy: any difference from docs/ fails
-make build   # ./bin/terraform-provider-stowage, only after green checks
-make install-local # the build in OpenTofu's implied local mirror (PLUGIN_DIR, default ~/.terraform.d/plugins): see docs/guides/install-without-registry.md
-make test    # fast loop, never the gate
-make docs    # docs/ by tfplugindocs from OpenTofu's schema of the built provider (test/schema.sh; the pinned tofu, downloaded once)
-make tidy    # go.mod / go.sum
-make fmt     # gofmt -w
-make shell   # toolchain container
-make hooks   # commit identity + .githooks
-make hooks-test  # the hooks' test (test/hooks.sh) on this machine; make check runs it too
-make release-check # goreleaser check + a snapshot release (zips, manifest, checksums; unsigned) in dist/, in Docker
-make acc-k8s # the Kubernetes target through tofu on a kind cluster, against a real Stowage, in a container; prints PASS
-make acc-vm  # the VM target and stowage_vm_seed on a real TrueNAS VM (STOWAGE_VM_ENV=<file>), in the same container; prints PASS
-make acc-vm-names # the names of the variables STOWAGE_VM_ENV gives that container (never a value); runs nothing
-```
+| Command | |
+|---|---|
+| `make check` | GATE: gofmt, go vet, staticcheck, govulncheck, the hooks' test, go test -race (Dockerfile target checks), then make docs-check |
+| `make docs-check` | docs/ regenerated in Docker (target docs-check: the pinned tofu, its checksum checked, and tfplugindocs) into a copy: any difference from docs/ fails |
+| `make build` | ./bin/terraform-provider-stowage, only after green checks |
+| `make install-local` | the build in OpenTofu's implied local mirror (PLUGIN_DIR, default ~/.terraform.d/plugins): see docs/guides/install-without-registry.md |
+| `make test` | fast loop, never the gate |
+| `make docs` | docs/ by tfplugindocs from OpenTofu's schema of the built provider (test/schema.sh; the pinned tofu, downloaded once) |
+| `make tidy` | go.mod / go.sum |
+| `make fmt` | gofmt -w |
+| `make shell` | toolchain container |
+| `make hooks` | commit identity + .githooks |
+| `make hooks-test` | the hooks' test (test/hooks.sh) on this machine; make check runs it too |
+| `make release-check` | goreleaser check + a snapshot release (zips, manifest, checksums; unsigned) in dist/, in Docker |
+| `make acc-k8s` | the Kubernetes target through tofu on a kind cluster, against a real Stowage, in a container; prints PASS |
+| `make acc-vm` | the VM target and `stowage_vm_seed` on a real TrueNAS VM (`STOWAGE_VM_ENV=<file>`), in the same container; prints PASS |
+| `make acc-vm-names` | the names of the variables STOWAGE_VM_ENV gives that container (never a value); runs nothing |
 
 **`make acc-docker`** (`STOWAGE_SRC=<a Stowage checkout ≥ 0.35.0, its ./bin/stowage built>`)
 runs `test/acc-docker.sh`, the Docker target's acceptance test against a real installer through

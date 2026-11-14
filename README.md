@@ -51,10 +51,11 @@ release](https://github.com/norvexlabs/terraform-provider-stowage/releases) hold
 platform: check it and copy it into OpenTofu's local mirror,
 `~/.terraform.d/plugins/registry.opentofu.org/norvexlabs/stowage/` ([the
 steps](docs/guides/install-without-registry.md#a-releases-zip-in-the-implied-local-mirror)). Or
-build it from a checkout (Docker is the only requirement; linux/amd64):
+build it from a checkout (Docker is the only requirement; linux/amd64), then copy it into
+OpenTofu's local mirror, `~/.terraform.d/plugins`:
 
 ```bash
-make install-local   # build, then copy into OpenTofu's local mirror, ~/.terraform.d/plugins
+make install-local
 ```
 
 A root then requires it as it will once published, and `tofu init` installs it from the mirror
@@ -142,15 +143,15 @@ full: [Docker](docs/guides/docker-target.md), [Kubernetes](docs/guides/kubernete
 
 ## Building and testing
 
-```bash
-make check          # the gate: gofmt, vet, staticcheck, govulncheck, the hooks' test, go test -race, docs/ in step
-make build          # ./bin/terraform-provider-stowage, after green checks
-make install-local  # the build in OpenTofu's local mirror
-make docs           # docs/ from OpenTofu's schema of the build (tfplugindocs)
-make acc-docker     # acceptance: Docker over SSH against a real installer (STOWAGE_SRC=<Stowage checkout>)
-make acc-k8s        # acceptance: a kind cluster
-make acc-vm         # acceptance: a TrueNAS VM (STOWAGE_VM_ENV=<file>)
-```
+| Command | |
+|---|---|
+| `make check` | the gate: gofmt, vet, staticcheck, govulncheck, the hooks' test, go test -race, docs/ in step |
+| `make build` | `./bin/terraform-provider-stowage`, after green checks |
+| `make install-local` | the build in OpenTofu's local mirror |
+| `make docs` | docs/ from OpenTofu's schema of the build (tfplugindocs) |
+| `make acc-docker` | acceptance: Docker over SSH against a real installer (`STOWAGE_SRC=<Stowage checkout>`) |
+| `make acc-k8s` | acceptance: a kind cluster |
+| `make acc-vm` | acceptance: a TrueNAS VM (`STOWAGE_VM_ENV=<file>`) |
 
 Everything runs in Docker. The acceptance tests, the release procedure and the repository's map: [DEVELOPMENT.md](DEVELOPMENT.md).
 
