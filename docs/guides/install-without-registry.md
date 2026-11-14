@@ -23,8 +23,9 @@ the zip unopened into the mirror's directory for the provider (`platform` as the
 `linux_amd64`, `darwin_arm64`, `windows_amd64`, …; on macOS, `shasum -a 256 --check` for
 `sha256sum --check`). Each step runs only once the one before succeeded, and a step that fails
 says why: a download, the key file holding one key that is not the release key, the signature,
-the checksum. The block has no comment, so it pastes into any shell, zsh without
-`interactive_comments` included:
+the checksum. The block is for a POSIX shell: it pastes into bash or zsh (it has no comment, so
+zsh without `interactive_comments` too); on Windows, run it in Git Bash or WSL, or take its steps
+by hand:
 
 ```bash
 v=0.1.0 platform=linux_amd64

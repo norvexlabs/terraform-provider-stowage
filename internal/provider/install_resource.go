@@ -926,15 +926,16 @@ func (r *installResource) Read(ctx context.Context, req resource.ReadRequest, re
 }
 
 // sshLoginRefused matches OpenSSH's own refusals of a login: "user@host: Permission denied
-// (publickey,password).", by its list of authentication methods (a program's EACCES, "…:
-// Permission denied (os error 13)", is not one), and the server's disconnect once its MaxAuthTries
-// is exceeded, by ssh's framing of that disconnect ("Received disconnect from <host> port
-// <port>:2: Too many authentication failures"; before OpenSSH 7.3 "from <host>: 2: …"): more keys
-// offered than it tries (the agent's, ssh_config's IdentityFile entries). ssh that could not load
-// a key file says so before it ("Load key …: Permission denied"), then refuses the login the same
-// way: the detail shows both.
-var sshLoginRefused = regexp.MustCompile(`: Permission denied \((publickey|password|keyboard-interactive|hostbased|gssapi-[a-z-]+)(,(publickey|password|keyboard-interactive|hostbased|gssapi-[a-z-]+))*\)|` +
-	`Received disconnect from \S+?(?: port \d+)?: ?2: Too many authentication failures`)
+// (publickey,password).", by its list of authentication methods, empty when the server offers
+// none ("Permission denied ()."; a program's EACCES, "…: Permission denied (os error 13)", is not
+// one), and a server's disconnect of the login, by ssh's framing of it ("Received disconnect from
+// <host> port <port>:2: Too many authentication failures" past the server's MaxAuthTries, more
+// keys offered than it tries: the agent's, ssh_config's IdentityFile entries; ":14: No supported
+// authentication methods available" from a server that sends it rather than an empty list; before
+// OpenSSH 7.3 "from <host>: 2: …"). ssh that could not load a key file says so before it ("Load
+// key …: Permission denied"), then refuses the login the same way: the detail shows both.
+var sshLoginRefused = regexp.MustCompile(`: Permission denied \((?:(?:publickey|password|keyboard-interactive|hostbased|gssapi-[a-z-]+)(?:,(?:publickey|password|keyboard-interactive|hostbased|gssapi-[a-z-]+))*)?\)|` +
+	`Received disconnect from \S+?(?: port \d+)?: ?(?:2: Too many authentication failures|14: No supported authentication methods available)`)
 
 // unreachable is a read's error for a remote target ssh did not reach (exit 255: ssh's own failure,
 // or the program's own exit 255). The install stays in state whatever ssh met: nothing a read sees

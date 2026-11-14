@@ -347,6 +347,8 @@ func TestReadFollowsTheTarget(t *testing.T) {
 		"Host key verification failed.":                   {[]string{key, "docker.known_hosts_line", "tofu apply -refresh=false"}, []string{login, none, "docker.user"}},
 		"Load key \"/keys/ops\": Permission denied\nops@app.example: Permission denied (publickey,password).": {[]string{login, "Load key"}, []string{key, none}},
 		"Received disconnect from 192.0.2.5 port 22:2: Too many authentication failures":                      {[]string{login}, []string{key, none}},
+		"Received disconnect from 192.0.2.5 port 22:14: No supported authentication methods available":        {[]string{login}, []string{key, none}},
+		"ops@app.example: Permission denied ().":                                                              {[]string{login}, []string{key, none}},
 		"Received disconnect from 192.0.2.5: 2: Too many authentication failures for ops":                     {[]string{login}, []string{key, none}},
 		"registry login: Too many authentication failures":                                                    {[]string{none}, []string{login, key}},
 		"open /srv/notes/.env: Permission denied (os error 13)":                                               {[]string{none}, []string{login, key, "docker.user", "known_hosts_line"}},

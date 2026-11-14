@@ -62,10 +62,11 @@ another name reaches the installer unchanged. Over ssh no environment is carried
   A read ssh fails (exit 255) is an error, and the install stays in state whatever ssh met:
   nothing a read sees tells a host gone for good from one down for a while. A read connects as
   state holds the connection; ssh's message picks the summary and the way on: its refusal of the
-  login (`user@host: Permission denied (publickey,…)`, its authentication methods listed; after a
-  key file it could not load, `Load key …`, too; or the server's disconnect past its MaxAuthTries,
-  `Received disconnect from <host> port <port>:2: Too many authentication failures`, `from <host>:
-  2: …` before OpenSSH 7.3) — `ssh's login to the Docker host <host> was
+  login (`user@host: Permission denied (publickey,…)`, its authentication methods listed, none
+  when the server offers none; after a key file it could not load, `Load key …`, too; or the
+  server's disconnect, `Received disconnect from <host> port <port>:2: Too many authentication
+  failures` past its MaxAuthTries or `…:14: No supported authentication methods available`, `from
+  <host>: 2: …` before OpenSSH 7.3) — `ssh's login to the Docker host <host> was
   refused` (a fix outside the configuration — the agent's keys, ssh_config's IdentityFile
   entries, the keys the host accepts or its MaxAuthTries: plan again; a fix of `docker.user` or `docker.private_key_file`: `tofu apply -refresh=false`, which
   saves a change of the connection alone without running anything on the target, then plan); `Host key verification failed` or a changed identification — `The Docker host <host>
