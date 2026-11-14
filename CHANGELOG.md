@@ -16,6 +16,12 @@ named here.
 - `delete_data = true` with a `vm` block is refused at validation (`delete_data is not the VM's`): a
   VM's destroy forgets the install and deletes nothing, its data going with the VM.
 
+- A read of a Docker host or VM that ssh does not reach is an error naming the ways on (`Cannot reach
+  the Docker host <host> to read the install`, `Cannot reach the VM <host> …`): plan again once it
+  answers, a changed host key's new pin and import, `tofu state rm` for a target deleted outside
+  OpenTofu, `-refresh=false` for one plan. The install stays in state, as a host down for a while
+  is not told from one gone.
+
 ### Documentation
 
 - Installing a GitHub release's signed zip into OpenTofu's local mirror, on any platform it is

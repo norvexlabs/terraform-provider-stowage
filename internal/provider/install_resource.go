@@ -905,6 +905,12 @@ func (r *installResource) Read(ctx context.Context, req resource.ReadRequest, re
 	}
 	st, err := d.Status(ctx)
 	if err != nil {
+		if known(m.Docker.Host) && sshFailed(err) {
+			unreachable(&resp.Diagnostics, "Docker host", m.Docker.Host.ValueString(),
+				"check the new key on the host's console and give it in docker.known_hosts_line, then `tofu state rm` this resource and `tofu import` it again ("+
+					"`<host>:<work_dir>/<name>/<short>-stow`): a read accepts the key state holds alone.", err)
+			return
+		}
 		addInstallerError(&resp.Diagnostics, "Reading the install", err)
 		return
 	}
@@ -916,6 +922,19 @@ func (r *installResource) Read(ctx context.Context, req resource.ReadRequest, re
 	applyHeld(&m, st, true)
 	resp.Diagnostics.Append(dropUnrecorded(ctx, &m, st)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
+}
+
+// unreachable is a read's error for a remote target ssh did not reach (exit 255, its own failure:
+// no connection, or another host key served). The install stays in state: nothing a read sees
+// tells a host gone for good from one down or unreachable for a while, and forgetting an install
+// that still runs would have the next apply install it again. The detail names the ways on,
+// keyFix the one for a host serving another key.
+func unreachable(diags *diag.Diagnostics, kind, host, keyFix string, err error) {
+	diags.AddError(fmt.Sprintf("Cannot reach the %s %s to read the install", kind, host), fmt.Sprintf(
+		"%v\n\nThe install stays in state: the provider cannot tell a %s that is gone from one down or unreachable for a while. "+
+			"If it is down, plan again once it answers. If it serves another host key, "+keyFix+" "+
+			"If it was deleted outside OpenTofu, forget the install with `tofu state rm` on this resource (nothing runs on the target); the next apply installs again. "+
+			"To plan once without reading it: `tofu plan -refresh=false`.", err, kind))
 }
 
 // dropUnrecorded removes from m's inputs a key given a value that the install does not record,

@@ -344,6 +344,21 @@ func TestVMCreate(t *testing.T) {
 	if c := f.lastConn(); c.KnownHostsLine != ownLine || len(c.AlsoKnownHostsLines) != 0 {
 		t.Errorf("a connection after the install %+v", c)
 	}
+	// A VM ssh does not reach stays in state, the error naming the ways on; another failure is
+	// not taken for it.
+	f.set("status", reply{exit: 255, stderr: "ssh: connect to host 192.0.2.7 port 22: No route to host"})
+	r := h.read(state)
+	if got := errorsOf(r.Diagnostics); !strings.Contains(got, "Cannot reach the VM 192.0.2.7") || !strings.Contains(got, "tofu state rm") || !strings.Contains(got, "-refresh=false") {
+		t.Errorf("an unreachable VM: %q", got)
+	}
+	if h.attrs(r.NewState) == nil {
+		t.Error("an unreachable VM is forgotten")
+	}
+	f.set("status", reply{exit: 1, stderr: "status: the daemon is down"})
+	if got := errorsOf(h.read(state).Diagnostics); strings.Contains(got, "Cannot reach") {
+		t.Errorf("a failed status taken for an unreachable VM: %q", got)
+	}
+	f.set("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", "")})
 	// known_hosts_line may go once the own key is in state.
 	noLine := fill(h.typ, map[string]tftypes.Value{"vm": h.block("vm", map[string]tftypes.Value{
 		"host": str("192.0.2.7"), "user": str("ops"), "version": str("1.1.0"), "short_name": str("notes")}),
@@ -1668,7 +1683,7 @@ func TestVMRenamedInstaller(t *testing.T) {
 	// ssh's own failure is not looked into: no probe.
 	f.reset()
 	f.set("status", reply{exit: 255, stderr: "Connection refused"})
-	if got := errorsOf(h.read(state).Diagnostics); strings.Contains(got, "tofu import") || slices.Contains(f.ops(), "probe") {
+	if got := errorsOf(h.read(state).Diagnostics); strings.Contains(got, "The VM has no") || !strings.Contains(got, "Cannot reach the VM") || slices.Contains(f.ops(), "probe") {
 		t.Errorf("ssh's failure: %s ops %q", got, f.ops())
 	}
 	// A probe that fails says so.

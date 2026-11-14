@@ -330,7 +330,19 @@ func TestReadFollowsTheTarget(t *testing.T) {
 		t.Fatalf("previous %v %v", a["previous"], err)
 	}
 
+	// A host ssh does not reach stays in state, the error naming the ways on.
+	h.fake.replies["status"] = reply{exit: 255, stderr: "ssh: connect to host app.example port 22: Connection refused"}
+	r = h.read(state)
+	if got := errorsOf(r.Diagnostics); !strings.Contains(got, "Cannot reach the Docker host app.example") || !strings.Contains(got, "tofu state rm") || !strings.Contains(got, "-refresh=false") {
+		t.Fatalf("an unreachable host: %q", got)
+	}
+	if h.attrs(r.NewState) == nil {
+		t.Fatal("an unreachable host's install is forgotten")
+	}
 	h.fake.replies["status"] = reply{exit: 100, stderr: "the installer's own exit 100"}
+	if got := errorsOf(h.read(state).Diagnostics); strings.Contains(got, "Cannot reach") {
+		t.Fatalf("an installer's failure taken for an unreachable host: %q", got)
+	}
 	if got := errorsOf(h.read(state).Diagnostics); !strings.Contains(got, "status failed (exit 100)") {
 		t.Fatalf("an installer's exit 100 taken for a missing install: %q", got)
 	}
