@@ -36,6 +36,8 @@ const seedTimeout = 10 * time.Minute
 
 var diskType = map[string]attr.Type{"format": types.StringType, "image": types.StringType, "os_gib": types.Int64Type, "disk_gib": types.Int64Type, "cloud_image": types.StringType}
 
+var nicType = map[string]attr.Type{"mac": types.StringType, "attach": types.StringType, "primary": types.BoolType}
+
 var diskFileType = map[string]attr.Type{"path": types.StringType, "format": types.StringType, "sha256": types.StringType, "disk_gib": types.Int64Type}
 
 type seedModel struct {
@@ -80,6 +82,7 @@ type seedModel struct {
 	AppGiB         types.Int64    `tfsdk:"app_gib"`
 	DiskFile       types.Object   `tfsdk:"disk_file"`
 	AwaitTLS       types.Bool     `tfsdk:"await_tls"`
+	NICs           types.Map      `tfsdk:"nics"`
 	Timeouts       timeouts.Value `tfsdk:"timeouts"`
 }
 
@@ -194,6 +197,10 @@ func (r *seedResource) Schema(ctx context.Context, _ resource.SchemaRequest, res
 				PlanModifiers:       []planmodifier.Object{objectplanmodifier.UseStateForUnknown()}},
 			"await_tls": schema.BoolAttribute{Computed: true, MarkdownDescription: "The VM's first install waits for a `byo` certificate given over SSH (`tls = \"byo\"`).",
 				PlanModifiers: []planmodifier.Bool{boolplanmodifier.UseStateForUnknown()}},
+			"nics": schema.MapAttribute{Computed: true, ElementType: types.ObjectType{AttrTypes: nicType},
+				MarkdownDescription: "The NICs the VM is made with, by role (the release's `host.interfaces`, as `interfaces` gives them): `mac`, the MAC its cloud-config names it by — given (`mac=`), else generated for a hypervisor's VM of more than one NIC; null for a VM of one NIC, named from the NIC it has, and on a cloud, which gives its NICs their MACs —, `attach`, the network it attaches to (`attach=`; null: the primary's), and `primary`. " +
+					"Give each NIC of the VM's resource its `mac`: a NIC of another MAC is not named, and the VM's network does not come up as the release expects. Empty when the release declares no NIC; null from an installer made before Stowage 0.38.0, which names none (with a warning: give each NIC's `mac=` in `interfaces`).",
+				PlanModifiers: []planmodifier.Map{mapplanmodifier.UseStateForUnknown()}},
 			"waiting": schema.ListAttribute{Computed: true, ElementType: types.StringType,
 				MarkdownDescription: "The required secret inputs nothing gives, sorted: the VM's first install waits for them, which `stowage_install`'s `secret_inputs_wo` gives over SSH.",
 				PlanModifiers:       []planmodifier.List{listplanmodifier.UseStateForUnknown()}},
@@ -317,6 +324,24 @@ func (r *seedResource) Create(ctx context.Context, req resource.CreateRequest, r
 	if f := seed.DiskFile; f != nil {
 		m.DiskFile = types.ObjectValueMust(diskFileType, map[string]attr.Value{"path": types.StringValue(f.Path), "format": types.StringValue(f.Format),
 			"sha256": types.StringValue(f.SHA256), "disk_gib": types.Int64Value(f.DiskGiB)})
+	}
+	m.NICs = types.MapNull(types.ObjectType{AttrTypes: nicType})
+	if seed.Interfaces == nil {
+		resp.Diagnostics.AddWarning("The seed names no NIC",
+			fmt.Sprintf("%s %s's installer predates Stowage 0.38.0: its seed does not name the MACs it gives the VM's NICs, so nics is null. When the release names more than one NIC (host.interfaces), give each one's mac= in interfaces and those MACs to the VM's NICs.", desc.Name, desc.Release.Version))
+	} else {
+		nics := map[string]attr.Value{}
+		for _, i := range *seed.Interfaces {
+			mac, attach := types.StringNull(), types.StringNull()
+			if i.MAC != "" {
+				mac = types.StringValue(i.MAC)
+			}
+			if i.Attach != "" {
+				attach = types.StringValue(i.Attach)
+			}
+			nics[i.Role] = types.ObjectValueMust(nicType, map[string]attr.Value{"mac": mac, "attach": attach, "primary": types.BoolValue(i.Primary)})
+		}
+		m.NICs = types.MapValueMust(types.ObjectType{AttrTypes: nicType}, nics)
 	}
 	waiting, d2 := types.ListValueFrom(ctx, types.StringType, seed.Waiting)
 	resp.Diagnostics.Append(d2...)

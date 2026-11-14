@@ -1009,6 +1009,9 @@ func remoteChange(plan, state *installModel) []string {
 		// Secret stays (nothing removes it) and nothing runs.
 		"kubernetes.image_pull_login": plan.Kubernetes == nil || state.Kubernetes == nil ||
 			!plan.Kubernetes.ImagePullLogin.ValueBool() || state.Kubernetes.ImagePullLogin.ValueBool(),
+		// Changed, the release is applied again with them; left out, nothing runs (the release
+		// keeps the values it has).
+		"kubernetes.values": !valuesChanged(plan, state),
 	} {
 		if !eq {
 			changed = append(changed, name)

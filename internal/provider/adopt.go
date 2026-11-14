@@ -97,8 +97,9 @@ func releaseChangeOf(changes bool) releaseChange {
 // alone: a value may be private), or nothing; then the release change. guessed: the split was made
 // without the new release (a certain re-run skips its fetch), so what the running release does not
 // declare — an input, a secret input, a route's port — is told apart: the new release's upgrade
-// gives what it declares, the re-run refuses the rest.
-func adoptionReport(diags *diag.Diagnostics, u *update, rerun, up installer.Change, change releaseChange, running *installer.Describe, guessed bool) {
+// gives what it declares, the re-run refuses the rest. given: what the first apply gives again
+// whatever the install records, which is not read (the chart values on Kubernetes).
+func adoptionReport(diags *diag.Diagnostics, u *update, rerun, up installer.Change, change releaseChange, running *installer.Describe, guessed bool, given ...string) {
 	if u.adopted == nil {
 		diags.AddWarning("Taking over the install: its values are not known",
 			"The installer the install runs predates `status --json --values` (Stowage 0.38.0), or cannot read the release it runs: the first apply re-runs the install with every value the configuration gives.")
@@ -146,6 +147,9 @@ func adoptionReport(diags *diag.Diagnostics, u *update, rerun, up installer.Chan
 	} else {
 		b.WriteString("The first apply re-runs the install with what differs from what it records: " + strings.Join(changes, ", ") + ".")
 	}
+	if len(given) > 0 {
+		b.WriteString(" It gives " + strings.Join(given, ", ") + " again, whatever the install has: not read, not compared.")
+	}
 	b.WriteString(map[releaseChange]string{
 		noReleaseChange:  " The plan changes no release.",
 		releaseChanges:   " The release change the plan makes runs after it, as planned.",
@@ -161,6 +165,9 @@ func adoptionReport(diags *diag.Diagnostics, u *update, rerun, up installer.Chan
 	summary := "Taking over the install: its values differ"
 	if len(changes)+len(upgrade)+len(undeclared) == 0 {
 		summary = "Taking over the install: its values match"
+		if len(given) > 0 {
+			summary += ", applied again for " + strings.Join(given, ", ")
+		}
 	}
 	diags.AddWarning(summary, b.String())
 }

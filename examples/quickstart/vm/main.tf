@@ -1,6 +1,6 @@
 # Quick start: a Kairos VM. stowage_vm_seed makes its first-boot material once; your hypervisor's
-# or cloud's own resource makes the VM from user_data and the disk (examples/resources/
-# stowage_vm_seed has a TrueNAS one); stowage_install then installs and keeps it over SSH.
+# or cloud's own resource makes the VM from user_data and the disk (examples/guides/truenas-vm
+# makes it on TrueNAS with the TrueNAS provider); stowage_install then installs and keeps it over SSH.
 # `make install-local` in the provider's checkout first, then `tofu init`.
 terraform {
   required_version = ">= 1.11.0"

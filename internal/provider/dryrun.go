@@ -70,7 +70,11 @@ func (r *installResource) k8sPlanDryRun(ctx context.Context, plan, state *instal
 	}
 	defer p.run.close()
 	if imported(state) {
-		adoptionReport(diags, p.u, p.rerun, p.up, releaseChangeOf(p.step != stay || plan.Installer.ValueString() != p.runningRef), p.running, p.next == nil && p.step == stay)
+		var given []string
+		if !plan.Kubernetes.Values.IsNull() {
+			given = []string{"kubernetes.values"}
+		}
+		adoptionReport(diags, p.u, p.rerun, p.up, releaseChangeOf(p.step != stay || plan.Installer.ValueString() != p.runningRef), p.running, p.next == nil && p.step == stay, given...)
 	}
 	// One order on every target: stay, rollback (its prepare refused one beside a re-run), a
 	// re-run beside the upgrade, the upgrade.

@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -236,5 +237,62 @@ func TestSeedMirrorLogin(t *testing.T) {
 	files := untarAll(t, seed.stdin)
 	if seed.argv[6] != "" || files["mirror-host"] != "mirror.lan:5000" || files["mirror-password"] != "site-"+secretVal || strings.Contains(string(seed.stdin), "pull-"+secretVal) {
 		t.Fatalf("seed %q %q", seed.argv[6:8], files)
+	}
+}
+
+// nics names each NIC by role, as the seed does: its MAC and network, null when the seed gives
+// none; empty for a release declaring none; null, with a warning, from an installer naming none.
+func TestSeedNICs(t *testing.T) {
+	t.Parallel()
+	for name, c := range map[string]struct {
+		json, warn string
+		want       map[string][3]string // role → mac, attach, primary ("" null)
+		null       bool
+	}{
+		"two NICs": {json: `,"interfaces":[{"role":"edge","mac":"02:00:00:00:00:0b","attach":"br1"},{"role":"uplink","mac":"02:00:00:00:00:0a","primary":true}]`,
+			want: map[string][3]string{"edge": {"02:00:00:00:00:0b", "br1", "false"}, "uplink": {"02:00:00:00:00:0a", "", "true"}}},
+		"one NIC":          {json: `,"interfaces":[{"role":"uplink","primary":true}]`, want: map[string][3]string{"uplink": {"", "", "true"}}},
+		"none declared":    {json: `,"interfaces":[]`, want: map[string][3]string{}},
+		"an old installer": {warn: "The seed names no NIC", null: true},
+	} {
+		s := newSeedHarness(t, nil)
+		s.fake.set("install", reply{stdout: strings.TrimSuffix(seedJSON, "}") + c.json + "}"})
+		a := s.create(s.config(nil))
+		if d := errorsOf(a.Diagnostics); d != "" {
+			t.Fatalf("%s: %s", name, d)
+		}
+		if w := warningsOf(a.Diagnostics); (c.warn == "") != (w == "") || !strings.Contains(w, c.warn) {
+			t.Errorf("%s: warnings %q", name, w)
+		}
+		nics := s.attrs(a.NewState)["nics"]
+		if c.null {
+			if !nics.IsNull() {
+				t.Errorf("%s: %v", name, nics)
+			}
+			continue
+		}
+		var m map[string]tftypes.Value
+		if err := nics.As(&m); err != nil || len(m) != len(c.want) {
+			t.Fatalf("%s: %v %v", name, nics, err)
+		}
+		for role, w := range c.want {
+			var o map[string]tftypes.Value
+			_ = m[role].As(&o)
+			var primary bool
+			_ = o["primary"].As(&primary)
+			for i, k := range []string{"mac", "attach"} {
+				if (w[i] == "") != o[k].IsNull() || (w[i] != "" && asString(t, o[k]) != w[i]) {
+					t.Errorf("%s: %s.%s %v", name, role, k, o[k])
+				}
+			}
+			if fmt.Sprint(primary) != w[2] {
+				t.Errorf("%s: %s.primary %v", name, role, primary)
+			}
+		}
+	}
+	s := newSeedHarness(t, nil)
+	s.fake.set("install", reply{stdout: strings.TrimSuffix(seedJSON, "}") + `,"interfaces":[{"role":"a"},{"role":"a"}]}`})
+	if d := errorsOf(s.create(s.config(nil)).Diagnostics); !strings.Contains(d, "a role named twice") {
+		t.Errorf("a role twice: %q", d)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -95,9 +96,19 @@ func TestK8sValidation(t *testing.T) {
 		"tls":                {h.k8sConfig(map[string]tftypes.Value{"tls": str("internal")}), "tls is not Kubernetes's"},
 		"ports":              {h.k8sConfig(map[string]tftypes.Value{"ports": tftypes.NewValue(tftypes.Map{ElementType: tftypes.Number}, map[string]tftypes.Value{"web": num(80)})}), "ports is not Kubernetes's"},
 		"a secrets export":   {h.k8sConfig(map[string]tftypes.Value{"secrets_wo": str("x")}), "secrets_wo is not Kubernetes's"},
+		"values not YAML":    {block(map[string]tftypes.Value{"namespace": str("n"), "values": str("a: [")}), "kubernetes.values is not a chart values file"},
+		"values a list":      {block(map[string]tftypes.Value{"namespace": str("n"), "values": str("- a\n")}), "its document is not a mapping"},
+		"values empty":       {block(map[string]tftypes.Value{"namespace": str("n"), "values": str("")}), "its document is not a mapping"},
+		"values two docs":    {block(map[string]tftypes.Value{"namespace": str("n"), "values": str("a: 1\n---\n- x\n")}), "more than one YAML document"},
 	} {
 		if got := diagText(h.validate(c.config)); !strings.Contains(got, c.want) {
 			t.Errorf("%s: got %q, want %q", name, got, c.want)
+		}
+	}
+	// Mappings helm takes: a key that is no string, an empty document after the mapping.
+	for _, v := range []string{"1: a\nb: {c: null}\n", "a: 1\n---\n"} {
+		if d := errorsOf(h.validate(block(map[string]tftypes.Value{"namespace": str("n"), "values": str(v)}))); d != "" {
+			t.Errorf("values %q: %s", v, d)
 		}
 	}
 }
@@ -275,6 +286,16 @@ func TestK8sCreateOverTheRelease(t *testing.T) {
 	up := h.fake.callsOf("k8s-upgrade")[0]
 	if g := untarAll(t, up.stdin)["given"]; g != "project: \"notes\"\ninputs:\n  ADMIN_EMAIL: \"ops@example.com\"\n" || flags(up.argv)["--set"] != "" {
 		t.Fatalf("take-over %q %q", up.argv, g)
+	}
+	// Nothing to give but kubernetes.values: the release is applied again with them.
+	h.fake.reset()
+	config = h.k8sConfig(map[string]tftypes.Value{"kubernetes": h.block("kubernetes", map[string]tftypes.Value{"namespace": str("notes"), "values": str("replicas: 2\n")})})
+	p = h.plan(nil, config)
+	if d := errorsOf(h.apply(nil, p.PlannedState, config).Diagnostics); d != "" {
+		t.Fatal(d)
+	}
+	if ups := h.fake.callsOf("k8s-upgrade"); len(ups) != 1 || untarAll(t, ups[0].stdin)["values"] != "replicas: 2\n" || untarAll(t, ups[0].stdin)["given"] != "" {
+		t.Fatalf("take-over with values: %q", h.fake.ops())
 	}
 }
 
@@ -1369,5 +1390,155 @@ func TestK8sImportedTakeOverComparesTheRecordedValues(t *testing.T) {
 		if len(st) == 0 || !contains(st[0].argv, "--values") || len(h.fake.callsOf("k8s-upgrade")) != upgrades {
 			t.Errorf("%s: calls %q", email, h.fake.ops())
 		}
+	}
+}
+
+// kubernetes.values goes to helm as a values file (`--values`, on standard input) at the install,
+// a change of it alone applies the release again with it, an upgrade carries it, a rollback beside
+// a change of it is refused, and leaving it out runs nothing, with a warning.
+func TestK8sChartValues(t *testing.T) {
+	t.Parallel()
+	h := k8sHarness(t, nil)
+	cfg := func(values string, extra map[string]tftypes.Value) tftypes.Value {
+		b := map[string]tftypes.Value{"namespace": str("notes")}
+		if values != "" {
+			b["values"] = str(values)
+		}
+		c := map[string]tftypes.Value{"kubernetes": h.block("kubernetes", b)}
+		maps.Copy(c, extra)
+		return h.k8sConfig(c)
+	}
+	carries := func(c call, want string) bool {
+		return strings.Contains(c.argv[6], "values") && untarAll(t, c.stdin)["values"] == want
+	}
+	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
+	state := h.create(cfg("replicas: 2\n", nil))
+	if install := h.fake.callsOf("k8s-install"); len(install) != 1 || !carries(install[0], "replicas: 2\n") {
+		t.Fatalf("install %q", h.fake.ops())
+	}
+	// Changed alone: the release applied again, given the new values.
+	h.fake.reset()
+	a := h.update(state, cfg("replicas: 3\n", nil))
+	if d := errorsOf(a.Diagnostics); d != "" {
+		t.Fatal(d)
+	}
+	if ups := h.fake.callsOf("k8s-upgrade"); len(ups) != 1 || !carries(ups[0], "replicas: 3\n") {
+		t.Fatalf("changed: %q", h.fake.ops())
+	}
+	state = a.NewState
+	// The same values: nothing runs.
+	h.fake.reset()
+	if d := errorsOf(h.update(state, cfg("replicas: 3\n", nil)).Diagnostics); d != "" || len(h.fake.callsOf("k8s-upgrade")) != 0 {
+		t.Fatalf("unchanged: %s %q", d, h.fake.ops())
+	}
+	// An upgrade carries them.
+	h.fake.reset()
+	h.fake.then("k8s-describe", reply{stdout: describeK8s}, reply{stdout: describeK8s2})
+	h.fake.then("k8s-status", reply{stdout: statusK8s})
+	h.fake.set("k8s-status", reply{stdout: statusK8s2})
+	upgraded := h.update(state, cfg("replicas: 3\n", map[string]tftypes.Value{"installer": str(image2)}))
+	if d := errorsOf(upgraded.Diagnostics); d != "" {
+		t.Fatal(d)
+	}
+	if ups := h.fake.callsOf("k8s-upgrade"); len(ups) != 1 || !carries(ups[0], "replicas: 3\n") {
+		t.Fatalf("upgrade: %q", h.fake.ops())
+	}
+	// A rollback beside a change of them: refused before anything runs.
+	h.fake.reset()
+	h.fake.set("k8s-status", reply{stdout: statusK8s2})
+	h.fake.set("k8s-describe", reply{stdout: describeK8s2})
+	back := cfg("replicas: 4\n", map[string]tftypes.Value{"allow_rollback": boolean(true)})
+	p := h.plan(upgraded.NewState, back)
+	got := errorsOf(p.Diagnostics) + errorsOf(h.apply(upgraded.NewState, p.PlannedState, back).Diagnostics)
+	if !strings.Contains(got, "a rollback goes alone") || !strings.Contains(got, "kubernetes.values") || len(h.fake.callsOf("k8s-rollback")) != 0 {
+		t.Fatalf("a rollback with values changed: %q %q", got, h.fake.ops())
+	}
+	// State's previous stale (the plan sees no rollback): the apply, reading the release's, refuses.
+	attrs := h.attrs(upgraded.NewState)
+	attrs["previous"] = tftypes.NewValue(attrs["previous"].Type(), nil)
+	stale := h.dv(h.typ, tftypes.NewValue(h.typ, attrs))
+	p = h.plan(&stale, back)
+	if d := errorsOf(p.Diagnostics); d != "" {
+		t.Fatalf("plan over a stale previous: %s", d)
+	}
+	if got := errorsOf(h.apply(&stale, p.PlannedState, back).Diagnostics); !strings.Contains(got, "a rollback goes alone") || len(h.fake.callsOf("k8s-rollback")) != 0 {
+		t.Fatalf("apply over a stale previous: %q %q", got, h.fake.ops())
+	}
+	// A rollback with the values unchanged: helm's takes back the earlier release's values, so the
+	// release is applied again with them after it.
+	h.fake.reset()
+	h.fake.set("k8s-status", reply{stdout: statusK8s2})
+	h.fake.set("k8s-describe", reply{stdout: describeK8s2})
+	if d := errorsOf(h.update(upgraded.NewState, cfg("replicas: 3\n", map[string]tftypes.Value{"allow_rollback": boolean(true)})).Diagnostics); d != "" {
+		t.Fatal(d)
+	}
+	// The re-apply is the reached release's installer's (fetched into its own directory), never
+	// the one rolled back from, whose upgrade would undo the rollback.
+	if ops, ups := h.fake.ops(), h.fake.callsOf("k8s-upgrade"); len(h.fake.callsOf("k8s-rollback")) != 1 || len(ups) != 1 || untarAll(t, ups[0].stdin)["values"] != "replicas: 3\n" ||
+		slices.Index(ops, "k8s-rollback") > slices.Index(ops, "k8s-upgrade") || filepath.Base(ups[0].argv[4]) != "back" ||
+		filepath.Base(h.fake.callsOf("k8s-rollback")[0].argv[4]) != "run" {
+		t.Fatalf("rollback with values: %q %q", ops, h.fake.callsOf("k8s-upgrade"))
+	}
+	if !slices.ContainsFunc(h.fake.callsOf("fetch"), func(c call) bool { return filepath.Base(c.argv[4]) == "back" && c.argv[5] == image }) {
+		t.Fatalf("the reached release's installer was not fetched into back: %q", h.fake.callsOf("fetch"))
+	}
+	// Its re-apply failing: rolled back, state records no values, so the next plan gives them.
+	h.fake.reset()
+	h.fake.set("k8s-status", reply{stdout: statusK8s2})
+	h.fake.set("k8s-describe", reply{stdout: describeK8s2})
+	h.fake.then("k8s-upgrade", reply{exit: 1, stderr: "Error: helm failed\n"})
+	rb := cfg("replicas: 3\n", map[string]tftypes.Value{"allow_rollback": boolean(true)})
+	p = h.plan(upgraded.NewState, rb)
+	a = h.apply(upgraded.NewState, p.PlannedState, rb)
+	if d := errorsOf(a.Diagnostics); !strings.Contains(d, "after its rollback") {
+		t.Fatalf("re-apply failing: %q", d)
+	}
+	var kb map[string]tftypes.Value
+	if err := h.attrs(a.NewState)["kubernetes"].As(&kb); err != nil || !kb["values"].IsNull() || asString(t, h.attrs(a.NewState)["installer"]) != image {
+		t.Fatalf("state after the failed re-apply: %v %v", kb, err)
+	}
+	// The next plan gives them again.
+	h.fake.reset()
+	h.fake.set("k8s-status", reply{stdout: statusK8s})
+	if d := errorsOf(h.update(a.NewState, cfg("replicas: 3\n", nil)).Diagnostics); d != "" {
+		t.Fatal(d)
+	}
+	if ups := h.fake.callsOf("k8s-upgrade"); len(ups) != 1 || untarAll(t, ups[0].stdin)["values"] != "replicas: 3\n" {
+		t.Fatalf("the values not given again: %q", h.fake.ops())
+	}
+	// Left out: nothing runs, and the plan says the release keeps them.
+	h.fake.reset()
+	p = h.plan(state, cfg("", nil))
+	if w := warningsOf(p.Diagnostics); !strings.Contains(w, "kubernetes.values left out: the release keeps its values") {
+		t.Fatalf("left out: %q", w)
+	}
+	if d := errorsOf(h.apply(state, p.PlannedState, cfg("", nil)).Diagnostics); d != "" || len(h.fake.callsOf("k8s-upgrade")) != 0 {
+		t.Fatalf("left out: %s %q", d, h.fake.ops())
+	}
+}
+
+// An imported release taken over with kubernetes.values: its recorded inputs matching, the release
+// is still applied again with the values (they are not read), which the plan's report says.
+func TestK8sImportedTakeOverGivesTheChartValues(t *testing.T) {
+	t.Parallel()
+	h := k8sHarness(t, nil)
+	h.fake.set("k8s-status", reply{stdout: strings.TrimSuffix(strings.TrimSpace(statusK8s), "}") + `,"values":{"inputs":{"ADMIN_EMAIL":"a@example.com"}}}`})
+	state := h.importState("kubernetes:prod/notes").ImportedResources[0].State
+	cfg := func(extra map[string]tftypes.Value) tftypes.Value {
+		c := map[string]tftypes.Value{"kubernetes": h.block("kubernetes", map[string]tftypes.Value{"namespace": str("prod"), "values": str("replicas: 2\n")}),
+			"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})}
+		maps.Copy(c, extra)
+		return h.k8sConfig(c)
+	}
+	p := h.plan(state, cfg(map[string]tftypes.Value{"plan_dry_run": boolean(true)}))
+	if w := warningsOf(p.Diagnostics); !strings.Contains(w, "its values match, applied again for kubernetes.values") || !strings.Contains(w, "It gives kubernetes.values again") {
+		t.Fatalf("plan: %s %s", errorsOf(p.Diagnostics), w)
+	}
+	h.fake.reset()
+	if d := errorsOf(h.update(state, cfg(nil)).Diagnostics); d != "" {
+		t.Fatal(d)
+	}
+	if ups := h.fake.callsOf("k8s-upgrade"); len(ups) != 1 || untarAll(t, ups[0].stdin)["values"] != "replicas: 2\n" {
+		t.Fatalf("calls %q", h.fake.ops())
 	}
 }

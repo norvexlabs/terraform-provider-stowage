@@ -36,6 +36,7 @@ type k8sModel struct {
 	Namespace      types.String `tfsdk:"namespace"`
 	Release        types.String `tfsdk:"release"`
 	ImagePullLogin types.Bool   `tfsdk:"image_pull_login"`
+	Values         types.String `tfsdk:"values"`
 }
 
 func k8sBlock() schema.SingleNestedBlock {
@@ -50,6 +51,11 @@ func k8sBlock() schema.SingleNestedBlock {
 			"image_pull_login": schema.BoolAttribute{Optional: true,
 				MarkdownDescription: "Writes the cluster's pull Secret for the mirror from the provider's pull account (`k8s install|upgrade --image-pull-login`), at every install and upgrade, so an authenticated mirror serves the cluster's nodes. " +
 					"Opt-in: the account's credential is then readable by whoever reads the release's Secrets. Needs the provider's `username`, `password` and `registry` (the mirror; the release's own registry is refused by the installer)."},
+			"values": schema.StringAttribute{Optional: true,
+				MarkdownDescription: "A chart values file (YAML, a mapping: `yamlencode({...})`), given to helm after the installer's own values (`k8s install|upgrade --values`) at the install, every upgrade and every re-run of the release; a change alone applies the release again. " +
+					"helm keeps the values each run gave (`--reset-then-reuse-values`): a key left out keeps its earlier value, and a key given `null` drops it (back to the chart's default); leaving `values` out gives none and keeps what the release has. " +
+					"A rollback takes back the values of the release it reaches, then gives `values` again (the release applied again); a change of `values` beside a rollback is refused. " +
+					"Kept in state in the clear: give a secret as a secret input, or in a Secret of your own the chart reads."},
 		},
 	}
 }

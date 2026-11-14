@@ -36,6 +36,19 @@ type Seed struct {
 	// or for a byo certificate (--tls byo), given over SSH.
 	AwaitSecrets bool `json:"await_secrets"`
 	AwaitTLS     bool `json:"await_tls"`
+	// Interfaces are the NICs the VM is made with, sorted by role (Stowage 0.38.0 or later; nil
+	// from an earlier installer, which names none).
+	Interfaces *[]SeedInterface `json:"interfaces"`
+}
+
+// SeedInterface is a NIC a seed's VM is made with: its role, the MAC its cloud-config names it by
+// ("" for a VM of one NIC, named from the NIC it has, and on a cloud), the network it attaches to
+// ("" the primary's), and whether it is the primary.
+type SeedInterface struct {
+	Role    string `json:"role"`
+	MAC     string `json:"mac"`
+	Attach  string `json:"attach"`
+	Primary bool   `json:"primary"`
 }
 
 // SeedDisk is a disk image: its format, its reference by digest, what Kairos takes of a VM's
@@ -88,6 +101,15 @@ func ParseSeed(b []byte) (*Seed, error) {
 	}
 	if f := s.DiskFile; f != nil && (!strings.HasPrefix(f.Path, "/") || f.Format == "" || f.SHA256 == "") {
 		return nil, fmt.Errorf("%s: disk_file has no absolute path, format or sha256", doc)
+	}
+	if s.Interfaces != nil {
+		roles := map[string]bool{}
+		for _, i := range *s.Interfaces {
+			if i.Role == "" || roles[i.Role] {
+				return nil, fmt.Errorf("%s: interfaces: a NIC with no role, or a role named twice (%q)", doc, i.Role)
+			}
+			roles[i.Role] = true
+		}
 	}
 	s.Waiting = sortedUnique(s.Waiting)
 	return &s, nil

@@ -139,7 +139,8 @@ read](docs/guides/machine-interface.md). What runs where:
 Secrets (`secret_inputs_wo`, `given_wo`, `secrets_wo`) are write-only: on standard input, never on
 a command line or in state. Every SSH connection accepts the pinned key alone. Each target in
 full: [Docker](docs/guides/docker-target.md), [Kubernetes](docs/guides/kubernetes-target.md),
-[VM](docs/guides/vm-target.md).
+[VM](docs/guides/vm-target.md); a VM made on TrueNAS by the upstream TrueNAS provider alone:
+[guide](docs/guides/truenas-vm.md).
 
 ## Building and testing
 

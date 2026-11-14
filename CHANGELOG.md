@@ -24,6 +24,17 @@ each change named here.
   or the reverse, is refused. With `plan_dry_run`, the plan of an imported state runs too and says
   which keys differ (`Taking over the install: …`); a rollback of an imported install is refused at
   plan as at apply.
+- `kubernetes.values`: a chart values file (YAML) given to helm after the installer's own at the
+  install, every upgrade and every re-run (`k8s install|upgrade --values`); a change alone applies
+  the release again, a change beside a rollback is refused, a rollback gives them again after it
+  (helm's takes back the values of the release it reaches), and leaving it out keeps the release's
+  values (a key given `null` drops one).
+- `stowage_vm_seed.nics`: the NICs the VM is made with, by role — the MAC its cloud-config names
+  each by (given or generated), its network and the primary — for the VM's resource to give each
+  NIC its MAC (Stowage 0.38.0 or later; null, with a warning, from an earlier installer).
+- A guide, with its root in `examples/guides/truenas-vm`: a Kairos VM made on TrueNAS SCALE by the
+  upstream TrueNAS provider and a small SSH step script (the disk's upload and conversion, the
+  NoCloud seed ISO, the power), no module of Stowage's.
 
 ### Changed
 

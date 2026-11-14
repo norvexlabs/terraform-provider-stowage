@@ -37,7 +37,7 @@ operation first refuses a machine that is not linux/amd64 and names the programs
   object on standard output saying `absent` — any other refusal is an error) installs: `sh
   <name>.sh k8s install --no-input --json [--set K=V]… [--image-registry <the provider's
   registry>] [--image-pull-login]`, with `--answers` (the secret inputs), `--given`
-  (`given_wo`) and `--registry-ca` on standard input; then `k8s status --json`, read again every 10
+  (`given_wo`), `--registry-ca` and `--values` (`kubernetes.values`) on standard input; then `k8s status --json`, read again every 10
   seconds while it reports `installing` (helm's `pending-install`), within the create timeout. A
   release of another project is an error; one recording an installer the provider does not run
   (as at update) is refused, not taken over (`The release records another installer`: `k8s
@@ -48,8 +48,9 @@ operation first refuses a machine that is not linux/amd64 and names the programs
   taken over with a warning (`A release is already there`): `given_wo` is given as it is (`k8s
   upgrade --given`), then `inputs` and `secret_inputs_wo` the same way (below), which win as at an
   install; the provider's `registry` and `registry_ca` are not given (the release keeps what it
-  recorded); with nothing to give, a release whose latest helm revision is failed is applied
-  again, `k8s upgrade --no-input --json` given nothing. A release whose values record no installer is taken over only by an
+  recorded); with nothing to give, a release whose latest helm revision is failed, or any with
+  `kubernetes.values`, is applied again, `k8s upgrade --no-input --json` given no input (each of
+  these runs gets `--values` from `kubernetes.values` when set). A release whose values record no installer is taken over only by an
   installer of the release it runs (the same `version` and `revision`, else `The release runs
   another release`); one helm is working on (`installing`, or a latest revision `pending-…` or
   `uninstalling`) is refused (`helm is working on the release`: apply again once it is over; a
@@ -133,7 +134,12 @@ operation first refuses a machine that is not linux/amd64 and names the programs
      standard input: `project` and `inputs` — each input changed or added that the running release
      declares (every one without an upgrade), each taken out given `""`, and the secret inputs
      when `secret_inputs_wo_version` changed — which replace the values the release's Secret
-     records; `--registry-ca` too. When a release change follows, state is saved here, as on Docker,
+     records; `--registry-ca` too. With nothing to give but `kubernetes.values` changed (or
+     `image_pull_login` turned on), the release is applied again: `k8s upgrade --no-input --json`.
+     Every `k8s upgrade` the update runs (this one, the next step's) gets `--values` from
+     `kubernetes.values` when set; a rollback does not, and is followed, with `kubernetes.values`
+     set, by the running release's `k8s upgrade --no-input --json --values` (helm's rollback takes
+     back the values of the release it reaches). When a release change follows, state is saved here, as on Docker,
      with the release's status read again after the reconfiguration.
   4. The new installer's `k8s upgrade --no-input --json [--set K=V]…` given the inputs and secret
      inputs (`--answers`) the new release adds, with `--registry-ca`; or `k8s rollback --json`

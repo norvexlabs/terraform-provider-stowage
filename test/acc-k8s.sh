@@ -9,10 +9,11 @@
 #
 # Walks: create (1.0.0, a secret input added to the example's copy, the cluster reached by host and
 # client certificate, a kubeconfig written for each run) → a plan shows no change → a changed input
-# (k8s upgrade --given, the pod's environment changed) → ship 2.0.0, its installer upgrades → a
-# plan shows no change → ship 3.0.0, upgraded to → 1.0.0's installer (not the previous release):
-# its upgrade refused by the installer, state kept → back to 2.0.0's installer with allow_rollback
-# (k8s rollback) → the state forgotten, the release imported and its first apply → a destroy
+# (k8s upgrade --given, the pod's environment changed) → chart values (kubernetes.values: k8s
+# upgrade --values, in helm's values) → ship 2.0.0, its installer upgrades (the values kept) → a
+# plan shows no change → ship 3.0.0, upgraded to with changed chart values → 1.0.0's installer (not
+# the previous release): its upgrade refused by the installer, state kept → back to 2.0.0's
+# installer with allow_rollback (k8s rollback, then the values given again) → the state forgotten, the release imported and its first apply → a destroy
 # refused by deletion_protection → destroy (k8s uninstall --data).
 # Needs tofu, Docker, network access, a linux/amd64 host.
 set -euo pipefail
@@ -50,7 +51,7 @@ runs() {
 # st <attribute>: the attribute of stowage_install.notes in tofu's state.
 st() { (cd "$TF" && "${TF_ENV[@]}" "$TOFU" show -json) | jq -r --arg a "$1" '.values.root_module.resources[] | select(.address == "stowage_install.notes") | .values[$a] | if type == "object" then tojson else . end'; }
 # config <installer> <admin email> [extra lines]: main.tf for that release and input, the secret
-# input from TF_VAR_e2e_token.
+# input from TF_VAR_e2e_token; KVALUES, a line of the kubernetes block (its chart values).
 config() {
 	cat >"$TF/main.tf" <<HCL
 terraform {
@@ -83,6 +84,7 @@ resource "stowage_install" "notes" {
   ${3:-}
   kubernetes {
     namespace = "$NS"
+    ${KVALUES:-}
   }
 }
 HCL
@@ -157,6 +159,17 @@ kubectl rollout status -n "$NS" deploy/notes-web --timeout 180s >/dev/null
 [[ $(kubectl exec -n "$NS" deploy/notes-web -- printenv ADMIN_EMAIL) == ops@notes.test ]] || fail "the pod's ADMIN_EMAIL did not change"
 [[ $(kubectl get -n "$NS" secret notes-stowage -o jsonpath='{.data.ADMIN_EMAIL}' | base64 -d) == ops@notes.test ]] || fail "the release's Secret holds another ADMIN_EMAIL"
 
+step "chart values: the running release applied again with kubernetes.values (k8s upgrade --values)"
+# Kept for every later step: each upgrade gives them again, and helm keeps them.
+KVALUES='values = yamlencode({ acceptance = { mark = "one" } })'
+config "$I1" ops@notes.test
+tf apply -auto-approve -no-color >"$WORK/apply-values.log" 2>&1 || { cat "$WORK/apply-values.log"; cluster_logs >&2; fail "tofu apply (values)"; }
+runs 1.0.0
+mark() { helm get values notes -n "$NS" -o json | jq -r '.acceptance.mark // empty'; }
+[[ $(mark) == one ]] || fail "the release's values hold no acceptance.mark one: $(helm get values notes -n "$NS" -o json)"
+rc=0; tf plan -detailed-exitcode -no-color >"$WORK/plan-values.log" 2>&1 || rc=$?
+[[ $rc == 0 ]] || { cat "$WORK/plan-values.log"; fail "tofu plan after the values exited $rc, not 0 (no change)"; }
+
 step "ship 2.0.0; its installer upgrades the release"
 release 2.0.0
 I2=$REG/notes/notes-installer@$(digest_of notes/notes-installer:latest)
@@ -164,6 +177,7 @@ I2=$REG/notes/notes-installer@$(digest_of notes/notes-installer:latest)
 config "$I2" ops@notes.test
 tf apply -auto-approve -no-color >"$WORK/apply3.log" 2>&1 || { cat "$WORK/apply3.log"; cluster_logs >&2; fail "tofu apply (upgrade)"; }
 runs 2.0.0
+[[ $(mark) == one ]] || fail "the upgrade lost the chart values: $(helm get values notes -n "$NS" -o json)"
 [[ $(st version) == 2.0.0 && $(st installer) == "$I2" && $(st previous | jq -r .installer) == "$I1" ]] ||
 	fail "state after the upgrade: version $(st version), previous $(st previous)"
 rc=0; tf plan -detailed-exitcode -no-color >"$WORK/plan2.log" 2>&1 || rc=$?
@@ -173,9 +187,12 @@ step "ship 3.0.0; its installer upgrades the release"
 release 3.0.0
 I3=$REG/notes/notes-installer@$(digest_of notes/notes-installer:latest)
 [[ $I3 != "$I2" ]] || fail "3.0.0's installer has 2.0.0's digest"
+# The chart values changed with the upgrade: the rollback below reaches 2.0.0's revision, given one.
+KVALUES='values = yamlencode({ acceptance = { mark = "two" } })'
 config "$I3" ops@notes.test
 tf apply -auto-approve -no-color >"$WORK/apply3b.log" 2>&1 || { cat "$WORK/apply3b.log"; cluster_logs >&2; fail "tofu apply (upgrade to 3.0.0)"; }
 runs 3.0.0
+[[ $(mark) == two ]] || fail "the upgrade did not give the changed chart values: $(helm get values notes -n "$NS" -o json)"
 [[ $(st version) == 3.0.0 && $(st previous | jq -r .installer) == "$I2" ]] || fail "state after the upgrade to 3.0.0: version $(st version), previous $(st previous)"
 
 step "1.0.0's installer while 3.0.0 runs (not the previous release): its upgrade refused by the installer, state kept"
@@ -208,6 +225,8 @@ config "$I2" ops@notes.test "allow_rollback = true"
 tf apply -auto-approve -no-color >"$WORK/apply4.log" 2>&1 || { cat "$WORK/apply4.log"; cluster_logs >&2; fail "tofu apply (rollback)"; }
 runs 2.0.0
 [[ $(st version) == 2.0.0 && $(st installer) == "$I2" ]] || fail "state after the rollback: version $(st version), installer $(st installer)"
+# helm's rollback took back 2.0.0's values (one): the release applied again with the configured two.
+[[ $(mark) == two ]] || fail "after the rollback, the release's values are not kubernetes.values: $(helm get values notes -n "$NS" -o json)"
 
 step "import: the state forgotten, the release imported by its ID, its first apply, then a plan with no change"
 tf state rm stowage_install.notes >"$WORK/rm.log" 2>&1 || { cat "$WORK/rm.log"; fail "tofu state rm"; }

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"os"
 	"path/filepath"
@@ -24,6 +25,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"github.com/norvexlabs/terraform-provider-stowage/internal/installer"
+	"go.yaml.in/yaml/v3"
 )
 
 // k8sPlatform is the platform the installers are built for: a Kubernetes run executes one on the
@@ -47,12 +49,47 @@ func validateK8s(m *installModel, diags *diag.Diagnostics) {
 				fmt.Sprintf("%q: lower-case letters, digits and -, starting and ending with a letter or digit, at most 63 characters (53 for a release).", v.ValueString()))
 		}
 	}
+	if known(b.Values) {
+		if err := chartValues(b.Values.ValueString()); err != nil {
+			diags.AddAttributeError(p.AtName("values"), "kubernetes.values is not a chart values file", err.Error())
+		}
+	}
 	for name, v := range map[string]interface{ IsNull() bool }{"tls": m.TLS, "domains": m.Domains, "ports": m.Ports, "address": m.Address, "secrets_wo": m.SecretsWO} {
 		if !v.IsNull() {
 			diags.AddAttributeError(path.Root(name), name+" is not Kubernetes's",
 				fmt.Sprintf("%s is a setting of the Docker and VM shapes: on Kubernetes the chart's ingress owns TLS and routes, and the release keeps its secrets in the cluster. Remove %s.", name, name))
 		}
 	}
+}
+
+// chartValues refuses what helm does not take as a values file: YAML that does not parse, more
+// than one document, or a document that is not a mapping. Empty is refused too: leaving values out
+// gives none.
+func chartValues(v string) error {
+	var doc, more any
+	dec := yaml.NewDecoder(strings.NewReader(v))
+	if err := dec.Decode(&doc); err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("it does not parse as YAML: %v", err)
+	}
+	// An empty document after it is read as none, as helm does.
+	if err := dec.Decode(&more); err != nil && !errors.Is(err, io.EOF) || err == nil && more != nil {
+		return errors.New("it holds more than one YAML document: give one mapping")
+	}
+	switch doc.(type) {
+	case map[string]any, map[any]any: // a key that is no string (1: a) decodes to the latter
+	default:
+		return errors.New("its document is not a mapping of chart values (`yamlencode({...})`); leave values out to give none")
+	}
+	return nil
+}
+
+// valuesChanged says whether plan gives the release chart values state's run did not: a change
+// the release is applied again for. Values left out give none: the release keeps its own.
+func valuesChanged(plan, state *installModel) bool {
+	if plan.Kubernetes == nil || plan.Kubernetes.Values.IsNull() {
+		return false
+	}
+	return state.Kubernetes == nil || !plan.Kubernetes.Values.Equal(state.Kubernetes.Values)
 }
 
 // validateK8sConn checks the provider's kubernetes block: host with its credentials, or a
@@ -183,6 +220,10 @@ func (r *installResource) k8sModifyPlan(ctx context.Context, plan, state *instal
 			untrustedDiag(diags, true, "", k, ref, err, plan.Installer.ValueString())
 		}
 	}
+	if plan.Kubernetes.Values.IsNull() && known(state.Kubernetes.Values) {
+		diags.AddAttributeWarning(path.Root("kubernetes").AtName("values"), "kubernetes.values left out: the release keeps its values",
+			"Nothing runs for it: helm keeps the values the earlier runs gave (`--reset-then-reuse-values`). To drop a key, give it null in values and apply, then leave values out.")
+	}
 	if !plan.Kubernetes.Namespace.IsUnknown() {
 		firstInstallOnly(diags, path.Root("kubernetes").AtName("namespace"), "kubernetes.namespace", state.Kubernetes.Namespace.ValueString(), plan.Kubernetes.Namespace.ValueString())
 	}
@@ -234,6 +275,7 @@ func (r *installResource) k8sStart(ctx context.Context, m *installModel, name st
 	if m.Kubernetes.ImagePullLogin.ValueBool() {
 		run.k.PullLogin = r.pullLogin(m)
 	}
+	run.k.Values = m.Kubernetes.Values.ValueString()
 	b := r.data.Kubernetes
 	if b == nil {
 		b = &k8sConnModel{}
@@ -511,7 +553,7 @@ func (r *installResource) k8sCreate(ctx context.Context, m *installModel, in ins
 	default:
 		diags.AddWarning("A release is already there",
 			fmt.Sprintf("The release %s already runs %s: the create takes it over, giving it given_wo, then inputs and secret_inputs_wo, again (k8s upgrade --given), which replace the values it records; "+
-				"with nothing to give, a release whose latest helm revision failed is applied again (k8s upgrade). "+
+				"with nothing to give, a release whose latest helm revision failed, or with kubernetes.values, is applied again (k8s upgrade). "+
 				"The settings only a first install takes (the provider's registry, registry_ca) are not given: the release keeps what it recorded.", k8sID(k), name))
 		if in.Given != "" {
 			if _, err := k.Give(ctx, in.Given, r.registryCA()); err != nil {
@@ -526,7 +568,8 @@ func (r *installResource) k8sCreate(ctx context.Context, m *installModel, in ins
 				addInstallerError(diags, "Reconfiguring "+desc.Name, err)
 				return
 			}
-		case failed != "" && in.Given == "":
+		case (failed != "" || k.Values != "") && in.Given == "":
+			// A Give or a Reconfigure gave the values already.
 			if _, err := k.Reapply(ctx, r.registryCA()); err != nil {
 				addInstallerError(diags, "Applying "+desc.Name+" again", err)
 				return
@@ -893,6 +936,10 @@ type k8sPrep struct {
 	u             *update
 	step          releaseStep
 	rerun, up     installer.Change
+	// backK and back, on a rollback with kubernetes.values: the installer of the release it
+	// reaches, which gives the values again after it (helm's rollback takes back that revision's).
+	backK installer.K8s
+	back  *installer.Describe
 }
 
 // k8sPrepare reads the release and decides the update's step as the apply does, with every
@@ -1002,9 +1049,19 @@ func (r *installResource) k8sPrepare(ctx context.Context, plan, state *installMo
 	case step == rollback && plan.Kubernetes.ImagePullLogin.ValueBool() && !state.Kubernetes.ImagePullLogin.ValueBool():
 		rollbackAlone(diags, "image_pull_login") // helm's rollback writes no pull Secret
 		return nil
+	case step == rollback && valuesChanged(plan, state):
+		rollbackAlone(diags, "kubernetes.values") // helm's rollback takes back the values it reaches
+		return nil
+	}
+	p := &k8sPrep{name: name, run: run, cur: cur, nextK: nextK, st: st, running: running, next: next, runningRef: runningRef, u: u, step: step, rerun: rerun, up: up}
+	if step == rollback && cur.Values != "" {
+		// Fetched before anything changes: a rollback whose values cannot be given again is refused.
+		if p.backK, p.back = run.fetch(ctx, "back", plan.Installer.ValueString(), diags); p.back == nil {
+			return nil
+		}
 	}
 	kept = true
-	return &k8sPrep{name: name, run: run, cur: cur, nextK: nextK, st: st, running: running, next: next, runningRef: runningRef, u: u, step: step, rerun: rerun, up: up}
+	return p
 }
 
 // k8sUpdate applies a plan to a release in DESIGN § 13's order: the inputs first, by `k8s upgrade
@@ -1022,10 +1079,12 @@ func (r *installResource) k8sUpdate(ctx context.Context, plan, state *installMod
 	rerun, up := p.rerun, p.up                 // what the running release's re-run and the upgrade are given
 	short := running.ShortName
 	base := state // what the final read falls back to: the state saved last
-	if rerun.Empty() && step == stay && plan.Kubernetes.ImagePullLogin.ValueBool() && !state.Kubernetes.ImagePullLogin.ValueBool() {
-		// image_pull_login turned on, nothing else: the release applied again writes the Secret.
+	pullLogin := plan.Kubernetes.ImagePullLogin.ValueBool() && !state.Kubernetes.ImagePullLogin.ValueBool()
+	if rerun.Empty() && step == stay && (pullLogin || valuesChanged(plan, state)) {
+		// image_pull_login turned on or the chart values changed, no input: the release applied
+		// again writes the Secret and gives helm the values.
 		if _, err := cur.Reapply(ctx, r.registryCA()); err != nil {
-			addInstallerError(diags, "Writing the cluster's pull Secret", err)
+			addInstallerError(diags, "Applying "+name+" again", err)
 			return
 		}
 	}
@@ -1081,6 +1140,24 @@ func (r *installResource) k8sUpdate(ctx context.Context, plan, state *installMod
 		if _, err := cur.Rollback(ctx); err != nil {
 			addInstallerError(diags, "Rolling "+name+" back", err)
 			return
+		}
+		// helm's rollback takes back the values the release it reaches was given: kubernetes.values
+		// given again by that release's installer, so the release runs what state records.
+		if p.back != nil {
+			short, after = p.back.ShortName, p.backK
+			if _, err := p.backK.Reapply(ctx, r.registryCA()); err != nil {
+				addInstallerError(diags, "Applying "+name+" again with kubernetes.values after its rollback", err)
+				// Rolled back, the values not given again: state records none, so the next plan
+				// gives them.
+				final := *plan
+				kb := *plan.Kubernetes
+				kb.Values = types.StringNull()
+				final.Kubernetes = &kb
+				k8sFill(&final, cur, short, r.registry(), r.providerCA(), state)
+				r.k8sFinal(ctx, after, &final, base, name, diags, plan.Installer, state.Installer)
+				save(&final)
+				return
+			}
 		}
 	}
 	final := *plan

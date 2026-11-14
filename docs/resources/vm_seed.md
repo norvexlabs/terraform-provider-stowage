@@ -144,6 +144,7 @@ variable "api_key" {
 - `known_hosts_line` (String) The one-time host key as a `known_hosts` line, under the name `vm-seed-host-key`: give it to `stowage_install`'s `vm.known_hosts_line`.
 - `meta_data` (String) The NoCloud `meta-data` beside `user_data` (`instance-id`, `local-hostname`), for a hypervisor that builds its own seed ISO.
 - `name` (String) The project's name (`describe`'s).
+- `nics` (Map of Object) The NICs the VM is made with, by role (the release's `host.interfaces`, as `interfaces` gives them): `mac`, the MAC its cloud-config names it by — given (`mac=`), else generated for a hypervisor's VM of more than one NIC; null for a VM of one NIC, named from the NIC it has, and on a cloud, which gives its NICs their MACs —, `attach`, the network it attaches to (`attach=`; null: the primary's), and `primary`. Give each NIC of the VM's resource its `mac`: a NIC of another MAC is not named, and the VM's network does not come up as the release expects. Empty when the release declares no NIC; null from an installer made before Stowage 0.38.0, which names none (with a warning: give each NIC's `mac=` in `interfaces`). (see [below for nested schema](#nestedatt--nics))
 - `revision` (Number) That release's package revision.
 - `short_name` (String) The installer's short name: the VM runs `<short_name>-stow`. Give it to `stowage_install`'s `vm.short_name`.
 - `user_data` (String, Sensitive) The cloud-config for `platform`: a NoCloud seed's `user-data`, or a cloud's user data. It holds no secret input, but the one-time host key's private key.
@@ -179,6 +180,16 @@ Read-Only:
 - `format` (String)
 - `path` (String)
 - `sha256` (String)
+
+
+<a id="nestedatt--nics"></a>
+### Nested Schema for `nics`
+
+Read-Only:
+
+- `attach` (String)
+- `mac` (String)
+- `primary` (Boolean)
 
 ## Details
 
@@ -237,7 +248,8 @@ registry cannot be read. Exit 3 without that object breaks the machine interface
 | `disk_file` | With `disk_dir`: `{path, format, sha256, disk_gib}`, the disk as a file (an absolute path; the SHA-256 of its decompressed bytes); null otherwise. |
 | `await_tls` | The VM's first install waits for a `byo` certificate over SSH (`tls = "byo"`). |
 | `waiting` | The required secret inputs nothing gives, sorted: the VM's first install waits for them (`secret_inputs_wo`). |
+| `nics` | The NICs the VM is made with, by role (the release's `host.interfaces`, as `interfaces` gives them; `vm seed --json`'s `interfaces`): `mac`, the MAC its cloud-config names it by — `mac=` given, else generated (a locally administered unicast MAC) for a hypervisor's VM of more than one NIC; null for a VM of one NIC, named from the NIC it has, and on a cloud, which gives its NICs their MACs —, `attach`, the network it attaches to (`attach=`; null: the primary's), and `primary`. Give each NIC of the VM's resource its `mac` (`nics["edge"].mac`): a NIC of another MAC is not named, and the VM's network does not come up as the release expects. Empty when the release declares no NIC; null from an installer made before Stowage 0.38.0, whose seed names none, with a warning (`The seed names no NIC`: give each NIC's `mac=` in `interfaces`). |
 
 The private key is in state (in `user_data` and `host_key_private`) until it retires: encrypt
-state. The [TrueNAS example](examples/resources/stowage_vm_seed/resource.tf) feeds the seed to
-the TrueNAS provider's VM.
+state. The example above feeds the seed to Stowage's TrueNAS module; [the TrueNAS
+guide](../guides/truenas-vm.md) makes the VM with the upstream TrueNAS provider alone.

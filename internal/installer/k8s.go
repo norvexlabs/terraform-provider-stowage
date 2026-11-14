@@ -75,6 +75,22 @@ type K8s struct {
 	PullLogin *Login
 	// Mirror, when set, is the mirror's own login every run reads the mirror with (MirrorFiles).
 	Mirror *Login
+	// Values, when set, is a chart values file (YAML) every run applying the chart gives helm
+	// after the installer's own (`--values`): install, upgrade and its re-run, never a rollback.
+	Values string
+}
+
+// chart is files with the chart values file Values, when set: a run applying the chart.
+func (k K8s) chart(files map[string]string) map[string]string {
+	if k.Values == "" {
+		return files
+	}
+	out := maps.Clone(files)
+	if out == nil {
+		out = map[string]string{}
+	}
+	out["values"] = k.Values
+	return out
 }
 
 // Filtered is r leaving HelmEnv out of its programs' environment, when it can (EnvFilter: the
@@ -280,7 +296,7 @@ func (k K8s) Install(ctx context.Context, in Install) (*Result, error) {
 		}
 	}
 	args, login := k.pull(args)
-	stdout, stderr, exit, err := k.runLogin(ctx, login, files, args...)
+	stdout, stderr, exit, err := k.runLogin(ctx, login, k.chart(files), args...)
 	if err != nil {
 		return nil, fmt.Errorf("k8s install: %w", err)
 	}
@@ -315,22 +331,22 @@ func (k K8s) Give(ctx context.Context, given, registryCA string) (*Result, error
 		files["registry-ca"] = registryCA
 	}
 	args, login := k.pull(k.verb("upgrade", "--no-input", "--json"))
-	stdout, stderr, exit, err := k.runLogin(ctx, login, files, args...)
+	stdout, stderr, exit, err := k.runLogin(ctx, login, k.chart(files), args...)
 	if err != nil {
 		return nil, fmt.Errorf("k8s upgrade --given: %w", err)
 	}
 	return Outcome("k8s upgrade --given", stdout, stderr, exit)
 }
 
-// Reapply runs `k8s upgrade` given nothing: the release applied again by the installer of the
-// release it runs, as a re-run finishes a first install.
+// Reapply runs `k8s upgrade` given no input: the release applied again by the installer of the
+// release it runs (with the chart values Values), as a re-run finishes a first install.
 func (k K8s) Reapply(ctx context.Context, registryCA string) (*Result, error) {
 	files := map[string]string{}
 	if registryCA != "" {
 		files["registry-ca"] = registryCA
 	}
 	args, login := k.pull(k.verb("upgrade", "--no-input", "--json"))
-	stdout, stderr, exit, err := k.runLogin(ctx, login, files, args...)
+	stdout, stderr, exit, err := k.runLogin(ctx, login, k.chart(files), args...)
 	if err != nil {
 		return nil, fmt.Errorf("k8s upgrade: %w", err)
 	}
@@ -362,7 +378,7 @@ func (k K8s) upgrade(ctx context.Context, c Change, registryCA string, dry bool)
 		verb, flags = "k8s upgrade --dry-run", append(flags, "--dry-run")
 	}
 	args, login := k.pull(append(k.verb("upgrade", flags...), args...))
-	stdout, stderr, exit, err := k.runLogin(ctx, login, files, args...)
+	stdout, stderr, exit, err := k.runLogin(ctx, login, k.chart(files), args...)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", verb, err)
 	}
