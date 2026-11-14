@@ -11,13 +11,9 @@ installable and verifiable by a user. A finished item is deleted, not ticked.
    init` finds `norvexlabs/stowage` without a local mirror; then README's and the install guide's
    "not in a registry yet" go. 0.1.0 is released on GitHub, signed; the registry has no
    `norvexlabs/stowage` yet.
-2. **Acceptance coverage of the VM's import**: `make acc-docker` and `make acc-k8s` walk an import
-   and its first apply and `deletion_protection`'s refusal; `make acc-vm` neither (an import is
-   `vm:<host>/<short>-stow`). Add them to `test/acc-vm.sh` and run it (TrueNAS, ~1 h): until then
-   the VM's import is proven by unit tests alone.
-3. **Acceptance coverage of a secret input and a refused upgrade on Kubernetes**: `make acc-docker`
-   walks both, `make acc-k8s` neither (`examples/minimal` has no secret input: acc-docker adds
-   one to its copy).
+2. **Run `make acc-vm`** (TrueNAS, ~1 h, scheduled by the maintainer): `test/acc-vm.sh` now walks
+   the VM's import, its first apply under the VM's own key and a destroy refused by
+   `deletion_protection`, written and never run yet.
 
 ## Should
 
@@ -26,4 +22,4 @@ installable and verifiable by a user. A finished item is deleted, not ticked.
    Kubernetes verb.
 2. **A plan-time dry run on the VM** — blocked on Stowage: the VM's `<short>-stow upgrade` and
    `rollback` have no `--dry-run` (Stowage 0.37.0), which DESIGN § 13's "an upgrade's dry run over
-   SSH" needs. Raise it with Stowage.
+   SSH" needs; Stowage is adding it.

@@ -52,9 +52,11 @@ capped at 4 GiB, driving the host's Docker through its socket, with Stowage's te
 `STOWAGE_REPO` (default `~/stowage`) holds a built `bin/stowage` and its `test/lib.sh` (zot, a kind
 cluster `acc-k8s-<pid>` pulling from it, pinned kind, helm and kubectl). The runner mounts
 `~/.cache` (the work directory), `~/.docker` (the registry logins, buildx's state), this tree and
-Stowage's at their own paths, as the containers the suite starts are given host paths. It ships `examples/minimal` 1.0.0 and 2.0.0 and
-walks create, a plan with no change, a changed input, the upgrade, a plan with no change, the
-rollback (refused first without `allow_rollback`), the state forgotten and the release imported
+Stowage's at their own paths, as the containers the suite starts are given host paths. It ships `examples/minimal`, a secret input added to its copy,
+as 1.0.0, 2.0.0 and 3.0.0, and walks create (the secret input in the release's Secret, in no file
+of the root), a plan with no change, a changed input, the upgrades to 2.0.0 and 3.0.0, a plan with
+no change, 1.0.0's installer refused by the installer (state kept), the rollback to 2.0.0 (refused
+first without `allow_rollback`), the state forgotten and the release imported
 (`kubernetes:<namespace>/<release>`) with its first apply and a plan with no change, a destroy
 refused by `deletion_protection` (the release kept) and destroy, checking the cluster at each step
 and that no run leaves its private directory. It needs Docker, network access and a linux/amd64
@@ -74,7 +76,9 @@ environment as it is. It ships
 `examples/resources/stowage_vm_seed`'s root: the seed (its disk written by `disk_dir`, its ISO by
 xorriso), Stowage's TrueNAS module, the first install over SSH under the one-time key, the VM's own
 key and the one-time key's retirement, a plan with no change, a re-run, an upgrade and its reboot,
-the rollback (refused first without `allow_rollback`), and the destroy; it prints `PASS`. The host
+the rollback (refused first without `allow_rollback`), the install forgotten and imported
+(`vm:<host>/<short>-stow`) with its first apply under the VM's own key and a plan with no change,
+a destroy of the install refused by `deletion_protection`, and the destroy; it prints `PASS`. The host
 needs Docker, network access to TrueNAS and a linux/amd64 machine; every other tool is the
 runner's.
 

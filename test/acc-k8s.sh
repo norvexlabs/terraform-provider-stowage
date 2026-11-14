@@ -7,11 +7,13 @@
 #
 #   make acc-k8s     (or: PROVIDER_BIN=… bash test/acc-k8s.sh)
 #
-# Walks: create (1.0.0, the cluster reached by host and client certificate, a kubeconfig written
-# for each run) → a plan shows no change → a changed input (k8s upgrade --given, the pod's
-# environment changed) → ship 2.0.0, its installer upgrades → a plan shows no change → back to
-# 1.0.0's installer with allow_rollback (k8s rollback) → the state forgotten, the release imported
-# and its first apply → a destroy refused by deletion_protection → destroy (k8s uninstall --data).
+# Walks: create (1.0.0, a secret input added to the example's copy, the cluster reached by host and
+# client certificate, a kubeconfig written for each run) → a plan shows no change → a changed input
+# (k8s upgrade --given, the pod's environment changed) → ship 2.0.0, its installer upgrades → a
+# plan shows no change → ship 3.0.0, upgraded to → 1.0.0's installer (not the previous release):
+# its upgrade refused by the installer, state kept → back to 2.0.0's installer with allow_rollback
+# (k8s rollback) → the state forgotten, the release imported and its first apply → a destroy
+# refused by deletion_protection → destroy (k8s uninstall --data).
 # Needs tofu, Docker, network access, a linux/amd64 host.
 set -euo pipefail
 
@@ -47,13 +49,19 @@ runs() {
 }
 # st <attribute>: the attribute of stowage_install.notes in tofu's state.
 st() { (cd "$TF" && "${TF_ENV[@]}" "$TOFU" show -json) | jq -r --arg a "$1" '.values.root_module.resources[] | select(.address == "stowage_install.notes") | .values[$a] | if type == "object" then tojson else . end'; }
-# config <installer> <admin email> [extra lines]: main.tf for that release and input.
+# config <installer> <admin email> [extra lines]: main.tf for that release and input, the secret
+# input from TF_VAR_e2e_token.
 config() {
 	cat >"$TF/main.tf" <<HCL
 terraform {
   required_providers {
     stowage = { source = "norvexlabs/stowage" }
   }
+}
+variable "e2e_token" {
+  type      = string
+  sensitive = true
+  ephemeral = true
 }
 provider "stowage" {
   username = "pull"
@@ -68,6 +76,8 @@ provider "stowage" {
 resource "stowage_install" "notes" {
   installer           = "$1"
   inputs              = { ADMIN_EMAIL = "$2" }
+  secret_inputs_wo         = { E2E_TOKEN = var.e2e_token }
+  secret_inputs_wo_version = 1
   deletion_protection = ${PROTECT:-false}
   delete_data         = true
   ${3:-}
@@ -84,8 +94,18 @@ step "start zot, a kind cluster pulling from it"
 start_zot
 start_kind
 
-step "project, ship 1.0.0"
+step "project (a secret input added), ship 1.0.0"
 new_project "$PG"
+python3 - "$P/stowage.yaml" <<'PY'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+old = '  - { key: ADMIN_EMAIL, prompt: "Administrator email", required: true }\n'
+assert s.count(old) == 1, old
+s = s.replace(old, old + '  - { key: E2E_TOKEN, prompt: "A token", secret: true, optional: true }\n')
+open(path, "w").write(s)
+PY
+E2E_TOKEN=tok-$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')
 "${S[@]}" ship --channel stable 2>"$WORK/ship-1.0.0.log" || { cat "$WORK/ship-1.0.0.log"; fail "ship 1.0.0"; }
 I1=$REG/notes/notes-installer@$(digest_of notes/notes-installer:latest)
 [[ $I1 == *@sha256:* ]] || fail "no digest of the 1.0.0 installer"
@@ -107,7 +127,7 @@ K8S_HOST=$(jq -r '.clusters[0].cluster.server' "$WORK/kc.json")
 	jq -r '.users[0].user."client-key-data"' "$WORK/kc.json" | base64 -d >"$WORK/k8s-key.pem")
 # No KUBECONFIG: the provider writes the kubeconfig each run reads, from the block.
 # TMPDIR: each run's private directory (its kubeconfig) is made there, and must be gone after it.
-TF_ENV=(env -i "PATH=$PATH" "HOME=$WORK/tfhome" "TMPDIR=$WORK/tmp" "TF_CLI_CONFIG_FILE=$WORK/tofurc" "TF_IN_AUTOMATION=1")
+TF_ENV=(env -i "PATH=$PATH" "HOME=$WORK/tfhome" "TMPDIR=$WORK/tmp" "TF_CLI_CONFIG_FILE=$WORK/tofurc" "TF_IN_AUTOMATION=1" "TF_VAR_e2e_token=$E2E_TOKEN")
 for v in DOCKER_HOST DOCKER_CONTEXT; do
 	if [[ -n ${!v:-} ]]; then TF_ENV+=("$v=${!v}"); fi
 done
@@ -120,6 +140,9 @@ runs 1.0.0
 	fail "state after the create: status $(st status), version $(st version), id $(st id)"
 [[ $(kubectl exec -n "$NS" deploy/notes-web -- printenv ADMIN_EMAIL) == admin@notes.test ]] || fail "the pod's ADMIN_EMAIL is not the input"
 ! grep -qF -- "$(sed -n 2p "$WORK/k8s-key.pem")" "$TF/terraform.tfstate" || fail "the cluster's client key is in state"
+kubectl get -n "$NS" secrets -o json | jq -r '.items[].data.E2E_TOKEN // empty' | while read -r v; do base64 -d <<<"$v"; echo; done | grep -qxF -- "$E2E_TOKEN" ||
+	fail "no Secret of the release holds the secret input"
+! grep -rqF -- "$E2E_TOKEN" "$TF" || fail "the secret input is in the root's files"
 [[ -z $(ls -A "$WORK/tmp") ]] || fail "a run's private directory (its kubeconfig) is left: $(ls -A "$WORK/tmp")"
 
 step "a plan after the create shows no change"
@@ -146,34 +169,54 @@ runs 2.0.0
 rc=0; tf plan -detailed-exitcode -no-color >"$WORK/plan2.log" 2>&1 || rc=$?
 [[ $rc == 0 ]] || { cat "$WORK/plan2.log"; fail "tofu plan after the upgrade exited $rc, not 0 (no change)"; }
 
-step "back to 1.0.0's installer: refused without allow_rollback, then k8s rollback"
-config "$I1" ops@notes.test
-rc=0; tf plan -no-color >"$WORK/plan3.log" 2>&1 || rc=$?
-[[ $rc != 0 ]] && grep -q 'a rollback needs allow_rollback' "$WORK/plan3.log" || { cat "$WORK/plan3.log"; fail "the plan back to 1.0.0 without allow_rollback was not refused"; }
+step "ship 3.0.0; its installer upgrades the release"
+release 3.0.0
+I3=$REG/notes/notes-installer@$(digest_of notes/notes-installer:latest)
+[[ $I3 != "$I2" ]] || fail "3.0.0's installer has 2.0.0's digest"
+config "$I3" ops@notes.test
+tf apply -auto-approve -no-color >"$WORK/apply3b.log" 2>&1 || { cat "$WORK/apply3b.log"; cluster_logs >&2; fail "tofu apply (upgrade to 3.0.0)"; }
+runs 3.0.0
+[[ $(st version) == 3.0.0 && $(st previous | jq -r .installer) == "$I2" ]] || fail "state after the upgrade to 3.0.0: version $(st version), previous $(st previous)"
+
+step "1.0.0's installer while 3.0.0 runs (not the previous release): its upgrade refused by the installer, state kept"
 config "$I1" ops@notes.test "allow_rollback = true"
+rc=0; tf apply -auto-approve -no-color >"$WORK/apply-refused.log" 2>&1 || rc=$?
+[[ $rc != 0 ]] && tr -s ' \n' ' ' <"$WORK/apply-refused.log" | grep -qE 'refused by the installer [(][^)]*exit 3[)] before anything changed' ||
+	{ cat "$WORK/apply-refused.log"; fail "the upgrade to an older release was not refused by the installer"; }
+runs 3.0.0
+[[ $(st version) == 3.0.0 && $(st installer) == "$I3" ]] || fail "state after the refused upgrade: version $(st version), installer $(st installer)"
+config "$I3" ops@notes.test
+rc=0; tf plan -detailed-exitcode -no-color >"$WORK/plan-refused.log" 2>&1 || rc=$?
+[[ $rc == 0 ]] || { cat "$WORK/plan-refused.log"; fail "tofu plan after the refused upgrade exited $rc, not 0 (no change)"; }
+
+step "back to 2.0.0's installer: refused without allow_rollback, then k8s rollback"
+config "$I2" ops@notes.test
+rc=0; tf plan -no-color >"$WORK/plan3.log" 2>&1 || rc=$?
+[[ $rc != 0 ]] && grep -q 'a rollback needs allow_rollback' "$WORK/plan3.log" || { cat "$WORK/plan3.log"; fail "the plan back to 2.0.0 without allow_rollback was not refused"; }
+config "$I2" ops@notes.test "allow_rollback = true"
 tf apply -auto-approve -no-color >"$WORK/apply4.log" 2>&1 || { cat "$WORK/apply4.log"; cluster_logs >&2; fail "tofu apply (rollback)"; }
-runs 1.0.0
-[[ $(st version) == 1.0.0 && $(st installer) == "$I1" ]] || fail "state after the rollback: version $(st version), installer $(st installer)"
+runs 2.0.0
+[[ $(st version) == 2.0.0 && $(st installer) == "$I2" ]] || fail "state after the rollback: version $(st version), installer $(st installer)"
 
 step "import: the state forgotten, the release imported by its ID, its first apply, then a plan with no change"
 tf state rm stowage_install.notes >"$WORK/rm.log" 2>&1 || { cat "$WORK/rm.log"; fail "tofu state rm"; }
 tf import -input=false stowage_install.notes "kubernetes:$NS/notes" >"$WORK/import.log" 2>&1 || { cat "$WORK/import.log"; fail "tofu import"; }
 [[ $(st id) == notes/notes && $(st registry) == null ]] || fail "state after the import: id $(st id), registry $(st registry)"
 tf apply -auto-approve -no-color >"$WORK/apply5.log" 2>&1 || { cat "$WORK/apply5.log"; cluster_logs >&2; fail "tofu apply (the import's first)"; }
-runs 1.0.0
-[[ $(st version) == 1.0.0 && $(st installer) == "$I1" && $(st registry) != null ]] ||
+runs 2.0.0
+[[ $(st version) == 2.0.0 && $(st installer) == "$I2" && $(st registry) != null ]] ||
 	fail "state after the import's apply: version $(st version), installer $(st installer), registry $(st registry)"
 [[ $(kubectl exec -n "$NS" deploy/notes-web -- printenv ADMIN_EMAIL) == ops@notes.test ]] || fail "the import's apply changed ADMIN_EMAIL"
 rc=0; tf plan -detailed-exitcode -no-color >"$WORK/plan4.log" 2>&1 || rc=$?
 [[ $rc == 0 ]] || { cat "$WORK/plan4.log"; fail "tofu plan after the import's apply exited $rc, not 0 (no change)"; }
 
 step "a destroy refused by deletion_protection: the release kept"
-PROTECT=true config "$I1" ops@notes.test "allow_rollback = true"
+PROTECT=true config "$I2" ops@notes.test "allow_rollback = true"
 tf apply -auto-approve -no-color >"$WORK/apply6.log" 2>&1 || { cat "$WORK/apply6.log"; fail "tofu apply (deletion_protection on)"; }
 rc=0; tf destroy -auto-approve -no-color >"$WORK/destroy1.log" 2>&1 || rc=$?
 [[ $rc != 0 ]] && grep -q 'deletion_protection is on' "$WORK/destroy1.log" || { cat "$WORK/destroy1.log"; fail "the destroy was not refused by deletion_protection"; }
-runs 1.0.0
-config "$I1" ops@notes.test "allow_rollback = true"
+runs 2.0.0
+config "$I2" ops@notes.test "allow_rollback = true"
 tf apply -auto-approve -no-color >"$WORK/apply7.log" 2>&1 || { cat "$WORK/apply7.log"; fail "tofu apply (deletion_protection off)"; }
 
 step "destroy: k8s uninstall --data"

@@ -29,7 +29,10 @@
 #   5. 1.0.1 shipped and mirrored, vm.version 1.0.1: the upgrade, its reboot followed, the VM on
 #      1.0.1 with seed_boot_id null, and only its own key accepted from then on;
 #   6. vm.version back to 1.0.0 without allow_rollback: a plan error; with it, the rollback;
-#   7. destroy with deletion_protection off: stowage_install forgotten, the module destroyed.
+#   7. the install forgotten (tofu state rm) and imported (vm:<host>/notes-stow), its first apply
+#      under the VM's own key (vm.known_hosts_line), then no change planned;
+#   8. a destroy of the install refused by deletion_protection, the VM's install untouched;
+#   9. destroy with deletion_protection off: stowage_install forgotten, the module destroyed.
 set -euo pipefail
 
 STOWAGE_REPO=${STOWAGE_REPO:-$HOME/stowage}
@@ -135,6 +138,11 @@ variable "release_version" { type = string }
 variable "admin" { type = string }
 variable "allow_rollback" { default = false }
 variable "deletion_protection" { default = true }
+# The VM's own key, for an imported install's first apply; null: the seed's one-time key.
+variable "vm_known_hosts_line" {
+  type    = string
+  default = null
+}
 
 resource "stowage_vm_seed" "vm" {
   installer      = "$INSTALLER"
@@ -189,7 +197,7 @@ resource "stowage_install" "vm" {
     host             = "$ADDR"
     user             = "ops"
     private_key_file = "$KEY"
-    known_hosts_line = stowage_vm_seed.vm.known_hosts_line
+    known_hosts_line = var.vm_known_hosts_line != null ? var.vm_known_hosts_line : stowage_vm_seed.vm.known_hosts_line
     short_name       = stowage_vm_seed.vm.short_name
     version          = var.release_version
   }
@@ -313,6 +321,28 @@ fi
 TF_VAR_release_version=1.0.0 TF_VAR_allow_rollback=true apply_logged apply4 -input=false -auto-approve || { tail -80 "$WORK/apply4.log"; vm_dump apply4; fail "the rollback"; }
 [[ $(tf output -raw version) == 1.0.0 ]] || { vm_dump apply4; fail "state's version after the rollback: $(tf output -raw version)"; }
 on notes-stow status --json | jq -e '.installed.version == "1.0.0" and .boot == "passive"' >/dev/null || { vm_dump apply4; fail "the VM is not on 1.0.0, in its passive system"; }
+
+step "import: the install forgotten, imported by its ID, its first apply under the VM's own key, then no change planned"
+export TF_VAR_release_version=1.0.0
+tf state rm stowage_install.vm >"$WORK/rm.log" 2>&1 || { cat "$WORK/rm.log"; fail "tofu state rm"; }
+tf import -input=false stowage_install.vm "vm:$ADDR/notes-stow" >"$WORK/import.log" 2>&1 || { cat "$WORK/import.log"; fail "tofu import"; }
+export TF_VAR_vm_known_hosts_line=$own
+boot=$(on cat /proc/sys/kernel/random/boot_id)
+tf apply -input=false -auto-approve >"$WORK/apply-import.log" 2>&1 || { tail -80 "$WORK/apply-import.log"; vm_dump; fail "the import's first apply"; }
+[[ $(tf output -raw version) == 1.0.0 && $(tf output -raw host_key_line) == "$own" ]] ||
+	fail "state after the import's apply: version $(tf output -raw version), host_key_line $(tf output -raw host_key_line)"
+[[ $(on cat /proc/sys/kernel/random/boot_id) == "$boot" ]] || fail "the import's apply rebooted the VM"
+! grep -qF "$TOKEN" "$ROOT/terraform.tfstate" || fail "the secret input is in state after the import's apply"
+rc=0
+tf plan -input=false -detailed-exitcode >"$WORK/plan3.log" 2>&1 || rc=$?
+[[ $rc == 0 ]] || { cat "$WORK/plan3.log"; fail "a plan after the import's apply is not empty (exit $rc)"; }
+
+step "a destroy of the install refused by deletion_protection: the VM's install untouched"
+rc=0
+tf destroy -input=false -auto-approve -target=stowage_install.vm >"$WORK/destroy-refused.log" 2>&1 || rc=$?
+[[ $rc != 0 ]] && grep -q 'deletion_protection is on' "$WORK/destroy-refused.log" || { cat "$WORK/destroy-refused.log"; fail "the destroy was not refused by deletion_protection"; }
+[[ $(tf state list) == *stowage_install.vm* ]] || fail "the install left state though its destroy was refused"
+on notes-stow status --json | jq -e '.installed.version == "1.0.0"' >/dev/null || { vm_dump; fail "the VM does not run 1.0.0 after the refused destroy"; }
 
 step "destroy: the install forgotten, the VM destroyed by its module"
 TF_VAR_release_version=1.0.0 TF_VAR_deletion_protection=false tf apply -input=false -auto-approve -target=stowage_install.vm >"$WORK/apply5.log" 2>&1 || { tail -40 "$WORK/apply5.log"; fail "deletion_protection off"; }
