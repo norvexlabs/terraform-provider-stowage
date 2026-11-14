@@ -1237,6 +1237,48 @@ func TestImportFirstApplyIsConsistent(t *testing.T) {
 	}
 }
 
+// TestImportFirstApplyRecordsTheRegistryCA: an imported state's first apply records the
+// registry CA the install keeps, planned unknown, on every target, a provider given a CA.
+func TestImportFirstApplyRecordsTheRegistryCA(t *testing.T) {
+	t.Parallel()
+	ca := "-----BEGIN CERTIFICATE-----\nA\n"
+	withCA := map[string]tftypes.Value{"registry_ca": str(ca)}
+	check := func(t *testing.T, h *harness, a *tfprotov6.ApplyResourceChangeResponse) {
+		t.Helper()
+		if d := errorsOf(a.Diagnostics); d != "" {
+			t.Fatal(d)
+		}
+		if got := asString(t, h.attrs(a.NewState)["registry_ca_digest"]); got != caDigest(ca) {
+			t.Errorf("registry_ca_digest %q, want %q", got, caDigest(ca))
+		}
+	}
+	t.Run("docker", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t, withCA)
+		h.fake.set("status", reply{stdout: `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1,"installer":"` + image + `"},"channel":"stable","inputs":[],"registry_ca":"` + caDigest(ca) + `"}`})
+		state := h.importState("app.example:/srv/notes/notes-stow").ImportedResources[0].State
+		check(t, h, h.update(state, h.dockerConfig(map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})})))
+	})
+	t.Run("kubernetes", func(t *testing.T) {
+		t.Parallel()
+		h := k8sHarness(t, withCA)
+		state := h.importState("kubernetes:prod/notes").ImportedResources[0].State
+		check(t, h, h.update(state, h.k8sConfig(map[string]tftypes.Value{"kubernetes": h.block("kubernetes", map[string]tftypes.Value{"namespace": str("prod")}),
+			"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})})))
+	})
+	t.Run("vm", func(t *testing.T) {
+		t.Parallel()
+		h, f := newVMHarness(t)
+		cfg := h.dv(h.ptyp, fill(h.ptyp, withCA))
+		if resp, err := h.srv.ConfigureProvider(context.Background(), &tfprotov6.ConfigureProviderRequest{Config: &cfg}); err != nil || len(resp.Diagnostics) > 0 {
+			t.Fatalf("configure: %v %s", err, diagText(resp.Diagnostics))
+		}
+		f.retired = true
+		resp, _ := h.srv.ImportResourceState(context.Background(), &tfprotov6.ImportResourceStateRequest{TypeName: "stowage_install", ID: "vm:192.0.2.7/notes-stow"})
+		check(t, h, h.update(resp.ImportedResources[0].State, h.vmConfig("1.1.0", map[string]tftypes.Value{"vm": h.vmBlock("1.1.0", map[string]tftypes.Value{"known_hosts_line": str(ownLine)})})))
+	})
+}
+
 // TestVMUnreadSeedAfterReboot: a one-time key left accepted with no boot id is retired by the
 // reboot an upgrade made, even when that upgrade falls back.
 func TestVMUnreadSeedAfterReboot(t *testing.T) {

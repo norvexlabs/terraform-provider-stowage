@@ -353,9 +353,6 @@ func (r *installResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 	switch {
 	case !plan.Installer.Equal(state.Installer) || imported(&state):
 		unknowns = []string{"version", "revision", "channel", "status", "previous", "short_name"}
-		if imported(&state) {
-			unknowns = append(unknowns, "registry") // the first apply records the provider's
-		}
 	case len(remoteChange(&plan, &state)) > 0:
 		// The update reads the release after its run, and the target may run another than state
 		// says (changed outside OpenTofu, a refresh skipped); a re-run may finish a first
@@ -363,7 +360,10 @@ func (r *installResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 		unknowns = []string{"version", "revision", "channel", "status", "previous"}
 	}
 	if imported(&state) {
-		unknowns = append(unknowns, "registry") // the first apply records the provider's
+		// The first apply records the provider's registry, and the registry CA the install keeps
+		// (its status's; on Kubernetes, and on a VM whose status reports none, the provider's):
+		// a refresh before it reads no imported remote state, which has no connection yet.
+		unknowns = append(unknowns, "registry", "registry_ca_digest")
 	}
 	if len(unknowns) > 0 {
 		for _, a := range unknowns {

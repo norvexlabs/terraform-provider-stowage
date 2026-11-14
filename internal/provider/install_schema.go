@@ -187,7 +187,7 @@ func installSchema(ctx context.Context) schema.Schema {
 				MarkdownDescription: "A destroy runs `uninstall --data`, deleting the volumes, instead of `uninstall`, which keeps them. Docker and Kubernetes: `true` with a `vm` block is refused at validation (`delete_data is not the VM's`), as a VM's destroy forgets the install and deletes nothing.",
 			},
 			"registry":           computedString("The provider's `registry` at the install, which a later plan compares; null in an imported state until its first apply."),
-			"registry_ca_digest": computedString("`sha256:<hex>` of the registry CA the install keeps (the provider's `registry_ca` at its first install), as `status --json` reports it; null when it keeps none. A later plan compares it with the provider's `registry_ca`: first-install only on Docker and the VM."),
+			"registry_ca_digest": computedString("`sha256:<hex>` of the registry CA the install keeps (the provider's `registry_ca` at its first install), as `status --json` reports it; null when it keeps none. A later plan compares it with the provider's `registry_ca`: first-install only on Docker and the VM. Null in an imported state until its first apply, which records it."),
 			"short_name":         computedString("The installer's short name (`describe` `short_name`): the install keeps its installer as `<id>/<short_name>-stow`."),
 			"version":            computedString("The release installed, from `status --json`."),
 			"revision": schema.Int64Attribute{Computed: true, MarkdownDescription: "The installed release's package revision.",

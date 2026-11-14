@@ -88,7 +88,7 @@ variable "smtp_password" {
 - `id` (String) `<work_dir>/<name>` on Docker; `<namespace>/<release>` on Kubernetes.
 - `previous` (Object) The release `rollback` returns to (`version`, `revision`, `installer`); null before an upgrade. (see [below for nested schema](#nestedatt--previous))
 - `registry` (String) The provider's `registry` at the install, which a later plan compares; null in an imported state until its first apply.
-- `registry_ca_digest` (String) `sha256:<hex>` of the registry CA the install keeps (the provider's `registry_ca` at its first install), as `status --json` reports it; null when it keeps none. A later plan compares it with the provider's `registry_ca`: first-install only on Docker and the VM.
+- `registry_ca_digest` (String) `sha256:<hex>` of the registry CA the install keeps (the provider's `registry_ca` at its first install), as `status --json` reports it; null when it keeps none. A later plan compares it with the provider's `registry_ca`: first-install only on Docker and the VM. Null in an imported state until its first apply, which records it.
 - `revision` (Number) The installed release's package revision.
 - `short_name` (String) The installer's short name (`describe` `short_name`): the install keeps its installer as `<id>/<short_name>-stow`.
 - `status` (String) `installed`, `installing` (the first install has not finished), `failed: <why>` or `not installed`.
@@ -236,7 +236,7 @@ re-run never gives it.
 |---|---|
 | `id` | `<work_dir>/<name>` on Docker (the home resolved when `work_dir` is left out); `<namespace>/<release>` on Kubernetes; `vm:<host>/<short_name>-stow` on a VM. |
 | `short_name` | The installer's short name: a Docker install keeps its installer as `<id>/<short_name>-stow` (`describe`'s at create, then `status --json` `short_name` at each read and update, so a rollback across a release that renamed it finds the one kept); a VM runs its OS bundle's `<short_name>-stow`. |
-| `registry_ca_digest` | `sha256:<hex>` of the registry CA the install keeps (`status --json` `registry_ca`; on Kubernetes, the provider's at the install), null for none. On Docker and the VM a plan whose provider `registry_ca` has another digest (none included) is an error (`the provider's registry_ca is first-install only`), but for an imported state never applied. |
+| `registry_ca_digest` | `sha256:<hex>` of the registry CA the install keeps (`status --json` `registry_ca`; on Kubernetes, the provider's at the install), null for none. On Docker and the VM a plan whose provider `registry_ca` has another digest (none included) is an error (`the provider's registry_ca is first-install only`), but for an imported state never applied. An imported state holds none until its first apply, which records it (planned as known after apply); on a VM whose status reports none, the provider's. |
 | `version`, `revision` | The release installed (`status --json` `installed`). |
 | `channel` | The channel the install follows. |
 | `status` | `installed`, `installing` (the first install has not finished; helm's `pending-install` on Kubernetes), `failed: <why>` (`install_failed` on Docker; a latest helm revision neither deployed nor pending on Kubernetes), `pending: <why>` (Kubernetes: helm working on the release), or `not installed`. |

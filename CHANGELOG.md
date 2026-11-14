@@ -25,6 +25,12 @@ change before 1.0, each change named here.
   for a target known to be gone and `-refresh=false` for one plan. The install stays in state, as
   a host down for a while is not told from one gone.
 
+### Fixed
+
+- An imported install's first apply, the provider given `registry_ca`, no longer fails with an
+  inconsistent result on `registry_ca_digest`: the plan shows it known after apply, and the apply
+  records the registry CA the install keeps.
+
 ### Documentation
 
 - Installing a GitHub release's signed zip into OpenTofu's local mirror, on any platform it is
