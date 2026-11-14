@@ -1072,6 +1072,19 @@ type update struct {
 	plan, state *installModel
 	secrets     map[string]string // secret_inputs_wo, from the configuration
 	diags       *diag.Diagnostics
+	// adopted is an imported state as the install records it (adopt): what the first apply
+	// compares the configuration with; recorded the input keys the install records. Nil when the
+	// state is not imported, or the install's values are not known.
+	adopted  *installModel
+	recorded []string
+}
+
+// was is the state an update compares the plan with: the adopted one, else state.
+func (u *update) was() *installModel {
+	if u.adopted != nil {
+		return u.adopted
+	}
+	return u.state
 }
 
 // releaseStep is the release change an update ends with.
@@ -1090,7 +1103,7 @@ func (u *update) run(ctx context.Context, save func(*installModel) bool) {
 		u.diags.AddError("Cannot reach the Docker target", err.Error())
 		return
 	}
-	st, err := d.Status(ctx)
+	st, err := d.StatusOf(ctx, imported(state))
 	if err != nil {
 		addInstallerError(u.diags, "Reading the install", err)
 		return
@@ -1115,6 +1128,9 @@ func (u *update) run(ctx context.Context, save func(*installModel) bool) {
 	if !u.keptChecks(d, st, running) {
 		return
 	}
+	if u.adopt(ctx, st); u.diags.HasError() {
+		return
+	}
 	step, next := u.releaseStep(ctx, d, st, nil)
 	if u.diags.HasError() {
 		return
@@ -1130,13 +1146,12 @@ func (u *update) run(ctx context.Context, save func(*installModel) bool) {
 	d = d.Without(running, next)
 	switch {
 	case step == rollback && imported(state):
-		runs := "the installer of the release it runs (status --json installed.installer)"
-		if st.Installed != nil && st.Installed.Installer != "" {
-			runs = st.Installed.Installer + ", the release it runs"
-		}
-		u.diags.AddAttributeError(path.Root("installer"), "a rollback of an imported install",
-			fmt.Sprintf("An imported install is taken over first: apply with installer = %s, then set installer back to previous.installer.", runs))
+		importedRollback(u.diags, path.Root("installer"), "installer", installerRuns(st), "previous.installer")
 		return
+	case step == upgrade && imported(state):
+		if refuseNewRouteDomains(u.diags, rerun, running); u.diags.HasError() {
+			return
+		}
 	case step == rollback && !rerun.Empty():
 		rollbackAlone(u.diags, "inputs, secret inputs, tls, domains or ports")
 		return
@@ -1184,6 +1199,21 @@ func (u *update) run(ctx context.Context, save func(*installModel) bool) {
 	}
 	u.settled(ctx, d, &final, short)
 	save(&final)
+}
+
+// importedRollback refuses a rollback of an imported install, on every target: it is taken over
+// first, with the release it runs (attribute = runs), then rolled back.
+func importedRollback(diags *diag.Diagnostics, attr path.Path, setting, runs, back string) {
+	diags.AddAttributeError(attr, "a rollback of an imported install",
+		fmt.Sprintf("An imported install is taken over first: apply with %s = %s, then set %s back to %s.", setting, runs, setting, back))
+}
+
+// installerRuns names the installer of the release an install runs, for importedRollback.
+func installerRuns(st *installer.Status) string {
+	if st.Installed != nil && st.Installed.Installer != "" {
+		return st.Installed.Installer + ", the release it runs"
+	}
+	return "the installer of the release it runs (status --json installed.installer)"
 }
 
 // refuseSecretInputs refuses an input given a value that one of the releases declares secret:
@@ -1275,7 +1305,7 @@ func (u *update) releaseStep(ctx context.Context, d installer.Docker, st *instal
 // split decides only: what it reports in u.diags is the maps' own conversion, which a known map
 // of strings never fails.
 func (u *update) split(ctx context.Context, running, next *installer.Describe) (rerun, up installer.Change) {
-	plan, state := u.plan, u.state
+	plan, state := u.plan, u.was()
 	rerun = installer.Change{Inputs: map[string]string{}, SecretInputs: map[string]string{}, Domains: map[string]string{}, Ports: map[string]string{}}
 	up = installer.Change{Inputs: map[string]string{}, SecretInputs: map[string]string{}, Ports: map[string]string{}}
 	upgrading := next != nil
@@ -1306,6 +1336,11 @@ func (u *update) split(ctx context.Context, running, next *installer.Describe) (
 	}
 	for k, v := range u.secrets {
 		switch {
+		case u.adopted != nil && slices.Contains(u.recorded, k):
+			// Taken over: a secret the install records is kept, not compared.
+		case u.adopted != nil && (running.Declares(k) || !upgrading):
+			// One it does not record: given to the re-run, which refuses a key it does not declare.
+			rerun.SecretInputs[k] = v
 		case running.Declares(k) && bump:
 			rerun.SecretInputs[k] = v
 		case running.Declares(k):
@@ -1349,7 +1384,9 @@ func (u *update) partial(ctx context.Context, rerun installer.Change) *installMo
 	if imported(u.state) {
 		m.Registry = types.StringValue(u.r.registry())
 	}
-	inputs := stringMap(ctx, u.state.Inputs, u.diags)
+	// What the install holds now: state's (an imported state's, what it records) and the re-run.
+	was := u.was()
+	inputs := stringMap(ctx, was.Inputs, u.diags)
 	if inputs == nil {
 		inputs = map[string]string{}
 	}
@@ -1361,8 +1398,8 @@ func (u *update) partial(ctx context.Context, rerun installer.Change) *installMo
 			delete(inputs, k)
 		}
 	}
-	m.Inputs = mapOrNull(ctx, u.state.Inputs, u.plan.Inputs, inputs, u.diags)
-	ports := portMap(ctx, u.state.Ports, u.diags)
+	m.Inputs = mapOrNull(ctx, was.Inputs, u.plan.Inputs, inputs, u.diags)
+	ports := portMap(ctx, was.Ports, u.diags)
 	if ports == nil {
 		ports = map[string]string{}
 	}

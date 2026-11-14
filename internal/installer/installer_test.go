@@ -30,6 +30,21 @@ func TestParseDescribe(t *testing.T) {
 		!slices.Equal(d.FirstInstallOnly, []string{"address"}) || !d.Declares("ADMIN_EMAIL") || d.Declares("OTHER") {
 		t.Fatalf("got %+v", d)
 	}
+	// The TLS modes' inputs are declared, the token secret.
+	d, err = ParseDescribe([]byte(`{"format":1,"name":"notes","short_name":"notes","release":{"version":"1.2.0","revision":2},"routes":[],
+		"inputs":[{"key":"ADMIN_EMAIL"}],"tls_inputs":[{"key":"STOWAGE_ACME_EMAIL","tls_modes":["acme"]},{"key":"STOWAGE_CLOUDFLARE_API_TOKEN","secret":true,"tls_modes":["dns-cloudflare"]}]}`))
+	if err != nil || !d.Declares("STOWAGE_CLOUDFLARE_API_TOKEN") || !d.Secret("STOWAGE_CLOUDFLARE_API_TOKEN") || !d.Declares("STOWAGE_ACME_EMAIL") ||
+		d.Secret("STOWAGE_ACME_EMAIL") || d.Secret("ADMIN_EMAIL") || d.Declares("OTHER") {
+		t.Fatalf("tls inputs: %+v %v", d, err)
+	}
+	for stderr, want := range map[string]bool{"Error: unknown flag: --values\n": true, "ssh: x\nerror: unknown flag: --values": true, "Error: unknown flag: --json\n": false, "--values: denied": false} {
+		if noValuesFlag([]byte(stderr), 1) != want || noValuesFlag([]byte(stderr), 3) {
+			t.Errorf("%q", stderr)
+		}
+	}
+	if env := InputEnv(d); !slices.Contains(env, "STOWAGE_CLOUDFLARE_API_TOKEN") || !slices.Contains(env, "STOWAGE_ACME_EMAIL") {
+		t.Fatalf("input env %v", env)
+	}
 	for doc, want := range map[string]string{
 		`{"name":"notes","release":{"version":"1"}}`:                                               "predates the machine interface; use an installer made by Stowage " + MinStowage,
 		`{"format":2,"name":"notes","release":{"version":"1"}}`:                                    "format 2 is newer than this provider reads (format 1): upgrade terraform-provider-stowage",

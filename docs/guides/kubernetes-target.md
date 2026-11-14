@@ -96,7 +96,8 @@ operation first refuses a machine that is not linux/amd64 and names the programs
   is. While any value of the configuration (but `deletion_protection`, `delete_data` and `timeouts`), the provider's `kubernetes` block or a setting a run reads (the pull account, `registry`, `registry_ca`, the
   mirror's login) is not known, no dry run, with a warning (`No dry run of this plan yet`): OpenTofu
   plans again at apply, with it known, and that plan runs it (a dry run runs again there in any
-  case). Skipped for an imported state never applied.
+  case). On an imported state never applied it runs too, and says what the take-over changes (see
+  Import).
 - **Update**: a change of the provider's own settings alone touches nothing. Otherwise, in
   DESIGN § 13's order:
   1. `k8s status --json`, by state's installer (an imported state's: the desired one). No release,
@@ -142,8 +143,11 @@ operation first refuses a machine that is not linux/amd64 and names the programs
   5. `k8s status --json` by the installer that now runs fills the computed attributes.
 - **Import**: `tofu import stowage_install.x 'kubernetes:<namespace>/<release>'`. State records
   the namespace and the release, `deletion_protection = true`; the first apply, with the
-  configuration's cluster and installer, runs the update above (the release's project checked
-  from its status) and records the provider's `registry`.
+  configuration's cluster and installer, compares the configuration's inputs with those the
+  release records (`k8s status --json --values` by the configuration's installer, Stowage 0.38.0
+  or later; it tells them when it carries the release installed) as on Docker — matching, no helm
+  upgrade runs for them —, runs the update above (the release's project checked from its status)
+  and records the provider's `registry`.
 - **Delete**: refused while `deletion_protection`; else state's installer fetched and described,
   then `k8s uninstall --yes --no-input --json [--data]`. The installer's refusal `no release …,
   and nothing … made for it there` (gone, and nothing left) is success; one keeping its data's

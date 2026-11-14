@@ -1351,3 +1351,23 @@ func TestK8sMirrorLogin(t *testing.T) {
 		t.Fatalf("status run without the mirror's login: %q", st.argv)
 	}
 }
+
+// An imported release's first apply compares the configuration with the inputs it records: matching,
+// no helm upgrade runs; a differing input re-runs it.
+func TestK8sImportedTakeOverComparesTheRecordedValues(t *testing.T) {
+	t.Parallel()
+	for email, upgrades := range map[string]int{"a@example.com": 0, "b@example.com": 1} {
+		h := k8sHarness(t, nil)
+		h.fake.set("k8s-status", reply{stdout: strings.TrimSuffix(strings.TrimSpace(statusK8s), "}") + `,"values":{"inputs":{"ADMIN_EMAIL":"a@example.com"}}}`})
+		state := h.importState("kubernetes:prod/notes").ImportedResources[0].State
+		a := h.update(state, h.k8sConfig(map[string]tftypes.Value{"kubernetes": h.block("kubernetes", map[string]tftypes.Value{"namespace": str("prod")}),
+			"inputs": strMap(map[string]string{"ADMIN_EMAIL": email})}))
+		if d := errorsOf(a.Diagnostics); d != "" {
+			t.Fatal(d)
+		}
+		st := h.fake.callsOf("k8s-status")
+		if len(st) == 0 || !contains(st[0].argv, "--values") || len(h.fake.callsOf("k8s-upgrade")) != upgrades {
+			t.Errorf("%s: calls %q", email, h.fake.ops())
+		}
+	}
+}

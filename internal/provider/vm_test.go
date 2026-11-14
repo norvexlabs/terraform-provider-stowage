@@ -78,7 +78,7 @@ func vmOp(argv []string) string {
 		return "probe"
 	case len(argv) == 3 && argv[1] == "describe":
 		return "describe"
-	case len(argv) == 3 && argv[1] == "status":
+	case len(argv) == 3 && argv[1] == "status", len(argv) == 4 && argv[1] == "status" && argv[3] == "--values":
 		return "status"
 	case len(argv) == 5 && argv[1] == "events":
 		return "events"
@@ -2049,5 +2049,65 @@ func TestVMRetryReloadNotTaken(t *testing.T) {
 	if errorsOf(up.Diagnostics) != "" || vmAttr(t, h, up.NewState, "seed_boot_id") != unreadBoot || !strings.Contains(diagText(up.Diagnostics), "still not retired") ||
 		slices.Contains(f.ops()[slices.Index(f.ops(), "retire")+1:], "hostkey") {
 		t.Fatalf("%s %s %q", diagText(up.Diagnostics), vmAttr(t, h, up.NewState, "seed_boot_id"), f.ops())
+	}
+}
+
+// An imported VM's first apply compares the configuration with what the install records: matching,
+// it runs no install; a differing input goes alone.
+func TestVMImportedTakeOverComparesTheRecordedValues(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		email string
+		want  []string // the re-run's --set, nil for none
+	}{{"a@b", nil}, {"c@d", []string{"ADMIN_EMAIL=c@d"}}} {
+		h, f := newVMHarness(t)
+		f.retired = true
+		f.set("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", `,"values":{"inputs":{"ADMIN_EMAIL":"a@b"},"tls":"none"}`)})
+		resp, _ := h.srv.ImportResourceState(context.Background(), &tfprotov6.ImportResourceStateRequest{TypeName: "stowage_install", ID: "vm:192.0.2.7/notes-stow"})
+		cfg := fill(h.typ, map[string]tftypes.Value{"vm": h.vmBlock("1.1.0", map[string]tftypes.Value{"known_hosts_line": str(ownLine)}),
+			"inputs": strMap(map[string]string{"ADMIN_EMAIL": c.email})})
+		a := h.update(resp.ImportedResources[0].State, cfg)
+		if d := errorsOf(a.Diagnostics); d != "" {
+			t.Fatal(d)
+		}
+		st := f.callsOf("status")
+		in := f.callsOf("install")
+		switch {
+		case len(st) == 0 || !slices.Contains(st[0].argv, "--values"):
+			t.Errorf("%s: status %q", c.email, f.ops())
+		case c.want == nil && len(in) != 0:
+			t.Errorf("%s: an install ran: %q", c.email, f.ops())
+		case c.want != nil && (len(in) != 1 || !slices.Contains(in[0].argv, c.want[0])):
+			t.Errorf("%s: install %q", c.email, in)
+		}
+	}
+}
+
+// A rollback of an imported VM is refused: it is taken over first.
+func TestVMImportedRollbackIsRefused(t *testing.T) {
+	t.Parallel()
+	h, f := newVMHarness(t)
+	f.retired = true
+	f.set("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", `,"previous":{"version":"1.0.0","revision":1},"values":{"inputs":{"ADMIN_EMAIL":"a@b"},"tls":"none"}`)})
+	resp, _ := h.srv.ImportResourceState(context.Background(), &tfprotov6.ImportResourceStateRequest{TypeName: "stowage_install", ID: "vm:192.0.2.7/notes-stow"})
+	cfg := fill(h.typ, map[string]tftypes.Value{"vm": h.vmBlock("1.0.0", map[string]tftypes.Value{"known_hosts_line": str(ownLine)}), "allow_rollback": boolean(true),
+		"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@b"})})
+	if got := errorsOf(h.update(resp.ImportedResources[0].State, cfg).Diagnostics); !strings.Contains(got, "a rollback of an imported install") || len(f.callsOf("rollback")) != 0 {
+		t.Fatalf("got %q, ops %q", got, f.ops())
+	}
+}
+
+// An imported VM's plan with plan_dry_run says what the take-over changes.
+func TestVMImportedPlanReportsTheTakeOver(t *testing.T) {
+	t.Parallel()
+	h, f := newVMHarness(t)
+	f.retired = true
+	f.set("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", `,"values":{"inputs":{"ADMIN_EMAIL":"a@b"},"tls":"none"}`)})
+	resp, _ := h.srv.ImportResourceState(context.Background(), &tfprotov6.ImportResourceStateRequest{TypeName: "stowage_install", ID: "vm:192.0.2.7/notes-stow"})
+	cfg := fill(h.typ, map[string]tftypes.Value{"vm": h.vmBlock("1.1.0", map[string]tftypes.Value{"known_hosts_line": str(ownLine)}), "plan_dry_run": boolean(true),
+		"inputs": strMap(map[string]string{"ADMIN_EMAIL": "c@d"})})
+	p := h.plan(resp.ImportedResources[0].State, cfg)
+	if w := warningsOf(p.Diagnostics); !strings.Contains(w, "its values differ") || !strings.Contains(w, "input ADMIN_EMAIL") {
+		t.Fatalf("%s %s %q", errorsOf(p.Diagnostics), w, f.ops())
 	}
 }

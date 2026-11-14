@@ -85,17 +85,26 @@ type Input struct {
 	Default  json.RawMessage `json:"default,omitempty"`
 }
 
+// TLSInput is an input a TLS mode adds, and the modes (--tls) that ask for it.
+type TLSInput struct {
+	Input
+	TLSModes []string `json:"tls_modes"`
+}
+
 // Describe is `describe --json`: what the installer's release offers.
 type Describe struct {
 	Format *int   `json:"format"`
 	Name   string `json:"name"`
 	// ShortName is the <short> of <short>-stow, the installer an install keeps in its directory.
-	ShortName        string   `json:"short_name"`
-	Release          Release  `json:"release"`
-	Channel          string   `json:"channel"`
-	Shapes           []string `json:"shapes"`
-	Inputs           []Input  `json:"inputs"`
-	FirstInstallOnly []string `json:"first_install_only"`
+	ShortName string   `json:"short_name"`
+	Release   Release  `json:"release"`
+	Channel   string   `json:"channel"`
+	Shapes    []string `json:"shapes"`
+	Inputs    []Input  `json:"inputs"`
+	// TLSInputs are the inputs Stowage adds in a TLS mode (Stowage >= 0.38.0; none before): the
+	// ACME contact and the secret Cloudflare token. Declares and Secret count them as declared.
+	TLSInputs        []TLSInput `json:"tls_inputs"`
+	FirstInstallOnly []string   `json:"first_install_only"`
 	// StowageVersion is the Stowage release that built the installer ("" when its manifest
 	// records none).
 	StowageVersion string `json:"stowage_version"`
@@ -131,24 +140,30 @@ func (d *Describe) HasRoute(name string) bool {
 	return false
 }
 
-// Declares says whether the release declares the input key.
+// Declares says whether the release declares the input key, its TLS modes' included.
 func (d *Describe) Declares(key string) bool {
-	for _, i := range d.Inputs {
-		if i.Key == key {
-			return true
-		}
-	}
-	return false
+	_, ok := d.input(key)
+	return ok
 }
 
-// Secret says whether the release declares the input key secret.
+// Secret says whether the release declares the input key secret, its TLS modes' included.
 func (d *Describe) Secret(key string) bool {
+	i, _ := d.input(key)
+	return i.Secret
+}
+
+func (d *Describe) input(key string) (Input, bool) {
 	for _, i := range d.Inputs {
 		if i.Key == key {
-			return i.Secret
+			return i, true
 		}
 	}
-	return false
+	for _, i := range d.TLSInputs {
+		if i.Key == key {
+			return i.Input, true
+		}
+	}
+	return Input{}, false
 }
 
 // Status is `status --json`: the fields common to every shape, and Docker's restore flags.
@@ -174,6 +189,25 @@ type Status struct {
 	ShortName  string `json:"short_name"`
 	Address    string `json:"address"`
 	RegistryCA string `json:"registry_ca"`
+	// Values is what `status --json --values` adds (Stowage >= 0.38.0): the values the install
+	// records that a configuration gives again. Nil when not asked, or unknown.
+	Values *Values `json:"values"`
+}
+
+// Values are an install's recorded values, never a secret's: its inputs that are not secret (a
+// file input as sha256:<hex>), the front's TLS mode ("none" for loopback), each route's domain
+// in a TLS mode and loopback port in loopback mode.
+type Values struct {
+	Inputs  map[string]string `json:"inputs"`
+	TLS     string            `json:"tls"`
+	Domains map[string]string `json:"domains"`
+	Ports   map[string]int64  `json:"ports"`
+}
+
+// noValuesFlag says whether a status run refused --values as unknown: an installer made before
+// Stowage 0.38.0, whose status is read without it.
+func noValuesFlag(stderr []byte, exit int) bool {
+	return exit != 0 && exit != 3 && bytes.Contains(stderr, []byte("unknown flag")) && bytes.Contains(stderr, []byte("--values"))
 }
 
 // HelmStatus is a helm release's latest revision and its status (deployed, failed, …).

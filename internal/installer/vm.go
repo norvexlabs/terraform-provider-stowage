@@ -189,13 +189,25 @@ func ParseVMStatus(b []byte) (*VMStatus, error) {
 
 // Status runs the VM's `<short>-stow status --json`.
 func (v VM) Status(ctx context.Context) (*VMStatus, error) {
+	return v.StatusOf(ctx, false)
+}
+
+// StatusOf is Status, with the recorded values (`--values`) when values is set: Values nil
+// from an installer made before Stowage 0.38.0, which refuses the flag (read again without it).
+func (v VM) StatusOf(ctx context.Context, values bool) (*VMStatus, error) {
 	ctl, err := v.ctl()
 	if err != nil {
 		return nil, err
 	}
 	argv := []string{ctl, "status", "--json"}
+	if values {
+		argv = append(argv, "--values")
+	}
 	stdout, stderr, exit, err := v.Runner.Run(ctx, argv, nil)
 	logRun(ctx, argv, stdout, stderr, true, exit, err)
+	if err == nil && values && noValuesFlag(stderr, exit) {
+		return v.StatusOf(ctx, false)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("status: %w", err)
 	}

@@ -117,6 +117,11 @@ func InputEnv(desc *Describe) []string {
 			out = append(out, i.Key)
 		}
 	}
+	for _, i := range desc.TLSInputs {
+		if ValidInputKey(i.Key) && !RunEnv(i.Key) {
+			out = append(out, i.Key)
+		}
+	}
 	return out
 }
 
@@ -227,7 +232,20 @@ func (k K8s) Describe(ctx context.Context) (*Describe, error) {
 // release of the name, which the installer refuses (exit 3) with `refused.absent`. Another refusal
 // is a *RefusedError.
 func (k K8s) Status(ctx context.Context) (*Status, error) {
-	stdout, stderr, exit, err := k.run(ctx, nil, k.verb("status", "--json")...)
+	return k.StatusOf(ctx, false)
+}
+
+// StatusOf is Status, with the recorded values (`--values`) when values is set: Values nil
+// from an installer made before Stowage 0.38.0, which refuses the flag (read again without it).
+func (k K8s) StatusOf(ctx context.Context, values bool) (*Status, error) {
+	args := []string{"--json"}
+	if values {
+		args = append(args, "--values")
+	}
+	stdout, stderr, exit, err := k.run(ctx, nil, k.verb("status", args...)...)
+	if err == nil && values && noValuesFlag(stderr, exit) {
+		return k.StatusOf(ctx, false)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("k8s status: %w", err)
 	}

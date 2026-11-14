@@ -17,6 +17,13 @@ each change named here.
   upgrade --dry-run` (or `k8s rollback --dry-run`), or the VM's `upgrade --version V --dry-run` (or
   `rollback --dry-run`) over SSH, so a refusal is a plan error; the VM's OS needs Stowage 0.38.0 or
   later.
+- Taking over an imported install: its first apply reads what the install records (`status --json
+  --values`, Stowage 0.38.0 or later) and re-runs it with what the configuration gives otherwise
+  alone — a configuration that matches re-runs nothing; a secret input the install records is
+  kept, one it does not is sent. A TLS mode the install serves that the configuration leaves out,
+  or the reverse, is refused. With `plan_dry_run`, the plan of an imported state runs too and says
+  which keys differ (`Taking over the install: …`); a rollback of an imported install is refused at
+  plan as at apply.
 
 ### Changed
 
@@ -33,6 +40,10 @@ each change named here.
 
 ### Fixed
 
+- The Cloudflare token of the `dns-cloudflare` TLS mode (`STOWAGE_CLOUDFLARE_API_TOKEN`) counts as a
+  declared secret input (Stowage 0.38.0's `describe` lists it): given in `inputs` it is refused, as
+  it would land in state; given in `secret_inputs_wo` it is no longer sent again with every
+  upgrade; exported in OpenTofu's environment it is kept out of a local installer's run.
 - An imported install's first apply, the provider given `registry_ca`, no longer fails with an
   inconsistent result on `registry_ca_digest`: the plan shows it known after apply, and the apply
   records the registry CA the install keeps.

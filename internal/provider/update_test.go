@@ -3,12 +3,19 @@ package provider
 import (
 	"bytes"
 	"context"
+	"maps"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
+
+	"github.com/hashicorp/terraform-plugin-framework/attr"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/types"
+
+	"github.com/norvexlabs/terraform-provider-stowage/internal/installer"
 )
 
 const (
@@ -884,5 +891,336 @@ func TestNullMapElementsAndPortsKnownAtApply(t *testing.T) {
 	}
 	if ops := h.fake.ops(); slices.Contains(ops, "install") {
 		t.Fatalf("calls %q", ops)
+	}
+}
+
+// The Cloudflare token a TLS mode adds is a declared secret (describe's tls_inputs): refused in
+// inputs, and an upgrade does not re-send it without a new secret_inputs_wo_version.
+func TestTLSModeTokenIsADeclaredSecret(t *testing.T) {
+	t.Parallel()
+	withTLS := func(d string) string {
+		return strings.TrimSuffix(d, "}") + `,"tls_inputs":[{"key":"STOWAGE_CLOUDFLARE_API_TOKEN","secret":true,"tls_modes":["dns-cloudflare"]}]}`
+	}
+	h := newHarness(t, nil)
+	h.fake.set("describe", reply{stdout: withTLS(describe1)})
+	config := h.dockerConfig(map[string]tftypes.Value{"inputs": strMap(map[string]string{"STOWAGE_CLOUDFLARE_API_TOKEN": "x"})})
+	if got := errorsOf(h.apply(nil, h.plan(nil, config).PlannedState, config).Diagnostics); !strings.Contains(got, "STOWAGE_CLOUDFLARE_API_TOKEN is a secret input") {
+		t.Fatalf("in inputs: %q", got)
+	}
+	h = newHarness(t, nil)
+	h.fake.set("describe", reply{stdout: withTLS(describe1)})
+	secrets := map[string]tftypes.Value{"secret_inputs_wo": strMap(map[string]string{"STOWAGE_CLOUDFLARE_API_TOKEN": "tok"}), "secret_inputs_wo_version": num(1)}
+	state := h.create(h.dockerConfig(secrets))
+	h.fake.reset()
+	h.fake.set("describe", reply{stdout: withTLS(describe2)})
+	h.fake.set("kept-describe", reply{stdout: withTLS(describe1)})
+	secrets["installer"] = str(image2)
+	if d := errorsOf(h.update(state, h.dockerConfig(secrets)).Diagnostics); d != "" {
+		t.Fatal(d)
+	}
+	if files := untarAll(t, h.fake.callsOf("upgrade")[0].stdin); strings.Contains(files["answers"], "STOWAGE_CLOUDFLARE_API_TOKEN") {
+		t.Fatalf("upgrade answers %q", files)
+	}
+}
+
+func warningsOf(ds []*tfprotov6.Diagnostic) string {
+	var b strings.Builder
+	for _, d := range ds {
+		if d.Severity == tfprotov6.DiagnosticSeverityWarning {
+			b.WriteString(d.Summary + ": " + d.Detail + "\n")
+		}
+	}
+	return b.String()
+}
+
+// An imported install's first apply compares the configuration with what the install records
+// (status --json --values): matching, it runs nothing on the target; otherwise it re-runs with
+// what differs alone — a recorded secret kept, an unrecorded one sent. plan_dry_run says which.
+func TestImportedTakeOverComparesTheRecordedValues(t *testing.T) {
+	t.Parallel()
+	const recorded = `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1,"installer":"` + image + `"},"channel":"stable","previous":null,` +
+		`"inputs":["ADMIN_EMAIL","LEGACY","SMTP_PASSWORD"],"values":{"inputs":{"ADMIN_EMAIL":"a@example.com","LEGACY":"old"},"tls":"none","ports":{"web":8080}}}`
+	cfg := func(email string, secrets map[string]string, extra map[string]tftypes.Value) tftypes.Value {
+		v := map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": email}),
+			"ports":            tftypes.NewValue(tftypes.Map{ElementType: tftypes.Number}, map[string]tftypes.Value{"web": num(8080)}),
+			"secret_inputs_wo": strMap(secrets), "secret_inputs_wo_version": num(1)}
+		maps.Copy(v, extra)
+		return newHarness(t, nil).dockerConfig(v)
+	}
+	takeOver := func(status string, config tftypes.Value) (*harness, *tfprotov6.ApplyResourceChangeResponse) {
+		h := newHarness(t, nil)
+		h.fake.set("status", reply{stdout: status})
+		state := h.importState("app.example:/srv/notes/notes-stow").ImportedResources[0].State
+		return h, h.update(state, config)
+	}
+
+	// Matching: nothing runs; LEGACY, recorded and left out, is never emptied.
+	h, a := takeOver(recorded, cfg("a@example.com", map[string]string{"SMTP_PASSWORD": "pw"}, nil))
+	if d := errorsOf(a.Diagnostics); d != "" {
+		t.Fatal(d)
+	}
+	if got := h.fake.ops(); !slices.Equal(got, []string{"status", "kept-describe", "status"}) || !contains(h.fake.calls[0].argv, "--values") {
+		t.Fatalf("calls %q %q", got, h.fake.calls[0].argv)
+	}
+	if at := h.attrs(a.NewState); asString(t, at["installer"]) != image || at["registry"].IsNull() {
+		t.Fatalf("state %v", at)
+	}
+
+	// Differing: the input that differs, and the secret the install does not record.
+	h, a = takeOver(strings.Replace(recorded, `"LEGACY","SMTP_PASSWORD"`, `"LEGACY"`, 1), cfg("b@example.com", map[string]string{"SMTP_PASSWORD": "pw"}, nil))
+	if d := errorsOf(a.Diagnostics); d != "" {
+		t.Fatal(d)
+	}
+	rerun := h.fake.callsOf("rerun")
+	if len(rerun) != 1 || flags(rerun[0].argv)["--set"] != "ADMIN_EMAIL=b@example.com" || flags(rerun[0].argv)["--ports"] != "" ||
+		untarAll(t, rerun[0].stdin)["answers"] != "SMTP_PASSWORD: \"pw\"\n" {
+		t.Fatalf("re-run %q", h.fake.calls)
+	}
+
+	// The install serves a TLS mode the configuration leaves out: refused, nothing run.
+	h, a = takeOver(strings.Replace(recorded, `"tls":"none"`, `"tls":"acme","domains":{"web":"notes.example.com"}`, 1), cfg("a@example.com", nil, nil))
+	if got := errorsOf(a.Diagnostics); !strings.Contains(got, `the install serves a TLS mode: The install serves TLS mode acme and the configuration leaves tls out (loopback mode): give tls = "acme"`) ||
+		len(h.fake.callsOf("rerun")) != 0 {
+		t.Fatalf("got %q, calls %q", got, h.fake.ops())
+	}
+
+	// An installer before 0.38.0 refuses --values: status is read without it, and every value
+	// given goes again.
+	h = newHarness(t, nil)
+	state := h.importState("app.example:/srv/notes/notes-stow").ImportedResources[0].State
+	h.fake.then("status", reply{exit: 1, stderr: "Error: unknown flag: --values\n"})
+	a = h.update(state, cfg("a@example.com", nil, nil))
+	if d := errorsOf(a.Diagnostics); d != "" {
+		t.Fatal(d)
+	}
+	if st := h.fake.callsOf("status"); len(st) < 2 || !contains(st[0].argv, "--values") || contains(st[1].argv, "--values") ||
+		len(h.fake.callsOf("rerun")) != 1 || flags(h.fake.callsOf("rerun")[0].argv)["--set"] != "ADMIN_EMAIL=a@example.com" {
+		t.Fatalf("calls %q", h.fake.calls)
+	}
+
+	// plan_dry_run says what the take-over does.
+	h = newHarness(t, nil)
+	h.fake.set("status", reply{stdout: recorded})
+	state = h.importState("app.example:/srv/notes/notes-stow").ImportedResources[0].State
+	p := h.plan(state, cfg("a@example.com", nil, map[string]tftypes.Value{"plan_dry_run": boolean(true)}))
+	if d := errorsOf(p.Diagnostics); d != "" || !strings.Contains(warningsOf(p.Diagnostics), "Taking over the install: its values match") {
+		t.Fatalf("plan: %s %s", d, warningsOf(p.Diagnostics))
+	}
+	p = h.plan(state, cfg("b@example.com", nil, map[string]tftypes.Value{"plan_dry_run": boolean(true)}))
+	if w := warningsOf(p.Diagnostics); !strings.Contains(w, "its values differ: The first apply re-runs the install with what differs from what it records: input ADMIN_EMAIL.") ||
+		strings.Contains(w, "b@example.com") {
+		t.Fatalf("plan: %s", w)
+	}
+}
+
+// The take-over's other paths: a release change beside it is dry-run against what the install
+// records; a rollback of an imported install is refused at plan as at apply; a failed upgrade
+// after the re-run saves every value the install holds; a secret no release declares still goes
+// to the re-run (which refuses it); an install that records no TLS mode is not compared.
+func TestImportedTakeOverPaths(t *testing.T) {
+	t.Parallel()
+	const recorded = `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1,"installer":"` + image + `"},"channel":"stable",` +
+		`"previous":{"version":"1.1.0","revision":1,"installer":"` + image2 + `"},"inputs":["ADMIN_EMAIL","LEGACY"],"values":{"inputs":{"ADMIN_EMAIL":"a@example.com","LEGACY":"old"},"tls":"none"}}`
+	imported := func(status string) (*harness, *tfprotov6.DynamicValue) {
+		h := newHarness(t, nil)
+		h.fake.set("status", reply{stdout: status})
+		return h, h.importState("app.example:/srv/notes/notes-stow").ImportedResources[0].State
+	}
+	cfg := func(h *harness, extra map[string]tftypes.Value) tftypes.Value {
+		v := map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})}
+		maps.Copy(v, extra)
+		return h.dockerConfig(v)
+	}
+
+	// An upgrade beside a matching take-over is dry-run.
+	h, state := imported(recorded)
+	h.fake.set("describe", reply{stdout: describe2})
+	p := h.plan(state, cfg(h, map[string]tftypes.Value{"installer": str("registry.example.com/notes/notes-installer@sha256:" + strings.Repeat("c", 64)), "plan_dry_run": boolean(true)}))
+	if w := warningsOf(p.Diagnostics); strings.Contains(w, "No dry run of this plan") || !strings.Contains(w, "The release change the plan makes runs after it") || len(h.fake.callsOf("dry-upgrade")) != 1 {
+		t.Fatalf("upgrade: %s %s %q", errorsOf(p.Diagnostics), w, h.fake.ops())
+	}
+
+	// A rollback of an imported install: refused at plan.
+	h, state = imported(recorded)
+	p = h.plan(state, cfg(h, map[string]tftypes.Value{"installer": str(image2), "allow_rollback": boolean(true), "plan_dry_run": boolean(true)}))
+	if got := errorsOf(p.Diagnostics); !strings.Contains(got, "a rollback of an imported install") || len(h.fake.callsOf("dry-rollback")) != 0 ||
+		strings.Contains(warningsOf(p.Diagnostics), "Taking over") {
+		t.Fatalf("rollback: %q %q %s", got, h.fake.ops(), warningsOf(p.Diagnostics))
+	}
+
+	// An upgrade beside a re-run the take-over makes: no fetch (the re-run is certain), and the
+	// report still says the release changes, never naming what only the new release declares.
+	h, state = imported(recorded)
+	p = h.plan(state, cfg(h, map[string]tftypes.Value{"installer": str("registry.example.com/notes/notes-installer@sha256:" + strings.Repeat("c", 64)), "plan_dry_run": boolean(true),
+		"inputs":           strMap(map[string]string{"ADMIN_EMAIL": "b@example.com"}),
+		"secret_inputs_wo": strMap(map[string]string{"NEW_TOKEN": "t"}), "secret_inputs_wo_version": num(1)}))
+	if w := warningsOf(p.Diagnostics); !strings.Contains(w, "its values differ") || !strings.Contains(w, "The release change the plan makes runs after it") ||
+		!strings.Contains(w, "does not declare secret input NEW_TOKEN (the install records none): the new release's upgrade gives") || strings.Contains(w, "changes no release") {
+		t.Fatalf("upgrade beside a re-run: %s %s", errorsOf(p.Diagnostics), w)
+	}
+
+	// A home-relative import is not read at plan: said.
+	h = newHarness(t, nil)
+	home := h.importState("app.example:notes/notes-stow").ImportedResources[0].State
+	homeCfg := cfg(h, map[string]tftypes.Value{"plan_dry_run": boolean(true), "docker": h.block("docker", map[string]tftypes.Value{
+		"host": str("app.example"), "user": str("ops"), "known_hosts_line": str(hostLine)})})
+	if p := h.plan(home, homeCfg); !strings.Contains(warningsOf(p.Diagnostics), "its values are not read at plan") {
+		t.Fatalf("home: %s %s", warningsOf(p.Diagnostics), errorsOf(p.Diagnostics))
+	}
+
+	// The re-run ran, the upgrade failed: state holds the matching input too.
+	h, state = imported(recorded)
+	h.fake.set("describe", reply{stdout: describe2})
+	h.fake.set("upgrade", reply{exit: 1, stderr: "pull failed"})
+	a := h.update(state, cfg(h, map[string]tftypes.Value{"installer": str("registry.example.com/notes/notes-installer@sha256:" + strings.Repeat("c", 64)),
+		"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com", "LEGACY": "new"})}))
+	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "pull failed") || len(h.fake.callsOf("rerun")) != 1 {
+		t.Fatalf("upgrade failure: %q %q", got, h.fake.ops())
+	}
+	if at := h.attrs(a.NewState); at["inputs"].IsNull() {
+		t.Fatalf("partial state %v", at)
+	} else {
+		var in map[string]tftypes.Value
+		if err := at["inputs"].As(&in); err != nil || len(in) != 2 {
+			t.Fatalf("partial inputs %v %v", in, err)
+		}
+	}
+
+	// A configuration leaving inputs out keeps them null in the partial state.
+	h, state = imported(recorded)
+	h.fake.set("describe", reply{stdout: describe2})
+	h.fake.set("upgrade", reply{exit: 1, stderr: "pull failed"})
+	a = h.update(state, h.dockerConfig(map[string]tftypes.Value{"installer": str("registry.example.com/notes/notes-installer@sha256:" + strings.Repeat("c", 64)),
+		"ports": tftypes.NewValue(tftypes.Map{ElementType: tftypes.Number}, map[string]tftypes.Value{"web": num(9090)})}))
+	if at := h.attrs(a.NewState); len(h.fake.callsOf("rerun")) != 1 || !at["inputs"].IsNull() {
+		t.Fatalf("partial without inputs: %q %v", h.fake.ops(), at["inputs"])
+	}
+
+	// A secret no release declares goes to the re-run.
+	h, state = imported(recorded)
+	a = h.update(state, cfg(h, map[string]tftypes.Value{"secret_inputs_wo": strMap(map[string]string{"SMTP_PASWORD": "x"}), "secret_inputs_wo_version": num(1)}))
+	if r := h.fake.callsOf("rerun"); errorsOf(a.Diagnostics) != "" || len(r) != 1 || untarAll(t, r[0].stdin)["answers"] != "SMTP_PASWORD: \"x\"\n" {
+		t.Fatalf("undeclared secret: %s %q", errorsOf(a.Diagnostics), h.fake.ops())
+	}
+
+	// No TLS mode recorded: the configuration's stands.
+	h, state = imported(strings.Replace(recorded, `,"tls":"none"`, "", 1))
+	if got := errorsOf(h.plan(state, cfg(h, map[string]tftypes.Value{"tls": str("acme"), "plan_dry_run": boolean(true)})).Diagnostics); strings.Contains(got, "serves loopback mode") {
+		t.Fatalf("tls: %q", got)
+	}
+}
+
+// Beside a release change the take-over's report names what the running release declares
+// alone; an install recording no installer leaves the change open; a secret the install records
+// is kept on the VM's upgrade too.
+func TestImportedTakeOverReportBesideARelease(t *testing.T) {
+	t.Parallel()
+	const recorded = `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1,"installer":"` + image + `"},"channel":"stable","previous":null,` +
+		`"inputs":["ADMIN_EMAIL"],"values":{"inputs":{"ADMIN_EMAIL":"a@example.com"},"tls":"none"}}`
+	for name, c := range map[string]struct{ status, want string }{
+		"recorded":     {recorded, "The release change the plan makes runs after it, as planned."},
+		"not recorded": {strings.Replace(recorded, `,"installer":"`+image+`"`, "", 1), "If the plan changes the release (the install records no installer to tell), that change runs after it."},
+	} {
+		h := newHarness(t, nil)
+		h.fake.set("status", reply{stdout: c.status})
+		state := h.importState("app.example:/srv/notes/notes-stow").ImportedResources[0].State
+		p := h.plan(state, h.dockerConfig(map[string]tftypes.Value{"installer": str("registry.example.com/notes/notes-installer@sha256:" + strings.Repeat("c", 64)),
+			"plan_dry_run": boolean(true), "inputs": strMap(map[string]string{"ADMIN_EMAIL": "b@example.com", "NEW_KEY": "k"})}))
+		w := warningsOf(p.Diagnostics)
+		if !strings.Contains(w, "what differs from what it records: input ADMIN_EMAIL.") || !strings.Contains(w, "The running release does not declare input NEW_KEY: the new release's upgrade gives what it declares, the re-run refuses the rest.") || !strings.Contains(w, c.want) {
+			t.Errorf("%s: %s %s", name, errorsOf(p.Diagnostics), w)
+		}
+	}
+
+	// vmSplit: a recorded secret the running release does not declare is kept on an upgrade.
+	var diags diag.Diagnostics
+	plan := installModel{Inputs: types.MapNull(types.StringType), Domains: types.MapNull(types.StringType), Ports: types.MapNull(types.Int64Type),
+		TLS: types.StringNull(), SecretInputsWOVersion: types.Int64Value(1)}
+	u := &update{plan: &plan, state: &plan, secrets: map[string]string{"OLD_KEY": "k", "NEW_TOKEN": "t"}, diags: &diags, adopted: &plan, recorded: []string{"OLD_KEY"}}
+	now, later := vmSplit(context.Background(), u, &installer.Describe{}, true)
+	if _, ok := later.SecretInputs["OLD_KEY"]; ok || now.SecretInputs["OLD_KEY"] != "" || later.SecretInputs["NEW_TOKEN"] != "t" {
+		t.Errorf("now %v later %v", now.SecretInputs, later.SecretInputs)
+	}
+}
+
+// The take-over's report when the new installer is read (no certain re-run): another release is an
+// upgrade after it; the release the install runs, no release change — though the install records
+// no installer. On the VM a domain of a route only the new release has waits for its upgrade.
+func TestImportedTakeOverReportReadsTheNewRelease(t *testing.T) {
+	t.Parallel()
+	const recorded = `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1},"channel":"stable","previous":null,` +
+		`"inputs":["ADMIN_EMAIL"],"values":{"inputs":{"ADMIN_EMAIL":"a@example.com"},"tls":"none"}}`
+	for name, c := range map[string]struct {
+		describe, want string
+	}{
+		"same release": {describe1, "The plan changes no release."},
+		"upgrade":      {describe2, "The release change the plan makes runs after it, as planned."},
+	} {
+		h := newHarness(t, nil)
+		h.fake.set("status", reply{stdout: recorded})
+		h.fake.set("describe", reply{stdout: c.describe})
+		state := h.importState("app.example:/srv/notes/notes-stow").ImportedResources[0].State
+		p := h.plan(state, h.dockerConfig(map[string]tftypes.Value{"plan_dry_run": boolean(true), "inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})}))
+		if w := warningsOf(p.Diagnostics); !strings.Contains(w, "its values match") || !strings.Contains(w, c.want) || len(h.fake.callsOf("fetch")) != 1 {
+			t.Errorf("%s: %s %s %q", name, errorsOf(p.Diagnostics), w, h.fake.ops())
+		}
+	}
+
+	var diags diag.Diagnostics
+	domains := types.MapValueMust(types.StringType, map[string]attr.Value{"web": types.StringValue("a.example.com"), "api": types.StringValue("b.example.com")})
+	plan := installModel{Inputs: types.MapNull(types.StringType), Domains: domains, Ports: types.MapNull(types.Int64Type), TLS: types.StringValue("acme")}
+	was := plan
+	was.Domains = types.MapValueMust(types.StringType, map[string]attr.Value{})
+	u := &update{plan: &plan, state: &was, diags: &diags, adopted: &was}
+	plan.Domains = types.MapValueMust(types.StringType, map[string]attr.Value{"web": types.StringValue("a.example.com"), "api": types.StringValue("b.example.com"), "db": types.StringValue("c.example.com")})
+	now, later := vmSplit(context.Background(), u, &installer.Describe{Routes: []installer.Route{{Name: "web"}}, L4Routes: []installer.L4Route{{Name: "db"}}}, true)
+	if now.Domains["web"] != "a.example.com" || now.Domains["db"] != "c.example.com" || now.Domains["api"] != "" || later.Domains["api"] != "b.example.com" {
+		t.Errorf("now %v later %v", now.Domains, later.Domains)
+	}
+}
+
+// The take-over's report names what the upgrade gives too, and says "differ" whenever anything
+// is given; a domain for a route only the new release has is refused beside the upgrade.
+func TestImportedTakeOverReportNamesTheUpgrade(t *testing.T) {
+	t.Parallel()
+	const recorded = `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1,"installer":"` + image + `"},"channel":"stable","previous":null,` +
+		`"inputs":["ADMIN_EMAIL"],"values":{"inputs":{"ADMIN_EMAIL":"a@example.com"},"tls":"acme","domains":{"web":"notes.example.com"}}}`
+	newer := "registry.example.com/notes/notes-installer@sha256:" + strings.Repeat("c", 64)
+	plan := func(extra map[string]tftypes.Value) (*harness, *tfprotov6.PlanResourceChangeResponse) {
+		h := newHarness(t, nil)
+		h.fake.set("status", reply{stdout: recorded})
+		h.fake.set("describe", reply{stdout: describe2})
+		state := h.importState("app.example:/srv/notes/notes-stow").ImportedResources[0].State
+		v := map[string]tftypes.Value{"installer": str(newer), "plan_dry_run": boolean(true), "tls": str("acme"),
+			"domains": strMap(map[string]string{"web": "notes.example.com"}), "inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com", "NEW_KEY": "k"})}
+		maps.Copy(v, extra)
+		return h, h.plan(state, h.dockerConfig(v))
+	}
+	_, p := plan(nil)
+	if w := warningsOf(p.Diagnostics); !strings.Contains(w, "its values differ") || !strings.Contains(w, "The upgrade gives what only the new release declares: input NEW_KEY.") {
+		t.Errorf("upgrade keys: %s %s", errorsOf(p.Diagnostics), w)
+	}
+	h, p := plan(map[string]tftypes.Value{"domains": strMap(map[string]string{"web": "notes.example.com", "api": "api.example.com"})})
+	if got := errorsOf(p.Diagnostics); !strings.Contains(got, "a domain added with a release change: domains.api names a route the running release does not have") ||
+		len(h.fake.callsOf("dry-upgrade")) != 0 {
+		t.Errorf("new route's domain: %q %q", got, h.fake.ops())
+	}
+
+	h = newHarness(t, nil)
+	h.fake.set("status", reply{stdout: recorded})
+	h.fake.set("describe", reply{stdout: describe2})
+	state := h.importState("app.example:/srv/notes/notes-stow").ImportedResources[0].State
+	a := h.update(state, h.dockerConfig(map[string]tftypes.Value{"installer": str(newer), "tls": str("acme"),
+		"domains": strMap(map[string]string{"web": "notes.example.com", "api": "api.example.com"})}))
+	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "a domain added with a release change") || len(h.fake.callsOf("rerun")) != 0 || len(h.fake.callsOf("upgrade")) != 0 {
+		t.Errorf("apply, new route's domain: %q %q", got, h.fake.ops())
+	}
+
+	// Only what the running release does not declare, the fetch skipped: still "differ".
+	var diags diag.Diagnostics
+	u := &update{adopted: &installModel{}}
+	adoptionReport(&diags, u, installer.Change{Inputs: map[string]string{"NEW_KEY": "k"}}, installer.Change{}, releaseChanges, &installer.Describe{}, true)
+	if len(diags) != 1 || diags[0].Summary() != "Taking over the install: its values differ" {
+		t.Errorf("undeclared alone: %v", diags)
 	}
 }

@@ -972,6 +972,7 @@ type vmPrep struct {
 	step       releaseStep
 	u          *update
 	now, later installer.Change
+	running    *installer.Describe // the VM's installer, describe --json
 }
 
 // vmPrepare reads the VM and decides the update's step as the apply does, with every refusal it
@@ -987,7 +988,7 @@ func (r *installResource) vmPrepare(ctx context.Context, plan, state *installMod
 		diags.AddError("Cannot reach the VM", err.Error())
 		return nil
 	}
-	st, err := v.Status(ctx)
+	st, err := v.StatusOf(ctx, imported(state))
 	if err != nil {
 		addInstallerError(diags, "Reading the VM", renamed(ctx, v, err))
 		return nil
@@ -1002,10 +1003,17 @@ func (r *installResource) vmPrepare(ctx context.Context, plan, state *installMod
 		return nil
 	}
 	step := vmStep(plan, state, st, diags)
+	if step == rollback && imported(state) {
+		importedRollback(diags, path.Root("vm").AtName("version"), "vm.version", st.Installed.Version+", the release it runs", "previous.version")
+	}
 	if diags.HasError() {
 		return nil
 	}
 	u := &update{r: r, plan: plan, state: state, secrets: secrets, diags: diags}
+	u.adopt(ctx, &st.Status)
+	if diags.HasError() {
+		return nil
+	}
 	now, later := vmSplit(ctx, u, running, step == upgrade)
 	refuseSecretInputs(diags, stringMap(ctx, plan.Inputs, diags), running)
 	if diags.HasError() {
@@ -1030,7 +1038,7 @@ func (r *installResource) vmPrepare(ctx context.Context, plan, state *installMod
 			fmt.Sprintf("Its status has no events (%s), so the health gate's verdict on the release change's reboot could not be read: nothing was run. Read `<short>-stow status` on the VM.", cmp.Or(st.EventsError, "no events_error either")))
 		return nil
 	}
-	return &vmPrep{conn: conn, v: v, st: st, step: step, u: u, now: now, later: later}
+	return &vmPrep{conn: conn, v: v, st: st, step: step, u: u, now: now, later: later, running: running}
 }
 
 // vmStep is the release step an update of a VM makes from st, its status (installed): an error in
@@ -1139,7 +1147,7 @@ func planConn(s, p *vmModel) vmModel {
 // domain of a route state does not record; everything else goes now, where the installer
 // refuses what it does not take.
 func vmSplit(ctx context.Context, u *update, running *installer.Describe, upgrading bool) (now, later installer.Change) {
-	plan, state := u.plan, u.state
+	plan, state := u.plan, u.was()
 	now = installer.Change{Inputs: map[string]string{}, SecretInputs: map[string]string{}, Domains: map[string]string{}, Ports: map[string]string{}}
 	later = installer.Change{Inputs: map[string]string{}, SecretInputs: map[string]string{}, Domains: map[string]string{}, Ports: map[string]string{}}
 	was := stringMap(ctx, state.Inputs, u.diags)
@@ -1167,8 +1175,12 @@ func vmSplit(ctx context.Context, u *update, running *installer.Describe, upgrad
 	}
 	for k, v := range u.secrets {
 		switch {
+		case u.adopted != nil && slices.Contains(u.recorded, k):
+			// Taken over: a secret the install records is kept, not compared.
 		case upgrading && !running.Declares(k):
 			later.SecretInputs[k] = v
+		case u.adopted != nil:
+			now.SecretInputs[k] = v // one the install does not record yet
 		case bump:
 			now.SecretInputs[k] = v
 		}
@@ -1191,7 +1203,9 @@ func vmSplit(ctx context.Context, u *update, running *installer.Describe, upgrad
 			old, ok := oldV[k]
 			switch {
 			case ok && old == v:
-			case upgrading && !ok && !imported(state):
+			// A key state never held goes after the upgrade; an imported state's, when the
+			// install records its values (adopted), only for a route the running release lacks.
+			case upgrading && !ok && (u.adopted != nil && !running.HasRoute(k) && !hasL4Route(running, k) || u.adopted == nil && !imported(state)):
 				c.later[k] = v
 			default:
 				c.now[k] = v

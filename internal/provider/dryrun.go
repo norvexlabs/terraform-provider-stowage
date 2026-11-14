@@ -30,7 +30,7 @@ const planDryRunTimeout = 10 * time.Minute
 // installer is fetched and extracted into, removed afterwards (its image stays in the daemon's
 // store, as any fetch's), and the install's lock while the dry run reads it.
 func (r *installResource) planDryRun(ctx context.Context, req resource.ModifyPlanRequest, plan, state *installModel, diags *diag.Diagnostics) {
-	if !plan.PlanDryRun.ValueBool() || imported(state) || r.data == nil || diags.HasError() {
+	if !plan.PlanDryRun.ValueBool() || r.data == nil || diags.HasError() {
 		return
 	}
 	var secretsWO types.Map
@@ -55,7 +55,7 @@ func (r *installResource) planDryRun(ctx context.Context, req resource.ModifyPla
 // release's `k8s upgrade --dry-run` given what its upgrade would be, or `k8s rollback --dry-run`.
 // A plan that also re-runs the running release is not dry-run, with a warning.
 func (r *installResource) k8sPlanDryRun(ctx context.Context, plan, state *installModel, secretsWO types.Map, configKnown bool, diags *diag.Diagnostics) {
-	if plan.Installer.Equal(state.Installer) {
+	if plan.Installer.Equal(state.Installer) && !imported(state) {
 		return
 	}
 	if !configKnown || (r.data.Kubernetes != nil && !connKnown(r.data.Kubernetes)) || !r.data.SettingsKnown {
@@ -69,6 +69,9 @@ func (r *installResource) k8sPlanDryRun(ctx context.Context, plan, state *instal
 		return
 	}
 	defer p.run.close()
+	if imported(state) {
+		adoptionReport(diags, p.u, p.rerun, p.up, releaseChangeOf(p.step != stay || plan.Installer.ValueString() != p.runningRef), p.running, p.next == nil && p.step == stay)
+	}
 	// One order on every target: stay, rollback (its prepare refused one beside a re-run), a
 	// re-run beside the upgrade, the upgrade.
 	switch {
@@ -92,7 +95,7 @@ func (r *installResource) k8sPlanDryRun(ctx context.Context, plan, state *instal
 // every check the host daemon runs before its job, no reboot. A plan that also re-runs the running
 // release is not dry-run, with a warning.
 func (r *installResource) vmPlanDryRun(ctx context.Context, plan, state *installModel, secretsWO types.Map, configKnown bool, diags *diag.Diagnostics) {
-	if plan.VM.Version.Equal(state.VM.Version) {
+	if plan.VM.Version.Equal(state.VM.Version) && !imported(state) {
 		return
 	}
 	// The VM's dry run reads only the vm block's connection over SSH (r.vm: no provider setting
@@ -106,6 +109,9 @@ func (r *installResource) vmPlanDryRun(ctx context.Context, plan, state *install
 	p := r.vmPrepare(ctx, plan, state, stringMap(ctx, secretsWO, diags), diags)
 	if p == nil {
 		return
+	}
+	if imported(state) {
+		adoptionReport(diags, p.u, p.now, p.later, releaseChangeOf(p.step != stay), p.running, false)
 	}
 	if p.step != stay && !known(state.VM.HostKeyLine) {
 		diags.AddWarning("The VM's own host key is not known yet",
@@ -143,7 +149,7 @@ func vmDryRunFailed(diags *diag.Diagnostics, summary string, err error) {
 
 // dockerPlanDryRun is planDryRun on a Docker target.
 func (r *installResource) dockerPlanDryRun(ctx context.Context, plan, state *installModel, secretsWO types.Map, configKnown bool, diags *diag.Diagnostics) {
-	if plan.Installer.Equal(state.Installer) {
+	if plan.Installer.Equal(state.Installer) && !imported(state) {
 		return
 	}
 	if !configKnown || !r.data.SettingsKnown {
@@ -158,9 +164,14 @@ func (r *installResource) dockerPlanDryRun(ctx context.Context, plan, state *ins
 		return
 	}
 	if !strings.HasPrefix(d.WorkDir, "/") {
-		return // a home never resolved: the apply resolves nothing more, and names the install ./<name>
+		// A home never resolved: the apply resolves nothing more, and names the install ./<name>.
+		if imported(state) {
+			diags.AddWarning("Taking over the install: its values are not read at plan",
+				"Its work_dir is the SSH user's home, which the apply resolves: the apply compares the configuration with what the install records.")
+		}
+		return
 	}
-	st, err := d.Status(ctx)
+	st, err := d.StatusOf(ctx, imported(state))
 	if err != nil || st == nil {
 		if err != nil {
 			addInstallerError(diags, "The plan's dry run: reading the install", err)
@@ -187,6 +198,9 @@ func (r *installResource) dockerPlanDryRun(ctx context.Context, plan, state *ins
 	u := &update{r: r, plan: plan, state: state, secrets: secrets, diags: diags}
 	if !u.keptChecks(d, st, running) {
 		return // the apply's own errors, at plan
+	}
+	if u.adopt(ctx, st); diags.HasError() {
+		return
 	}
 	// The step as the apply chooses it (releaseStep). The new installer, when it must be read, is
 	// fetched into a plan's directory — but for a plan that re-runs the running release too, which
@@ -220,9 +234,6 @@ func (r *installResource) dockerPlanDryRun(ctx context.Context, plan, state *ins
 	if diags.HasError() {
 		return
 	}
-	if step == stay {
-		return
-	}
 	// As the apply: the inputs checked (next nil for a rollback), then a rollback goes alone and
 	// an upgrade beside a re-run is not dry-run.
 	rerun, up := u.split(ctx, running, next)
@@ -231,7 +242,32 @@ func (r *installResource) dockerPlanDryRun(ctx context.Context, plan, state *ins
 	if d.Local() {
 		refuseRunEnvInputs(diags, nil, "", given, secrets)
 	}
+	if step == rollback && imported(state) {
+		importedRollback(diags, path.Root("installer"), "installer", installerRuns(st), "previous.installer") // as the apply
+	}
+	// The step is the release change, but when the re-run skipped the fetch (step stay, nothing
+	// fetched): then the installer the install records tells it, and none recorded leaves it open.
+	change := noReleaseChange
+	switch {
+	case step != stay:
+		change = releaseChanges
+	case dir != "":
+	case st.Installed == nil || st.Installed.Installer == "":
+		change = releaseMayChange
+	case plan.Installer.ValueString() != st.Installed.Installer:
+		change = releaseChanges
+	}
+	guessed := next == nil && step == stay && dir == ""
+	if imported(state) && step != rollback && change == releaseChanges {
+		refuseNewRouteDomains(diags, rerun, running) // as the apply
+	}
 	if diags.HasError() {
+		return
+	}
+	if imported(state) {
+		adoptionReport(diags, u, rerun, up, change, running, guessed)
+	}
+	if step == stay {
 		return
 	}
 	if step == rollback {

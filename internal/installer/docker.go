@@ -664,7 +664,20 @@ func (d Docker) Install(ctx context.Context, in Install) (*Result, error) {
 // Status runs the kept installer's `status --json`; nil without an install directory, or when
 // the installer refuses it as holding no install (absent).
 func (d Docker) Status(ctx context.Context) (*Status, error) {
-	stdout, stderr, exit, err := d.stow(ctx, nil, true, "status", "--json")
+	return d.StatusOf(ctx, false)
+}
+
+// StatusOf is Status, with the recorded values (`--values`) when values is set: Values nil
+// from an installer made before Stowage 0.38.0, which refuses the flag (read again without it).
+func (d Docker) StatusOf(ctx context.Context, values bool) (*Status, error) {
+	args := []string{"status", "--json"}
+	if values {
+		args = append(args, "--values")
+	}
+	stdout, stderr, exit, err := d.stow(ctx, nil, true, args...)
+	if err == nil && values && noValuesFlag(stderr, exit) {
+		return d.StatusOf(ctx, false)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("status: %w", err)
 	}

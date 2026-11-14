@@ -102,8 +102,8 @@ argument.
   (`The dry run covers the upgrade alone`); when state has no VM's own key, a warning says the apply
   reads it first and refuses the change when it cannot. While any value of the configuration (but `deletion_protection`, `delete_data` and `timeouts`)
   is not known, no dry run, with a warning (`No dry run of this plan yet`): OpenTofu plans again at
-  apply, with it known, and that plan runs it (a dry run runs again there in any case). Skipped for
-  an imported state never applied.
+  apply, with it known, and that plan runs it (a dry run runs again there in any case). On an
+  imported state never applied it runs too, and says what the take-over changes (see Import).
 - **Update**: a change of the provider's own settings alone is saved without touching the VM.
   Otherwise, in this order:
   1. `status --json` (no release installed is an error; no `<short>-stow` on the VM is the Read
@@ -179,6 +179,9 @@ argument.
      refresh reading the one the VM runs.
 - **Import**: `tofu import stowage_install.x 'vm:<host>/<short>-stow'` (`ls /usr/sbin/*-stow`
   on the VM); give `vm.known_hosts_line` the VM's own key. State records `vm.host`,
-  `vm.short_name` and `deletion_protection = true`; the first apply runs the update above with
-  every configured input, as on Docker.
+  `vm.short_name` and `deletion_protection = true`; the first apply compares the configuration
+  with the install's recorded values as on Docker (the VM's `status --json --values`: its OS
+  needs Stowage 0.38.0 or later, else every configured input is given), then runs the update
+  above. A rollback of an imported install (`vm.version` set to `previous.version`) is refused (`a
+  rollback of an imported install`: apply first with the version it runs).
 - **Delete**: refused while `deletion_protection`; else nothing runs: the resource is forgotten. `delete_data = true` is refused at validation (`delete_data is not the VM's`).

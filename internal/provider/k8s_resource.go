@@ -922,7 +922,7 @@ func (r *installResource) k8sPrepare(ctx context.Context, plan, state *installMo
 		addInstallerError(diags, "Fetching the installer", err)
 		return nil
 	}
-	st, err := cur.Status(ctx)
+	st, err := cur.StatusOf(ctx, imported(state))
 	if err != nil {
 		addInstallerError(diags, "Reading the release", err)
 		return nil
@@ -979,6 +979,9 @@ func (r *installResource) k8sPrepare(ctx context.Context, plan, state *installMo
 		return nil
 	}
 	u := &update{r: r, plan: plan, state: state, secrets: secrets, diags: diags}
+	if u.adopt(ctx, st); diags.HasError() {
+		return nil
+	}
 	step, next, nextK := r.k8sReleaseStep(ctx, run, u, st, runningRef, running, dry)
 	if diags.HasError() {
 		return nil
@@ -991,8 +994,7 @@ func (r *installResource) k8sPrepare(ctx context.Context, plan, state *installMo
 	}
 	switch {
 	case step == rollback && imported(state):
-		diags.AddAttributeError(path.Root("installer"), "a rollback of an imported install",
-			fmt.Sprintf("An imported release is taken over first: apply with installer = %s, the release it runs, then set installer back to previous.installer.", runningRef))
+		importedRollback(diags, path.Root("installer"), "installer", runningRef+", the release it runs", "previous.installer")
 		return nil
 	case step == rollback && !rerun.Empty():
 		rollbackAlone(diags, "inputs or secret inputs")
