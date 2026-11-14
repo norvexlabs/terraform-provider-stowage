@@ -89,9 +89,9 @@ request.
 
 ## Release
 
-Held: a release is cut only when the maintainer decides to publish (held since 2026-11-11). The
-procedure, for then:
-
+A release is cut only when the maintainer decides to publish (0.1.0, 2026-11-12, is the last).
+The OpenTofu registry indexes a release once its repository is submitted there, by hand; until
+then a release's zips are installed as [the guide](docs/guides/install-without-registry.md) says.
 
 For maintainers. Only a pushed `v*` tag releases (`.github/workflows/release.yml`); a push to
 `main` never does.
