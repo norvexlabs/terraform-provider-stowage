@@ -140,11 +140,11 @@ repository secrets, so a workflow run on a branch cannot read them.
 The release key: fingerprint `686D3351040F9F4463D9D3AC0C705E9BAA4F4981`, RSA 4096, `Norvex Labs
 <norvexlabs@gmail.com>`. Its public key is in this repository,
 [`keys/norvexlabs-gpg-public.asc`](keys/norvexlabs-gpg-public.asc), and is the one the registries
-are given. To check a release by hand:
+are given. To check a release by hand (each step runs only once the one before succeeded, and
+says why it fails: one key in the file, the release key; the signature by it alone, never your
+keyring's keys; the checksums):
 
 ```bash
-# each step only once the one before succeeded: one key in the file, the release key; the
-# signature by it alone (never your keyring's keys); the checksums
 { [ "$(gpg --show-keys --with-colons keys/norvexlabs-gpg-public.asc | awk -F: '$1=="pub"{n++} $1=="fpr"&&!f{f=$10} END{print n, f}')" = \
     "1 686D3351040F9F4463D9D3AC0C705E9BAA4F4981" ] || { echo "the key file is not the release key alone" >&2; false; }; } &&
 gpg --dearmor <keys/norvexlabs-gpg-public.asc >release-key.gpg &&

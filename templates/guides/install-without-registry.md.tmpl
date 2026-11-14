@@ -19,19 +19,20 @@ Each [release](https://github.com/norvexlabs/terraform-provider-stowage/releases
 (fingerprint `686D3351040F9F4463D9D3AC0C705E9BAA4F4981`, its public half the repository's
 `keys/norvexlabs-gpg-public.asc`). Check that the key file holds that key alone, the signature
 against it alone (`gpgv`, never the keys of your own keyring), and the zip's checksum, then copy
-the zip unopened into the mirror's directory for the provider:
+the zip unopened into the mirror's directory for the provider (`platform` as the release's zips name it:
+`linux_amd64`, `darwin_arm64`, `windows_amd64`, …; on macOS, `shasum -a 256 --check` for
+`sha256sum --check`). Each step runs only once the one before succeeded, and a step that fails
+says why: a download, the key file holding one key that is not the release key, the signature,
+the checksum. The block has no comment, so it pastes into any shell, zsh without
+`interactive_comments` included:
 
 ```bash
-# Each step runs only once the one before succeeded, each saying why it failed: the downloads; the
-# key file holding one key, the release key; the signature by it (gpgv, never your keyring's
-# keys); the zip's checksum, the signed one (on macOS, shasum -a 256 --check for sha256sum --check).
-# platform: linux_amd64, darwin_arm64, windows_amd64, … as the release's zips name it.
 v=0.1.0 platform=linux_amd64
 base=https://github.com/norvexlabs/terraform-provider-stowage/releases/download/v$v
-curl --fail-early -fLO "$base/terraform-provider-stowage_${v}_${platform}.zip" \
-     -fLO "$base/terraform-provider-stowage_${v}_SHA256SUMS" \
-     -fLO "$base/terraform-provider-stowage_${v}_SHA256SUMS.sig" \
-     -fLO "https://raw.githubusercontent.com/norvexlabs/terraform-provider-stowage/v$v/keys/norvexlabs-gpg-public.asc" &&
+curl -fLO "$base/terraform-provider-stowage_${v}_${platform}.zip" &&
+curl -fLO "$base/terraform-provider-stowage_${v}_SHA256SUMS" &&
+curl -fLO "$base/terraform-provider-stowage_${v}_SHA256SUMS.sig" &&
+curl -fLO "https://raw.githubusercontent.com/norvexlabs/terraform-provider-stowage/v$v/keys/norvexlabs-gpg-public.asc" &&
 { [ "$(gpg --show-keys --with-colons norvexlabs-gpg-public.asc | awk -F: '$1=="pub"{n++} $1=="fpr"&&!f{f=$10} END{print n, f}')" = \
     "1 686D3351040F9F4463D9D3AC0C705E9BAA4F4981" ] || { echo "norvexlabs-gpg-public.asc is not the release key alone" >&2; false; }; } &&
 gpg --dearmor <norvexlabs-gpg-public.asc >release-key.gpg &&
