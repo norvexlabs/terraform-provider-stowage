@@ -60,17 +60,19 @@ another name reaches the installer unchanged. Over ssh no environment is carried
   remote state (no `known_hosts_line` yet) is not read: the configuration's connection reads it at
   the first apply.
   A read ssh fails (exit 255) is an error, and the install stays in state whatever ssh met:
-  nothing a read sees tells a host gone for good from one down for a while. ssh's message picks
-  the summary and the way on: `Permission denied` — `ssh's login to the Docker host <host> was
-  refused` (check `docker.user` and `docker.private_key_file`, or the agent's keys); `Host key
-  verification failed` or a changed identification — `The Docker host <host> serves another host
-  key` (the new key, checked on its console, in `docker.known_hosts_line`, then `tofu state rm` and
-  `tofu import` again as `<host>:<work_dir>/<name>/<short>-stow`: a read accepts the key state
-  holds alone); anything else — `Cannot reach the Docker host <host> to read the install` (plan
-  again once it answers). Each detail ends on the ways common to all: only once the host is known
-  to be gone, `tofu state rm` (nothing runs on the target, the next apply installs again, and
-  state's record of the install — its previous release, its inputs — is lost); one plan without
-  the read, `tofu plan -refresh=false`.
+  nothing a read sees tells a host gone for good from one down for a while. A read connects as
+  state holds the connection; ssh's message picks the summary and the way on: its refusal of the
+  login (`… : Permission denied (…)`) — `ssh's login to the Docker host <host> was refused` (the
+  right `docker.user` and `docker.private_key_file`, or the agent's key, then `tofu apply
+  -refresh=false`, which saves a change of the connection alone without running anything on the
+  target); `Host key verification failed` or a changed identification — `The Docker host <host>
+  serves another host key` (the new key, checked on its console, in `docker.known_hosts_line`, then
+  `tofu apply -refresh=false` the same way); anything else, a local key file ssh cannot read
+  included — `Cannot reach the Docker host <host> to read the install` (plan again once it
+  answers). Each detail ends on the ways common to all: only once the host is known to be gone,
+  `tofu state rm` (nothing runs on the target, the next apply installs again, and state's record
+  of the install — its previous release, its inputs — is lost); one plan without the read, `tofu
+  plan -refresh=false`.
 - **Update**: a change of the provider's own settings alone (the connection,
   `deletion_protection`, `delete_data`, `allow_rollback`, `timeouts`) is saved without touching
   the target. Any other change, in this order:

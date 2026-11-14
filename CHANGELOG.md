@@ -16,20 +16,19 @@ change before 1.0, each change named here.
   Docker's`): their plans run nothing on the target, so the setting checked nothing.
 - `delete_data = true` with a `vm` block is refused at validation (`delete_data is not the VM's`): a
   VM's destroy forgets the install and deletes nothing, its data going with the VM.
-
 - A read of a Docker host or VM that ssh fails (exit 255) is an error naming what ssh met and the
-  way on: `ssh's login to … was refused` (the connection's user and key), `… serves another host
-  key` (the new key pinned, then a new import), else `Cannot reach … to read the install` (plan
-  again once it answers); each names `tofu state rm` for a target known to be gone and
-  `-refresh=false` for one plan. The install stays in state, as a host down for a while is not
-  told from one gone.
-- The install guide checks a release's signature against the release key alone (`gpgv`), the key file
-  first checked to hold that key and no other.
+  way on: `ssh's login to … was refused` (the right user and key file, then `tofu apply
+  -refresh=false`, which saves a change of the connection alone), `… serves another host key` (on
+  Docker the new key the same way; on a VM a new install, or the new key and a new import), else
+  `Cannot reach … to read the install` (plan again once it answers); each names `tofu state rm`
+  for a target known to be gone and `-refresh=false` for one plan. The install stays in state, as
+  a host down for a while is not told from one gone.
 
 ### Documentation
 
 - Installing a GitHub release's signed zip into OpenTofu's local mirror, on any platform it is
-  built for; the quick starts take any 0.x release (`~> 0.1`).
+  built for, its signature checked against the release key alone (`gpgv`, the key file first
+  checked to hold that key and no other); the quick starts take any 0.x release (`~> 0.1`).
 
 ## [0.1.0] - 2026-11-12
 

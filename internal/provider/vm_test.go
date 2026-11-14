@@ -359,6 +359,11 @@ func TestVMCreate(t *testing.T) {
 		!strings.Contains(got, "`vm:192.0.2.7/notes-stow`") || !strings.Contains(got, "VM made again from its seed") || !strings.Contains(got, "vm.known_hosts_line") {
 		t.Errorf("a VM serving another key: %q", got)
 	}
+	f.set("status", reply{exit: 255, stderr: "ops@192.0.2.7: Permission denied (publickey)."})
+	if got := errorsOf(h.read(state).Diagnostics); !strings.Contains(got, "ssh's login to the VM 192.0.2.7 was refused") ||
+		!strings.Contains(got, "vm.user and vm.private_key_file") || strings.Contains(got, "docker.") || strings.Contains(got, "made again") {
+		t.Errorf("a VM refusing the login: %q", got)
+	}
 	f.set("status", reply{exit: 1, stderr: "status: the daemon is down"})
 	if got := errorsOf(h.read(state).Diagnostics); strings.Contains(got, "Cannot reach") {
 		t.Errorf("a failed status taken for an unreachable VM: %q", got)

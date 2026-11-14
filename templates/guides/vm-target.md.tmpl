@@ -75,11 +75,13 @@ argument.
   plan proposes the upgrade again; `inputs` are dropped as on Docker. An imported state (no
   `known_hosts_line` yet) is not read.
   A read ssh fails (exit 255) is an error and the install stays in state, as on Docker, with the
-  same summaries (`ssh's login to the VM <host> was refused`: `vm.user`, `vm.private_key_file`;
-  `The VM <host> serves another host key`; `Cannot reach the VM <host> to read the install`) and
-  ways on; another host key adds that a VM made again from its seed is a new install (`tofu state
-  rm`, then the next apply installs it under the seed's key), a changed key being given in
-  `vm.known_hosts_line` and imported again as `vm:<host>/<short>-stow`.
+  same summaries (`ssh's login to the VM <host> was refused`: `vm.user`, `vm.private_key_file`,
+  then `tofu apply -refresh=false`; `The VM <host> serves another host key`; `Cannot reach the VM
+  <host> to read the install`) and common ways on. Another host key differs: a read accepts the
+  VM's own key state holds (`vm.host_key_line`) alone, so a VM made again from its seed is a new
+  install (`tofu state rm`, then the next apply installs it under the seed's key), and a VM whose
+  key changed is given it in `vm.known_hosts_line` and imported again (`tofu state rm`, then `tofu
+  import` its ID, `vm:<host>/<short>-stow`).
 - **Update**: a change of the provider's own settings alone is saved without touching the VM.
   Otherwise, in this order:
   1. `status --json` (no release installed is an error; no `<short>-stow` on the VM is the Read

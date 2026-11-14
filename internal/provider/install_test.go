@@ -339,21 +339,29 @@ func TestReadFollowsTheTarget(t *testing.T) {
 	if h.attrs(r.NewState) == nil {
 		t.Fatal("an unreachable host's install is forgotten")
 	}
-	// ssh's message picks the way on: a refused login, another host key.
-	for stderr, want := range map[string][]string{
-		"ops@app.example: Permission denied (publickey).": {"ssh's login to the Docker host app.example was refused", "docker.user and docker.private_key_file"},
-		"Host key verification failed.":                   {"The Docker host app.example serves another host key", "docker.known_hosts_line", "`app.example:/srv/notes/notes-stow`"},
+	// ssh's message picks the way on, and that one alone: a refused login, another host key, else
+	// no connection (a local key file ssh cannot read is not a refused login).
+	login, key, none := "ssh's login to the Docker host app.example was refused", "The Docker host app.example serves another host key", "Cannot reach the Docker host app.example"
+	for stderr, c := range map[string]struct{ want, not []string }{
+		"ops@app.example: Permission denied (publickey).": {[]string{login, "docker.user and docker.private_key_file", "tofu apply -refresh=false"}, []string{key, none, "known_hosts_line"}},
+		"Host key verification failed.":                   {[]string{key, "docker.known_hosts_line", "tofu apply -refresh=false"}, []string{login, none, "docker.user"}},
+		`Load key "/keys/ops": Permission denied`:         {[]string{none}, []string{login, key, "docker.user", "known_hosts_line"}},
 	} {
 		h.fake.replies["status"] = reply{exit: 255, stderr: stderr}
 		r := h.read(state)
 		got := errorsOf(r.Diagnostics)
-		for _, w := range append(want, "tofu state rm", "-refresh=false") {
+		for _, w := range append(c.want, "tofu state rm", "-refresh=false") {
 			if !strings.Contains(got, w) {
 				t.Errorf("%s: no %q in %q", stderr, w, got)
 			}
 		}
-		if strings.Contains(got, "Cannot reach") || h.attrs(r.NewState) == nil {
-			t.Errorf("%s: %q, state %v", stderr, got, h.attrs(r.NewState))
+		for _, w := range c.not {
+			if strings.Contains(got, w) {
+				t.Errorf("%s: %q in %q", stderr, w, got)
+			}
+		}
+		if h.attrs(r.NewState) == nil {
+			t.Errorf("%s: the install is forgotten", stderr)
 		}
 	}
 	h.fake.replies["status"] = reply{exit: 100, stderr: "the installer's own exit 100"}
@@ -423,6 +431,24 @@ func TestUpdate(t *testing.T) {
 	}
 	if asString(t, h.attrs(a.NewState)["version"]) != "1.2.0" {
 		t.Fatal("the computed values were lost")
+	}
+	// So does the connection: a new key, user and key file are saved without a call (the way on
+	// that a read refused by ssh names, with -refresh=false).
+	newLine := "app.example ssh-ed25519 " + ownKey
+	config = h.dockerConfig(map[string]tftypes.Value{"docker": h.block("docker", map[string]tftypes.Value{
+		"host": str("app.example"), "user": str("deploy"), "known_hosts_line": str(newLine), "work_dir": str("/srv"), "private_key_file": str("/keys/deploy")})})
+	p = h.plan(state, config)
+	a = h.apply(state, p.PlannedState, config)
+	if d := errorsOf(a.Diagnostics); d != "" {
+		t.Fatal(d)
+	}
+	if len(h.fake.calls) != calls {
+		t.Fatalf("the target was called on a connection change: %q", h.fake.ops()[calls:])
+	}
+	conn := map[string]tftypes.Value{}
+	if err := h.attrs(a.NewState)["docker"].As(&conn); err != nil || asString(t, conn["known_hosts_line"]) != newLine ||
+		asString(t, conn["user"]) != "deploy" || asString(t, conn["private_key_file"]) != "/keys/deploy" {
+		t.Fatalf("the connection in state: %v %v", conn, err)
 	}
 
 	// A new release plans its version unknown.

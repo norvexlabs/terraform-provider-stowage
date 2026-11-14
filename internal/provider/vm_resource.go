@@ -818,9 +818,10 @@ func (r *installResource) readVM(ctx context.Context, m *installModel, resp *res
 	st, err := v.Status(ctx)
 	if err != nil {
 		if sshFailed(err) {
-			host := m.VM.Host.ValueString()
-			unreachable(&resp.Diagnostics, "VM", "vm", host, "vm:"+host+"/"+m.VM.ShortName.ValueString()+"-stow",
-				"A VM made again from its seed is a new install: `tofu state rm` this resource, and the next apply installs it under the seed's key. ", err)
+			unreachable(&resp.Diagnostics, "VM", "vm", m.VM.Host.ValueString(),
+				"A read accepts the VM's own key state holds (vm.host_key_line) alone. A VM made again from its seed is a new install: `tofu state rm` this resource, "+
+					"and the next apply installs it under the seed's key. A VM whose key changed: check the new key on its console, give it in vm.known_hosts_line, "+
+					"then `tofu state rm` this resource and `tofu import` it again (`"+m.ID.ValueString()+"`).", err)
 			return
 		}
 		addInstallerError(&resp.Diagnostics, "Reading the VM", renamed(ctx, v, err))

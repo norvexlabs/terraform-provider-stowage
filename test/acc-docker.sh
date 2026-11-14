@@ -269,7 +269,7 @@ apply_fails() {
 	local log=$WORK/$1.log re
 	shift
 	if tf apply -auto-approve -input=false >"$log" 2>&1; then cat "$log"; fail "$(basename "$log" .log): the apply succeeded"; fi
-	for re in "$@"; do tr -s ' \n' ' ' <"$log" | grep -qE -- "$re" || { cat "$log"; fail "$(basename "$log" .log): no /$re/ in the error"; }; done
+	for re in "$@"; do tr -s ' \n' ' ' <"$log" | grep -E -- "$re" >/dev/null || { cat "$log"; fail "$(basename "$log" .log): no /$re/ in the error"; }; done
 }
 # state <jq filter>: true when the filter holds on the resource's state.
 state() {
