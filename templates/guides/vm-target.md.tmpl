@@ -74,11 +74,12 @@ argument.
   `vm.version` in state, so a VM whose health gate fell back shows its real release and the next
   plan proposes the upgrade again; `inputs` are dropped as on Docker. An imported state (no
   `known_hosts_line` yet) is not read.
-  A VM ssh does not reach (exit 255) is an error, `Cannot reach the VM <host> to read the
-  install`, and the install stays in state, as on Docker; its detail names the same ways on (a VM
-  deleted or made again outside OpenTofu: `tofu state rm`, the next apply installing the new VM
-  from its seed; a changed key: the new key in `vm.known_hosts_line`, then `tofu state rm` and
-  `tofu import` `vm:<host>/<short>-stow`; `tofu plan -refresh=false` for one plan).
+  A read ssh fails (exit 255) is an error and the install stays in state, as on Docker, with the
+  same summaries (`ssh's login to the VM <host> was refused`: `vm.user`, `vm.private_key_file`;
+  `The VM <host> serves another host key`; `Cannot reach the VM <host> to read the install`) and
+  ways on; another host key adds that a VM made again from its seed is a new install (`tofu state
+  rm`, then the next apply installs it under the seed's key), a changed key being given in
+  `vm.known_hosts_line` and imported again as `vm:<host>/<short>-stow`.
 - **Update**: a change of the provider's own settings alone is saved without touching the VM.
   Otherwise, in this order:
   1. `status --json` (no release installed is an error; no `<short>-stow` on the VM is the Read

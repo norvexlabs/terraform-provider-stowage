@@ -354,6 +354,11 @@ func TestVMCreate(t *testing.T) {
 	if h.attrs(r.NewState) == nil {
 		t.Error("an unreachable VM is forgotten")
 	}
+	f.set("status", reply{exit: 255, stderr: "@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@\nHost key verification failed."})
+	if got := errorsOf(h.read(state).Diagnostics); !strings.Contains(got, "The VM 192.0.2.7 serves another host key") ||
+		!strings.Contains(got, "`vm:192.0.2.7/notes-stow`") || !strings.Contains(got, "VM made again from its seed") || !strings.Contains(got, "vm.known_hosts_line") {
+		t.Errorf("a VM serving another key: %q", got)
+	}
 	f.set("status", reply{exit: 1, stderr: "status: the daemon is down"})
 	if got := errorsOf(h.read(state).Diagnostics); strings.Contains(got, "Cannot reach") {
 		t.Errorf("a failed status taken for an unreachable VM: %q", got)

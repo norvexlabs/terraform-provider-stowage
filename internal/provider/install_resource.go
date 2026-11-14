@@ -906,9 +906,8 @@ func (r *installResource) Read(ctx context.Context, req resource.ReadRequest, re
 	st, err := d.Status(ctx)
 	if err != nil {
 		if known(m.Docker.Host) && sshFailed(err) {
-			unreachable(&resp.Diagnostics, "Docker host", m.Docker.Host.ValueString(),
-				"check the new key on the host's console and give it in docker.known_hosts_line, then `tofu state rm` this resource and `tofu import` it again ("+
-					"`<host>:<work_dir>/<name>/<short>-stow`): a read accepts the key state holds alone.", err)
+			host := m.Docker.Host.ValueString()
+			unreachable(&resp.Diagnostics, "Docker host", "docker", host, host+":"+m.ID.ValueString()+"/"+m.ShortName.ValueString()+"-stow", "", err)
 			return
 		}
 		addInstallerError(&resp.Diagnostics, "Reading the install", err)
@@ -924,17 +923,32 @@ func (r *installResource) Read(ctx context.Context, req resource.ReadRequest, re
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }
 
-// unreachable is a read's error for a remote target ssh did not reach (exit 255, its own failure:
-// no connection, or another host key served). The install stays in state: nothing a read sees
+// unreachable is a read's error for a remote target ssh did not reach (exit 255: ssh's own failure,
+// or the program's own exit 255). The install stays in state whatever ssh met: nothing a read sees
 // tells a host gone for good from one down or unreachable for a while, and forgetting an install
-// that still runs would have the next apply install it again. The detail names the ways on,
-// keyFix the one for a host serving another key.
-func unreachable(diags *diag.Diagnostics, kind, host, keyFix string, err error) {
-	diags.AddError(fmt.Sprintf("Cannot reach the %s %s to read the install", kind, host), fmt.Sprintf(
-		"%v\n\nThe install stays in state: the provider cannot tell a %s that is gone from one down or unreachable for a while. "+
-			"If it is down, plan again once it answers. If it serves another host key, "+keyFix+" "+
-			"If it was deleted outside OpenTofu, forget the install with `tofu state rm` on this resource (nothing runs on the target); the next apply installs again. "+
-			"To plan once without reading it: `tofu plan -refresh=false`.", err, kind))
+// that still runs loses state's record of it. ssh's message picks the summary and the way on: a
+// refused login (the connection's user and key), another host key served (block's
+// known_hosts_line, then a new import as importID), else no connection; madeAgain, for a VM, is
+// said before a key's way on. Every detail ends on the ways common to all.
+func unreachable(diags *diag.Diagnostics, kind, block, host, importID, madeAgain string, err error) {
+	msg := err.Error()
+	common := fmt.Sprintf(" Only once the %s is known to be gone (deleted outside OpenTofu): `tofu state rm` this resource; nothing runs on the target, "+
+		"the next apply installs again, and what state recorded of the install (its previous release, its inputs) is lost. "+
+		"To plan once without reading it: `tofu plan -refresh=false`.", kind)
+	var summary, way string
+	switch {
+	case strings.Contains(msg, "Permission denied"):
+		summary = fmt.Sprintf("ssh's login to the %s %s was refused", kind, host)
+		way = fmt.Sprintf("The host answered and refused the login: check %s.user and %s.private_key_file (or the ssh agent's keys) against the keys it accepts, then plan again.", block, block)
+	case strings.Contains(msg, "Host key verification failed") || strings.Contains(msg, "REMOTE HOST IDENTIFICATION HAS CHANGED"):
+		summary = fmt.Sprintf("The %s %s serves another host key", kind, host)
+		way = madeAgain + fmt.Sprintf("A changed key: check the new key on the host's console, give it in %s.known_hosts_line, "+
+			"then `tofu state rm` this resource and `tofu import` it again (`%s`): a read accepts the key state holds alone.", block, importID)
+	default:
+		summary = fmt.Sprintf("Cannot reach the %s %s to read the install", kind, host)
+		way = "ssh's message above says what it met. If the host is down or unreachable for a while, plan again once it answers."
+	}
+	diags.AddError(summary, fmt.Sprintf("%s\n\nThe install stays in state. %s%s", msg, way, common))
 }
 
 // dropUnrecorded removes from m's inputs a key given a value that the install does not record,

@@ -339,6 +339,23 @@ func TestReadFollowsTheTarget(t *testing.T) {
 	if h.attrs(r.NewState) == nil {
 		t.Fatal("an unreachable host's install is forgotten")
 	}
+	// ssh's message picks the way on: a refused login, another host key.
+	for stderr, want := range map[string][]string{
+		"ops@app.example: Permission denied (publickey).": {"ssh's login to the Docker host app.example was refused", "docker.user and docker.private_key_file"},
+		"Host key verification failed.":                   {"The Docker host app.example serves another host key", "docker.known_hosts_line", "`app.example:/srv/notes/notes-stow`"},
+	} {
+		h.fake.replies["status"] = reply{exit: 255, stderr: stderr}
+		r := h.read(state)
+		got := errorsOf(r.Diagnostics)
+		for _, w := range append(want, "tofu state rm", "-refresh=false") {
+			if !strings.Contains(got, w) {
+				t.Errorf("%s: no %q in %q", stderr, w, got)
+			}
+		}
+		if strings.Contains(got, "Cannot reach") || h.attrs(r.NewState) == nil {
+			t.Errorf("%s: %q, state %v", stderr, got, h.attrs(r.NewState))
+		}
+	}
 	h.fake.replies["status"] = reply{exit: 100, stderr: "the installer's own exit 100"}
 	if got := errorsOf(h.read(state).Diagnostics); strings.Contains(got, "Cannot reach") {
 		t.Fatalf("an installer's failure taken for an unreachable host: %q", got)

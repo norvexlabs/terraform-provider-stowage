@@ -27,9 +27,10 @@ behaviour may still change before 1.0, each change named in [CHANGELOG.md](CHANG
 create, read, update (inputs, then the release: upgrade or rollback), import and delete, with an
 opt-in plan-time dry run on Docker —, `stowage_vm_seed`, the first-boot material of a Kairos VM a
 hypervisor's or cloud's resource makes, and the `stowage_install` data source. Each target
-is proven against a real Stowage 0.35.0 installer: the Docker target over SSH (`make acc-docker`),
-the Kubernetes target on a kind cluster (`make acc-k8s`), the VM target and `stowage_vm_seed` on a
-TrueNAS VM (`make acc-vm`). Not in a registry yet: [install it locally](#install).
+is proven against a real installer: the Docker target over SSH (`make acc-docker`, Stowage
+0.35.0), the Kubernetes target on a kind cluster (`make acc-k8s`, 0.35.0 and 0.37.0), the VM
+target and `stowage_vm_seed` on a TrueNAS VM (`make acc-vm`, 0.35.0; its walk of the VM's import
+and of a destroy refused by `deletion_protection` is written, not run yet: [TODO.md](TODO.md)). Not in a registry yet: [install it locally](#install).
 
 - Provider address: `registry.opentofu.org/norvexlabs/stowage` (`norvexlabs/stowage`), plugin
   protocol 6.

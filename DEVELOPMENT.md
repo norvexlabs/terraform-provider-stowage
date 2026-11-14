@@ -78,7 +78,9 @@ xorriso), Stowage's TrueNAS module, the first install over SSH under the one-tim
 key and the one-time key's retirement, a plan with no change, a re-run, an upgrade and its reboot,
 the rollback (refused first without `allow_rollback`), the install forgotten and imported
 (`vm:<host>/<short>-stow`) with its first apply under the VM's own key and a plan with no change,
-a destroy of the install refused by `deletion_protection`, and the destroy; it prints `PASS`. The host
+a destroy of the install refused by `deletion_protection`, and the destroy; it prints `PASS` (it
+did against Stowage 0.35.0 before the import and the refused destroy were added; those two are not
+run yet, [TODO.md](TODO.md)). The host
 needs Docker, network access to TrueNAS and a linux/amd64 machine; every other tool is the
 runner's.
 
@@ -141,8 +143,8 @@ The release key: fingerprint `686D3351040F9F4463D9D3AC0C705E9BAA4F4981`, RSA 409
 are given. To check a release by hand:
 
 ```bash
-gpg --import keys/norvexlabs-gpg-public.asc
-gpg --verify terraform-provider-stowage_<version>_SHA256SUMS.sig terraform-provider-stowage_<version>_SHA256SUMS
+gpg --dearmor <keys/norvexlabs-gpg-public.asc >release-key.gpg   # the release key alone, never your keyring's
+gpgv --keyring ./release-key.gpg terraform-provider-stowage_<version>_SHA256SUMS.sig terraform-provider-stowage_<version>_SHA256SUMS
 sha256sum --check --ignore-missing terraform-provider-stowage_<version>_SHA256SUMS
 ```
 

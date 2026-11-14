@@ -16,18 +16,22 @@ to OpenTofu through its implied local mirror; a checkout's build also through `d
 Each [release](https://github.com/norvexlabs/terraform-provider-stowage/releases) holds
 `terraform-provider-stowage_<version>_<os>_<arch>.zip` for linux, darwin, windows and freebsd,
 `terraform-provider-stowage_<version>_SHA256SUMS` and its GPG signature by the release key
-(fingerprint `686D3351040F9F4463D9D3AC0C705E9BAA4F4981`, in the repository's
-`keys/norvexlabs-gpg-public.asc`). Check the signature and the zip's checksum, then copy the zip
-unopened into the mirror's directory for the provider:
+(fingerprint `686D3351040F9F4463D9D3AC0C705E9BAA4F4981`, its public half the repository's
+`keys/norvexlabs-gpg-public.asc`). Check that the key file holds that key alone, the signature
+against it alone (`gpgv`, never the keys of your own keyring), and the zip's checksum, then copy
+the zip unopened into the mirror's directory for the provider:
 
 ```bash
 v=0.1.0 platform=linux_amd64   # darwin_arm64, windows_amd64, …
 base=https://github.com/norvexlabs/terraform-provider-stowage/releases/download/v$v
 curl -fLO "$base/terraform-provider-stowage_${v}_${platform}.zip" \
      -fLO "$base/terraform-provider-stowage_${v}_SHA256SUMS" \
-     -fLO "$base/terraform-provider-stowage_${v}_SHA256SUMS.sig"
-gpg --import keys/norvexlabs-gpg-public.asc   # from the repository
-gpg --verify "terraform-provider-stowage_${v}_SHA256SUMS.sig" "terraform-provider-stowage_${v}_SHA256SUMS"
+     -fLO "$base/terraform-provider-stowage_${v}_SHA256SUMS.sig" \
+     -fLO "https://raw.githubusercontent.com/norvexlabs/terraform-provider-stowage/v$v/keys/norvexlabs-gpg-public.asc"
+# One key, the release key: prints "1 686D3351040F9F4463D9D3AC0C705E9BAA4F4981", else stop.
+gpg --show-keys --with-colons norvexlabs-gpg-public.asc | awk -F: '$1=="pub"{n++} $1=="fpr"&&!f{f=$10} END{print n, f}'
+gpg --dearmor <norvexlabs-gpg-public.asc >release-key.gpg
+gpgv --keyring ./release-key.gpg "terraform-provider-stowage_${v}_SHA256SUMS.sig" "terraform-provider-stowage_${v}_SHA256SUMS"
 grep "_${platform}.zip\$" "terraform-provider-stowage_${v}_SHA256SUMS" | sha256sum --check   # macOS: shasum -a 256 --check
 mkdir -p ~/.terraform.d/plugins/registry.opentofu.org/norvexlabs/stowage
 cp "terraform-provider-stowage_${v}_${platform}.zip" ~/.terraform.d/plugins/registry.opentofu.org/norvexlabs/stowage/

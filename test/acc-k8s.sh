@@ -140,7 +140,7 @@ runs 1.0.0
 	fail "state after the create: status $(st status), version $(st version), id $(st id)"
 [[ $(kubectl exec -n "$NS" deploy/notes-web -- printenv ADMIN_EMAIL) == admin@notes.test ]] || fail "the pod's ADMIN_EMAIL is not the input"
 ! grep -qF -- "$(sed -n 2p "$WORK/k8s-key.pem")" "$TF/terraform.tfstate" || fail "the cluster's client key is in state"
-kubectl get -n "$NS" secrets -o json | jq -r '.items[].data.E2E_TOKEN // empty' | while read -r v; do base64 -d <<<"$v"; echo; done | grep -qxF -- "$E2E_TOKEN" ||
+kubectl get -n "$NS" secrets -o json | jq -r '.items[].data.E2E_TOKEN // empty' | while read -r v; do base64 -d <<<"$v"; echo; done | grep -xF -- "$E2E_TOKEN" >/dev/null ||
 	fail "no Secret of the release holds the secret input"
 ! grep -rqF -- "$E2E_TOKEN" "$TF" || fail "the secret input is in the root's files"
 [[ -z $(ls -A "$WORK/tmp") ]] || fail "a run's private directory (its kubeconfig) is left: $(ls -A "$WORK/tmp")"
@@ -181,7 +181,7 @@ runs 3.0.0
 step "1.0.0's installer while 3.0.0 runs (not the previous release): its upgrade refused by the installer, state kept"
 config "$I1" ops@notes.test "allow_rollback = true"
 rc=0; tf apply -auto-approve -no-color >"$WORK/apply-refused.log" 2>&1 || rc=$?
-[[ $rc != 0 ]] && tr -s ' \n' ' ' <"$WORK/apply-refused.log" | grep -qE 'refused by the installer [(][^)]*exit 3[)] before anything changed' ||
+[[ $rc != 0 ]] && tr -s ' \n' ' ' <"$WORK/apply-refused.log" | grep -E 'refused by the installer [(][^)]*exit 3[)] before anything changed' >/dev/null ||
 	{ cat "$WORK/apply-refused.log"; fail "the upgrade to an older release was not refused by the installer"; }
 runs 3.0.0
 [[ $(st version) == 3.0.0 && $(st installer) == "$I3" ]] || fail "state after the refused upgrade: version $(st version), installer $(st installer)"

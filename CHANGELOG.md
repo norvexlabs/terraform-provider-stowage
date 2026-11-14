@@ -6,8 +6,9 @@ follow [SemVer](https://semver.org/).
 ## [0.2.0]
 
 The provider is in **beta**: the Docker, Kubernetes and VM targets are proven by their acceptance
-tests against Stowage 0.35.0; its schema and behaviour may still change before 1.0, each change
-named here.
+tests (Docker and the VM against Stowage 0.35.0, Kubernetes against 0.35.0 and 0.37.0; the VM's
+import is proven by unit tests until its acceptance walk runs); its schema and behaviour may still
+change before 1.0, each change named here.
 
 ### Changed
 
@@ -16,11 +17,14 @@ named here.
 - `delete_data = true` with a `vm` block is refused at validation (`delete_data is not the VM's`): a
   VM's destroy forgets the install and deletes nothing, its data going with the VM.
 
-- A read of a Docker host or VM that ssh does not reach is an error naming the ways on (`Cannot reach
-  the Docker host <host> to read the install`, `Cannot reach the VM <host> …`): plan again once it
-  answers, a changed host key's new pin and import, `tofu state rm` for a target deleted outside
-  OpenTofu, `-refresh=false` for one plan. The install stays in state, as a host down for a while
-  is not told from one gone.
+- A read of a Docker host or VM that ssh fails (exit 255) is an error naming what ssh met and the
+  way on: `ssh's login to … was refused` (the connection's user and key), `… serves another host
+  key` (the new key pinned, then a new import), else `Cannot reach … to read the install` (plan
+  again once it answers); each names `tofu state rm` for a target known to be gone and
+  `-refresh=false` for one plan. The install stays in state, as a host down for a while is not
+  told from one gone.
+- The install guide checks a release's signature against the release key alone (`gpgv`), the key file
+  first checked to hold that key and no other.
 
 ### Documentation
 
