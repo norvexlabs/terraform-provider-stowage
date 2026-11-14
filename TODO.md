@@ -2,7 +2,9 @@
 
 Pending work, prioritised MoSCoW. The bar is a **production-ready beta**: DESIGN § 13 of Stowage
 (`docs/DESIGN.md`, "OpenTofu provider") on the three shapes, each proven by its acceptance test,
-installable and verifiable by a user. A finished item is deleted, not ticked.
+installable and verifiable by a user. A finding (a bug, a wrong behaviour, a security hole, a
+review's leftover, a weak test) is never written here: it is fixed in the slice that finds it. A
+finished item is deleted, not ticked.
 
 ## Must — the beta
 

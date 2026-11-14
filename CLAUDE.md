@@ -15,7 +15,7 @@ departure is raised with Stowage.
 | [DEVELOPMENT.md](DEVELOPMENT.md) | contributors | building, the acceptance tests, the release procedure (held), the repository's map |
 | [CHANGELOG.md](CHANGELOG.md) | users | the provider's releases; the version source of the build |
 | this file | contributors | rules and commit gates |
-| [TODO.md](TODO.md) | contributors | pending work, MoSCoW for the first release; a done item is deleted |
+| [TODO.md](TODO.md) | contributors | pending features, MoSCoW for the first release, and what is blocked outside the repository; never a finding; a done item is deleted |
 
 **README.md, docs/ and DEVELOPMENT.md document every feature — nothing is discovered in the code.**
 Every attribute, default, validation, refusal, plan-time error, command run on a target, file
@@ -26,10 +26,14 @@ defect for the review, like a bug.
 
 ## Scope — MoSCoW
 
-Every pending item and every review finding is sorted in [TODO.md](TODO.md): **Must** = DESIGN
-§ 13 for the three shapes (or a finding that changes what reaches state, the target's command
-line, or what the provider trusts — always fixed now); **Should / Could** = deferred unless cheap;
-**Won't**. Decide the category yourself.
+Every pending feature is sorted in [TODO.md](TODO.md): **Must** = DESIGN § 13 for the three
+shapes; **Should / Could** = deferred unless cheap; **Won't**. Decide the category yourself.
+
+**A finding is never deferred.** A bug, a wrong behaviour, a security hole, a race, a leftover of
+a review, a message whose hint does not work, or a test that proves less than it claims is fixed
+in the slice that finds it (one found outside a slice opens the next one), at its cause — the
+rule that let it exist — and never written to TODO.md. Only one blocked outside the repository
+(Stowage, upstream, an account) is noted there, with what unblocks it.
 
 ## Build — Docker only
 
