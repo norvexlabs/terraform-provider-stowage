@@ -63,10 +63,10 @@ another name reaches the installer unchanged. Over ssh no environment is carried
   nothing a read sees tells a host gone for good from one down for a while. A read connects as
   state holds the connection; ssh's message picks the summary and the way on: its refusal of the
   login (`user@host: Permission denied (publickey,…)`, its authentication methods listed; after a
-  key file it could not load, `Load key …`, too; `Too many authentication failures`; `No more
-  authentication methods available`) — `ssh's login to the Docker host <host> was
-  refused` (a fix outside the configuration, the agent's key or the keys the host accepts: plan
-  again; a fix of `docker.user` or `docker.private_key_file`: `tofu apply -refresh=false`, which
+  key file it could not load, `Load key …`, too; or the server's `Received disconnect from <host>
+  port <port>:2: Too many authentication failures`, past its MaxAuthTries) — `ssh's login to the Docker host <host> was
+  refused` (a fix outside the configuration — the agent's keys, ssh_config's IdentityFile
+  entries, the keys the host accepts or its MaxAuthTries: plan again; a fix of `docker.user` or `docker.private_key_file`: `tofu apply -refresh=false`, which
   saves a change of the connection alone without running anything on the target, then plan); `Host key verification failed` or a changed identification — `The Docker host <host>
   serves another host key` (the new key, checked on its console, in `docker.known_hosts_line`, then
   `tofu apply -refresh=false` the same way); anything else, a program's own `Permission denied

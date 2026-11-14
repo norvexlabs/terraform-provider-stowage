@@ -925,13 +925,14 @@ func (r *installResource) Read(ctx context.Context, req resource.ReadRequest, re
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }
 
-// sshLoginRefused matches ssh's own refusals of a login: "user@host: Permission denied
+// sshLoginRefused matches OpenSSH's own refusals of a login: "user@host: Permission denied
 // (publickey,password).", by its list of authentication methods (a program's EACCES, "…:
-// Permission denied (os error 13)", is not one), and the server's "Too many authentication
-// failures" (an agent offering more keys than it tries) or "No more authentication methods
-// available". ssh that could not load a key file says so before it ("Load key …: Permission
+// Permission denied (os error 13)", is not one), and the server's disconnect once its MaxAuthTries
+// is exceeded, "Received disconnect from <host> port <port>:2: Too many authentication failures"
+// (more keys offered than it tries: the agent's, or ssh_config's IdentityFile entries), by ssh's
+// framing of it. ssh that could not load a key file says so before it ("Load key …: Permission
 // denied"), then refuses the login the same way: the detail shows both.
-var sshLoginRefused = regexp.MustCompile(`: Permission denied \((publickey|password|keyboard-interactive|hostbased|gssapi-[a-z-]+)(,(publickey|password|keyboard-interactive|hostbased|gssapi-[a-z-]+))*\)|Too many authentication failures|No more authentication methods available`)
+var sshLoginRefused = regexp.MustCompile(`: Permission denied \((publickey|password|keyboard-interactive|hostbased|gssapi-[a-z-]+)(,(publickey|password|keyboard-interactive|hostbased|gssapi-[a-z-]+))*\)|Received disconnect from \S+ port \d+:2: Too many authentication failures`)
 
 // unreachable is a read's error for a remote target ssh did not reach (exit 255: ssh's own failure,
 // or the program's own exit 255). The install stays in state whatever ssh met: nothing a read sees
@@ -949,7 +950,8 @@ func unreachable(diags *diag.Diagnostics, kind, block, host, keyWay string, err 
 	case sshLoginRefused.MatchString(msg):
 		summary = fmt.Sprintf("ssh's login to the %s %s was refused", kind, host)
 		way = fmt.Sprintf("ssh's message names the host that refused it (a jump host's own, through an ssh configuration) and a key file it could not load (`Load key …`). "+
-			"A read logs in with the connection state holds: a fix outside the configuration (the ssh agent's key, the keys the host accepts) needs a plan again alone; "+
+			"A read logs in with the connection state holds: a fix outside the configuration (the ssh agent's keys, ssh_config's IdentityFile entries, "+
+			"the keys the host accepts or its MaxAuthTries) needs a plan again alone; "+
 			"a fix of %s.user or %s.private_key_file is saved by `tofu apply -refresh=false`, which saves a change of the connection alone without running anything on the target, "+
 			"then a plan reads the install again.", block, block)
 	case strings.Contains(msg, "Host key verification failed") || strings.Contains(msg, "REMOTE HOST IDENTIFICATION HAS CHANGED"):

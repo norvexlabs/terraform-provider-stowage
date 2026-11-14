@@ -27,17 +27,18 @@ base=https://github.com/norvexlabs/terraform-provider-stowage/releases/download/
 curl -fLO "$base/terraform-provider-stowage_${v}_${platform}.zip" \
      -fLO "$base/terraform-provider-stowage_${v}_SHA256SUMS" \
      -fLO "$base/terraform-provider-stowage_${v}_SHA256SUMS.sig" \
-     -fLO "https://raw.githubusercontent.com/norvexlabs/terraform-provider-stowage/v$v/keys/norvexlabs-gpg-public.asc"
-# Each step only once the one before succeeded: the key file holds one key, the release key;
-# the signature is by it (gpgv, never your keyring's keys); the zip's checksum is the signed one.
-[ "$(gpg --show-keys --with-colons norvexlabs-gpg-public.asc | awk -F: '$1=="pub"{n++} $1=="fpr"&&!f{f=$10} END{print n, f}')" = \
-  "1 686D3351040F9F4463D9D3AC0C705E9BAA4F4981" ] &&
+     -fLO "https://raw.githubusercontent.com/norvexlabs/terraform-provider-stowage/v$v/keys/norvexlabs-gpg-public.asc" &&
+# Each step only once the one before succeeded, each saying why it failed: the key file holds one
+# key, the release key; the signature is by it (gpgv, never your keyring's keys); the zip's
+# checksum is the signed one.
+{ [ "$(gpg --show-keys --with-colons norvexlabs-gpg-public.asc | awk -F: '$1=="pub"{n++} $1=="fpr"&&!f{f=$10} END{print n, f}')" = \
+    "1 686D3351040F9F4463D9D3AC0C705E9BAA4F4981" ] || { echo "norvexlabs-gpg-public.asc is not the release key alone" >&2; false; }; } &&
 gpg --dearmor <norvexlabs-gpg-public.asc >release-key.gpg &&
 gpgv --keyring ./release-key.gpg "terraform-provider-stowage_${v}_SHA256SUMS.sig" "terraform-provider-stowage_${v}_SHA256SUMS" &&
 grep "_${platform}.zip\$" "terraform-provider-stowage_${v}_SHA256SUMS" | sha256sum --check &&   # macOS: shasum -a 256 --check
 mkdir -p ~/.terraform.d/plugins/registry.opentofu.org/norvexlabs/stowage &&
 cp "terraform-provider-stowage_${v}_${platform}.zip" ~/.terraform.d/plugins/registry.opentofu.org/norvexlabs/stowage/ &&
-echo "installed $v ($platform)" || echo "NOT INSTALLED: the step above whose message is the last failed" >&2
+echo "installed $v ($platform)" || echo "NOT INSTALLED: the step that failed said why, above" >&2
 ```
 
 On Windows the directory is `%APPDATA%\terraform.d\plugins\registry.opentofu.org\norvexlabs\stowage`.
