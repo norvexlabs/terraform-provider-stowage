@@ -85,6 +85,25 @@ argument.
   then the next apply installs it under the seed's key), and a VM whose own key changed is given
   it in `vm.known_hosts_line` and imported again (`tofu state rm`, then `tofu import` its ID,
   `vm:<host>/<short>-stow`, the address a read uses).
+- **Plan, with `plan_dry_run`**: a plan changing `vm.version` reads `status --json` and chooses the
+  step as the update does (its errors — `a rollback needs allow_rollback`, `a rollback goes alone` —
+  at plan), then runs `sudo -n <short>-stow upgrade --version <vm.version> --dry-run --json`, or
+  `rollback --dry-run --json`, over SSH under the connection state accepts: the host daemon runs
+  every check the verb runs before its job (the release confirmed, the boot judged, no job running,
+  no system written that no boot ran yet, and for an upgrade the checks its boot would refuse) and
+  starts nothing — no backup, no OS written, no reboot. A refusal is a plan error, its reason the
+  summary and its fix the detail. A plan that also re-runs the running release (inputs, secret
+  inputs, TLS, domains or ports) gets a warning instead (`No dry run of this plan`). The VM's OS needs
+  Stowage 0.38.0 or later: an older `<short>-stow` has no `--dry-run`, and the change is planned
+  without one, with a warning (`No dry run of this plan`), so the upgrade bringing it can be planned. The update's
+  own refusals before it runs anything (no install, no `boot_id` or event journal, the channel of an
+  imported state) are plan errors too. The dry run covers the upgrade alone: when the plan also gives
+  what only the new release declares, a warning says the re-run after its reboot is not checked
+  (`The dry run covers the upgrade alone`); when state has no VM's own key, a warning says the apply
+  reads it first and refuses the change when it cannot. While any value of the configuration (but `deletion_protection`, `delete_data` and `timeouts`)
+  is not known, no dry run, with a warning (`No dry run of this plan yet`): OpenTofu plans again at
+  apply, with it known, and that plan runs it (a dry run runs again there in any case). Skipped for
+  an imported state never applied.
 - **Update**: a change of the provider's own settings alone is saved without touching the VM.
   Otherwise, in this order:
   1. `status --json` (no release installed is an error; no `<short>-stow` on the VM is the Read
@@ -162,4 +181,4 @@ argument.
   on the VM); give `vm.known_hosts_line` the VM's own key. State records `vm.host`,
   `vm.short_name` and `deletion_protection = true`; the first apply runs the update above with
   every configured input, as on Docker.
-- **Delete**: refused while `deletion_protection`; else nothing runs: the resource is forgotten. `delete_data = true` is refused at validation (`delete_data is not the VM's`), and `plan_dry_run = true` too (`plan_dry_run is Docker's`): a VM's plan runs nothing on it.
+- **Delete**: refused while `deletion_protection`; else nothing runs: the resource is forgotten. `delete_data = true` is refused at validation (`delete_data is not the VM's`).

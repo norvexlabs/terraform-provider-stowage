@@ -265,3 +265,310 @@ func TestMovedSecretAtPlanOnEveryTarget(t *testing.T) {
 		t.Errorf("k8s: %q", got)
 	}
 }
+
+// plan_dry_run on a VM: a plan changing vm.version runs `upgrade --version V --dry-run --json`
+// over SSH, or `rollback --dry-run --json` going back to previous; a refusal is a plan error, the
+// apply's own errors come first, and a plan that also re-runs the release is not dry-run.
+func TestVMPlanDryRun(t *testing.T) {
+	t.Parallel()
+	h, f := newVMHarness(t)
+	state := h.create(h.vmConfig("1.1.0", nil))
+	f.reset()
+	f.set("dry-upgrade", reply{stdout: `{"format":1,"result":"nothing","release":{"version":"1.1.0","revision":1}}`})
+	up := h.vmConfig("1.2.0", map[string]tftypes.Value{"plan_dry_run": boolean(true)})
+	if d := errorsOf(h.plan(state, up).Diagnostics); d != "" {
+		t.Fatal(d)
+	}
+	dry := f.callsOf("dry-upgrade")
+	if len(dry) != 1 || !slices.Equal(dry[0].argv, []string{"sudo", "-n", "notes-stow", "upgrade", "--version", "1.2.0", "--dry-run", "--json"}) ||
+		len(f.callsOf("upgrade")) != 0 || len(f.callsOf("rollback")) != 0 {
+		t.Fatalf("calls %q", f.ops())
+	}
+	// A refusal is the plan's error.
+	f.reset()
+	f.set("dry-upgrade", reply{exit: 3, stdout: `{"format":1,"result":"nothing","refused":{"reason":"a job (backup) is running"}}`})
+	if got := errorsOf(h.plan(state, up).Diagnostics); !strings.Contains(got, "a job (backup) is running") {
+		t.Fatalf("a refusal: %q", got)
+	}
+	// With a re-run of the running release: a warning, no dry run.
+	f.reset()
+	both := h.vmConfig("1.2.0", map[string]tftypes.Value{"plan_dry_run": boolean(true), "inputs": strMap(map[string]string{"ADMIN_EMAIL": "c@d"})})
+	if p := h.plan(state, both); errorsOf(p.Diagnostics) != "" || !strings.Contains(diagText(p.Diagnostics), "No dry run of this plan") || len(f.callsOf("dry-upgrade")) != 0 {
+		t.Fatalf("with a re-run: %q, calls %q", diagText(p.Diagnostics), f.ops())
+	}
+	// Off, or vm.version unchanged: nothing reaches the VM.
+	f.reset()
+	h.plan(state, h.vmConfig("1.2.0", nil))
+	h.plan(state, h.vmConfig("1.1.0", map[string]tftypes.Value{"plan_dry_run": boolean(true), "inputs": strMap(map[string]string{"ADMIN_EMAIL": "c@d"})}))
+	if ops := f.ops(); len(ops) != 0 {
+		t.Fatalf("calls %q", ops)
+	}
+	// Going back to previous: the apply's refusal without allow_rollback, else rollback --dry-run.
+	f.reset()
+	withPrev := strings.Replace(vmStatusJSON("1.1.0", "boot-1", ""), `"previous":null`, `"previous":{"version":"1.0.0","revision":1}`, 1)
+	f.set("status", reply{stdout: withPrev})
+	back := h.vmConfig("1.0.0", map[string]tftypes.Value{"plan_dry_run": boolean(true)})
+	if got := errorsOf(h.plan(state, back).Diagnostics); !strings.Contains(got, "a rollback needs allow_rollback") || len(f.callsOf("dry-rollback")) != 0 {
+		t.Fatalf("without allow_rollback: %q, calls %q", got, f.ops())
+	}
+	f.set("dry-rollback", reply{exit: 3, stdout: `{"format":1,"result":"nothing","refused":{"reason":"the database moved past 1.0.0","fix":"restore a backup"}}`})
+	back = h.vmConfig("1.0.0", map[string]tftypes.Value{"plan_dry_run": boolean(true), "allow_rollback": boolean(true)})
+	got := errorsOf(h.plan(state, back).Diagnostics)
+	if rb := f.callsOf("dry-rollback"); !strings.Contains(got, "the database moved past 1.0.0") || len(rb) != 1 ||
+		!slices.Equal(rb[0].argv, []string{"sudo", "-n", "notes-stow", "rollback", "--dry-run", "--json"}) {
+		t.Fatalf("a rollback: %q, calls %q", got, f.ops())
+	}
+}
+
+// plan_dry_run on Kubernetes: a plan changing installer reads the release and fetches the new
+// installer as the apply does, then runs its `k8s upgrade --dry-run` given what the upgrade adds;
+// a refusal is a plan error, and nothing is upgraded; a rollback runs `k8s rollback --dry-run`.
+func TestK8sPlanDryRun(t *testing.T) {
+	t.Parallel()
+	h := k8sHarness(t, nil)
+	state := h.create(h.k8sConfig(map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})}))
+	h.fake.reset()
+	h.fake.then("k8s-describe", reply{stdout: describeK8s}, reply{stdout: describeK8s2})
+	h.fake.set("k8s-dry-upgrade", reply{exit: 3, stdout: `{"format":1,"result":"nothing","refused":{"reason":"2.0.0 needs schema baseline 2","fix":"reset-db --new-baseline"}}`})
+	cfg := h.k8sConfig(map[string]tftypes.Value{"installer": str(image2), "plan_dry_run": boolean(true),
+		"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com", "NEW_KEY": "added"})})
+	got := errorsOf(h.plan(state, cfg).Diagnostics)
+	dry := h.fake.callsOf("k8s-dry-upgrade")
+	if !strings.Contains(got, "2.0.0 needs schema baseline 2") || !strings.Contains(got, "reset-db --new-baseline") || len(dry) != 1 ||
+		flags(dry[0].argv)["--set"] != "NEW_KEY=added" || !strings.HasSuffix(dry[0].argv[4], "/next") || len(h.fake.callsOf("k8s-upgrade")) != 0 {
+		t.Fatalf("got %q, calls %q", got, h.fake.ops())
+	}
+	// With a re-run of the running release: a warning, no dry run.
+	h.fake.reset()
+	h.fake.then("k8s-describe", reply{stdout: describeK8s}, reply{stdout: describeK8s2})
+	both := h.k8sConfig(map[string]tftypes.Value{"installer": str(image2), "plan_dry_run": boolean(true),
+		"inputs": strMap(map[string]string{"ADMIN_EMAIL": "b@example.com"})})
+	// Told before the new installer is fetched: one fetch, the running release's.
+	if p := h.plan(state, both); errorsOf(p.Diagnostics) != "" || !strings.Contains(diagText(p.Diagnostics), "No dry run of this plan") ||
+		len(h.fake.callsOf("k8s-dry-upgrade")) != 0 || len(h.fake.callsOf("fetch")) != 1 {
+		t.Fatalf("with a re-run: %q, calls %q", diagText(p.Diagnostics), h.fake.ops())
+	}
+	// Going back to previous: rollback --dry-run.
+	h.fake.reset()
+	h.fake.set("k8s-status", reply{stdout: strings.Replace(statusK8s, `"previous":null`, `"previous":{"version":"0.9.0","revision":1,"installer":"`+image2+`"}`, 1)})
+	h.fake.set("k8s-dry-rollback", reply{stdout: `{"format":1,"result":"nothing"}`})
+	back := h.k8sConfig(map[string]tftypes.Value{"installer": str(image2), "plan_dry_run": boolean(true), "allow_rollback": boolean(true),
+		"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})})
+	if d := errorsOf(h.plan(state, back).Diagnostics); d != "" || len(h.fake.callsOf("k8s-dry-rollback")) != 1 || len(h.fake.callsOf("k8s-rollback")) != 0 {
+		t.Fatalf("a rollback: %q, calls %q", d, h.fake.ops())
+	}
+	// Off: nothing runs.
+	h.fake.reset()
+	h.plan(state, h.k8sConfig(map[string]tftypes.Value{"installer": str(image2), "inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})}))
+	if ops := h.fake.ops(); len(ops) != 0 {
+		t.Fatalf("calls %q", ops)
+	}
+}
+
+// A setting a run reads not known yet (the provider's registry from another resource): no dry
+// run, nothing reaches the cluster.
+func TestK8sPlanDryRunWaitsForTheProvidersSettings(t *testing.T) {
+	t.Parallel()
+	h := k8sHarness(t, map[string]tftypes.Value{"registry": tftypes.NewValue(tftypes.String, tftypes.UnknownValue)})
+	state := h.create(h.k8sConfig(map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})}))
+	h.fake.reset()
+	p := h.plan(state, h.k8sConfig(map[string]tftypes.Value{"installer": str(image2), "plan_dry_run": boolean(true),
+		"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})}))
+	if ops := h.fake.ops(); len(ops) != 0 || !strings.Contains(diagText(p.Diagnostics), "No dry run of this plan yet") {
+		t.Fatalf("%s, calls %q", diagText(p.Diagnostics), ops)
+	}
+}
+
+// allow_rollback not known yet on Kubernetes: no dry run, a warning, no error, nothing reaches the
+// cluster.
+func TestK8sPlanDryRunWaitsForAllowRollback(t *testing.T) {
+	t.Parallel()
+	h := k8sHarness(t, nil)
+	state := h.create(h.k8sConfig(map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})}))
+	h.fake.reset()
+	p := h.plan(state, h.k8sConfig(map[string]tftypes.Value{"installer": str(image2), "plan_dry_run": boolean(true),
+		"allow_rollback": tftypes.NewValue(tftypes.Bool, tftypes.UnknownValue), "inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})}))
+	if d := errorsOf(p.Diagnostics); d != "" || !strings.Contains(diagText(p.Diagnostics), "No dry run of this plan yet") || len(h.fake.ops()) != 0 {
+		t.Fatalf("allow_rollback not known: %s / %s, calls %q", d, diagText(p.Diagnostics), h.fake.ops())
+	}
+}
+
+// vm.short_name not known yet (its seed made again): no dry run, nothing reaches the VM.
+func TestVMPlanDryRunWaitsForTheShortName(t *testing.T) {
+	t.Parallel()
+	h, f := newVMHarness(t)
+	state := h.create(h.vmConfig("1.1.0", nil))
+	f.reset()
+	cfg := fill(h.typ, map[string]tftypes.Value{"plan_dry_run": boolean(true), "inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@b"}),
+		"vm": h.vmBlock("1.2.0", map[string]tftypes.Value{"short_name": tftypes.NewValue(tftypes.String, tftypes.UnknownValue)})})
+	p := h.plan(state, cfg)
+	if d := errorsOf(p.Diagnostics); d != "" || len(f.ops()) != 0 || !strings.Contains(diagText(p.Diagnostics), "No dry run of this plan yet") {
+		t.Fatalf("%s / %s, calls %q", d, diagText(p.Diagnostics), f.ops())
+	}
+}
+
+// allow_rollback not known yet: no dry run, a warning, no error (the apply knows it).
+func TestVMPlanDryRunWaitsForAllowRollback(t *testing.T) {
+	t.Parallel()
+	h, f := newVMHarness(t)
+	state := h.create(h.vmConfig("1.1.0", nil))
+	f.reset()
+	withPrev := strings.Replace(vmStatusJSON("1.1.0", "boot-1", ""), `"previous":null`, `"previous":{"version":"1.0.0","revision":1}`, 1)
+	f.set("status", reply{stdout: withPrev})
+	p := h.plan(state, h.vmConfig("1.0.0", map[string]tftypes.Value{"plan_dry_run": boolean(true), "allow_rollback": tftypes.NewValue(tftypes.Bool, tftypes.UnknownValue)}))
+	if d := errorsOf(p.Diagnostics); d != "" || !strings.Contains(diagText(p.Diagnostics), "No dry run of this plan yet") || len(f.ops()) != 0 {
+		t.Fatalf("%s / %s, calls %q", d, diagText(p.Diagnostics), f.ops())
+	}
+}
+
+// An upgrade whose plan also gives what only the new release declares: the dry run covers the
+// upgrade, and a warning says the re-run after its reboot is not checked.
+func TestVMPlanDryRunWarnsOfTheReRunAfter(t *testing.T) {
+	t.Parallel()
+	h, f := newVMHarness(t)
+	state := h.create(h.vmConfig("1.1.0", nil))
+	f.reset()
+	f.set("dry-upgrade", reply{stdout: `{"format":1,"result":"nothing"}`})
+	p := h.plan(state, h.vmConfig("1.2.0", map[string]tftypes.Value{"plan_dry_run": boolean(true),
+		"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@b", "NEW_KEY": "added"})}))
+	if d := errorsOf(p.Diagnostics); d != "" || len(f.callsOf("dry-upgrade")) != 1 || !strings.Contains(diagText(p.Diagnostics), "The dry run covers the upgrade alone") {
+		t.Fatalf("%s / %s, calls %q", d, diagText(p.Diagnostics), f.ops())
+	}
+}
+
+// State without the VM's own key: the dry run runs, with a warning that the apply reads the key
+// first and refuses the change when it cannot.
+func TestVMPlanDryRunWithoutTheOwnKey(t *testing.T) {
+	t.Parallel()
+	h, f := newVMHarness(t)
+	f.then("retire", reply{exit: 1, stderr: "sudo: a password is required"})
+	f.then("hostkey", reply{exit: 1, stderr: "cat: permission denied"})
+	config := h.vmConfig("1.1.0", nil)
+	a := h.apply(nil, h.plan(nil, config).PlannedState, config)
+	if d := errorsOf(a.Diagnostics); d != "" || vmAttr(t, h, a.NewState, "host_key_line") != "<null>" {
+		t.Fatalf("%s %s", d, vmAttr(t, h, a.NewState, "host_key_line"))
+	}
+	f.reset()
+	f.set("dry-upgrade", reply{stdout: `{"format":1,"result":"nothing"}`})
+	p := h.plan(a.NewState, h.vmConfig("1.2.0", map[string]tftypes.Value{"plan_dry_run": boolean(true)}))
+	if d := errorsOf(p.Diagnostics); d != "" || len(f.callsOf("dry-upgrade")) != 1 || !strings.Contains(diagText(p.Diagnostics), "The VM's own host key is not known yet") {
+		t.Fatalf("%s / %s, calls %q", d, diagText(p.Diagnostics), f.ops())
+	}
+}
+
+// A rollback (state records previous) with allow_rollback not known yet: neither the plan's
+// rollback check nor the dry run decides; a warning, no error.
+func TestVMRollbackPlanWithAllowRollbackUnknown(t *testing.T) {
+	t.Parallel()
+	h, f := newVMHarness(t)
+	withPrev := strings.Replace(vmStatusJSON("1.2.0", "boot-1", ""), `"previous":null`, `"previous":{"version":"1.1.0","revision":1}`, 1)
+	f.set("describe", reply{stdout: describeOf("1.2.0", "")})
+	f.set("status", reply{stdout: withPrev})
+	state := h.create(h.vmConfig("1.2.0", nil))
+	f.reset()
+	p := h.plan(state, h.vmConfig("1.1.0", map[string]tftypes.Value{"plan_dry_run": boolean(true), "allow_rollback": tftypes.NewValue(tftypes.Bool, tftypes.UnknownValue)}))
+	if d := errorsOf(p.Diagnostics); d != "" || !strings.Contains(diagText(p.Diagnostics), "No dry run of this plan yet") || len(f.ops()) != 0 {
+		t.Fatalf("%s / %s, calls %q", d, diagText(p.Diagnostics), f.ops())
+	}
+	// Known false still refuses at plan.
+	if d := errorsOf(h.plan(state, h.vmConfig("1.1.0", nil)).Diagnostics); !strings.Contains(d, "a rollback needs allow_rollback") {
+		t.Fatalf("allow_rollback false: %q", d)
+	}
+}
+
+// Docker: a plan back to previous.installer with allow_rollback not known yet is no plan error.
+func TestPlanRollbackWithAllowRollbackUnknown(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	state := h.create(h.dockerConfig(nil))
+	h.fake.set("describe", reply{stdout: describe2})
+	h.fake.set("status", reply{stdout: status2})
+	up := h.update(state, h.dockerConfig(map[string]tftypes.Value{"installer": str(image2)}))
+	h.fake.reset()
+	p := h.plan(up.NewState, h.dockerConfig(map[string]tftypes.Value{"allow_rollback": tftypes.NewValue(tftypes.Bool, tftypes.UnknownValue), "plan_dry_run": boolean(true)}))
+	if d := errorsOf(p.Diagnostics); d != "" || !strings.Contains(diagText(p.Diagnostics), "No dry run of this plan yet") || len(h.fake.ops()) != 0 {
+		t.Fatalf("%s / %s, calls %q", d, diagText(p.Diagnostics), h.fake.ops())
+	}
+}
+
+// A VM whose OS carries an installer without --dry-run (Stowage before 0.38.0): the change is
+// planned without a dry run, with a warning, never a plan error.
+func TestVMPlanDryRunOnAnOlderOS(t *testing.T) {
+	t.Parallel()
+	h, f := newVMHarness(t)
+	state := h.create(h.vmConfig("1.1.0", nil))
+	f.reset()
+	f.set("dry-upgrade", reply{exit: 1, stderr: "Error: unknown flag: --dry-run\n"})
+	p := h.plan(state, h.vmConfig("1.2.0", map[string]tftypes.Value{"plan_dry_run": boolean(true)}))
+	if d := errorsOf(p.Diagnostics); d != "" || !strings.Contains(diagText(p.Diagnostics), "without --dry-run (built with Stowage before 0.38.0)") {
+		t.Fatalf("%s / %s", d, diagText(p.Diagnostics))
+	}
+	// What only the new release declares is still said to go unchecked.
+	p = h.plan(state, h.vmConfig("1.2.0", map[string]tftypes.Value{"plan_dry_run": boolean(true), "inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@b", "NEW_KEY": "x"})}))
+	if !strings.Contains(diagText(p.Diagnostics), "The dry run covers the upgrade alone") {
+		t.Fatalf("older OS, a later re-run: %s", diagText(p.Diagnostics))
+	}
+	// Any other failure stays a plan error.
+	f.set("dry-upgrade", reply{exit: 1, stderr: "Error: something else\n"})
+	if d := errorsOf(h.plan(state, h.vmConfig("1.2.0", map[string]tftypes.Value{"plan_dry_run": boolean(true)})).Diagnostics); !strings.Contains(d, "dry run of the VM's upgrade") {
+		t.Fatalf("another failure: %q", d)
+	}
+}
+
+// The provider's kubernetes block with an exec argument not known yet (a cluster made in the same
+// plan): no dry run, a warning, nothing reaches the cluster.
+func TestK8sPlanDryRunWaitsForTheProvidersCluster(t *testing.T) {
+	t.Parallel()
+	h := k8sHarness(t, nil)
+	state := h.create(h.k8sConfig(map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})}))
+	conn := h.ptyp.AttributeTypes["kubernetes"].(tftypes.Object)
+	execT := conn.AttributeTypes["exec"].(tftypes.Object)
+	args := tftypes.NewValue(tftypes.List{ElementType: tftypes.String}, []tftypes.Value{str("eks"), tftypes.NewValue(tftypes.String, tftypes.UnknownValue)})
+	h2 := newHarness(t, map[string]tftypes.Value{"kubernetes": fill(conn, map[string]tftypes.Value{"host": str("https://k8s.example:6443"),
+		"exec": fill(execT, map[string]tftypes.Value{"api_version": str("client.authentication.k8s.io/v1"), "command": str("aws"), "args": args})})})
+	p := h2.plan(state, h2.k8sConfig(map[string]tftypes.Value{"installer": str(image2), "plan_dry_run": boolean(true),
+		"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})}))
+	if d := errorsOf(p.Diagnostics); d != "" || !strings.Contains(diagText(p.Diagnostics), "No dry run of this plan yet") || len(h2.fake.ops()) != 0 {
+		t.Fatalf("%s / %s, calls %q", d, diagText(p.Diagnostics), h2.fake.ops())
+	}
+}
+
+// A value no dry run reads not known yet (deletion_protection from another resource): the dry run
+// runs all the same.
+func TestPlanDryRunIgnoresTheDestroysSettings(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, nil)
+	state := h.create(h.dockerConfig(map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})}))
+	h.fake.reset()
+	h.fake.set("describe", reply{stdout: describe2})
+	p := h.plan(state, h.dockerConfig(map[string]tftypes.Value{"installer": str(image2), "plan_dry_run": boolean(true),
+		"deletion_protection": tftypes.NewValue(tftypes.Bool, tftypes.UnknownValue), "inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})}))
+	if d := errorsOf(p.Diagnostics); d != "" || len(h.fake.callsOf("dry-upgrade")) != 1 {
+		t.Fatalf("%s / %s, calls %q", d, diagText(p.Diagnostics), h.fake.ops())
+	}
+}
+
+// allow_rollback not known yet with an input change beside the rollback: no plan error (the apply
+// decides between "needs allow_rollback" and "goes alone").
+func TestRollbackAloneWaitsForAllowRollback(t *testing.T) {
+	t.Parallel()
+	h, f := newVMHarness(t)
+	withPrev := strings.Replace(vmStatusJSON("1.2.0", "boot-1", ""), `"previous":null`, `"previous":{"version":"1.1.0","revision":1}`, 1)
+	f.set("describe", reply{stdout: describeOf("1.2.0", "")})
+	f.set("status", reply{stdout: withPrev})
+	state := h.create(h.vmConfig("1.2.0", nil))
+	cfg := h.vmConfig("1.1.0", map[string]tftypes.Value{"allow_rollback": tftypes.NewValue(tftypes.Bool, tftypes.UnknownValue),
+		"inputs": strMap(map[string]string{"ADMIN_EMAIL": "c@d"})})
+	if d := errorsOf(h.plan(state, cfg).Diagnostics); d != "" {
+		t.Fatalf("VM: %s", d)
+	}
+	dh := newHarness(t, nil)
+	ds := dh.create(dh.dockerConfig(nil))
+	dh.fake.set("describe", reply{stdout: describe2})
+	dh.fake.set("status", reply{stdout: status2})
+	up := dh.update(ds, dh.dockerConfig(map[string]tftypes.Value{"installer": str(image2)}))
+	if d := errorsOf(dh.plan(up.NewState, dh.dockerConfig(map[string]tftypes.Value{"allow_rollback": tftypes.NewValue(tftypes.Bool, tftypes.UnknownValue),
+		"inputs": strMap(map[string]string{"ADMIN_EMAIL": "c@d"})})).Diagnostics); d != "" {
+		t.Fatalf("Docker: %s", d)
+	}
+}

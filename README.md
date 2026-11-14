@@ -25,7 +25,7 @@ copy of a rule.
 **Status: beta** (0.1.0, released on GitHub, signed; not in a registry yet). The schema and
 behaviour may still change before 1.0, each change named in [CHANGELOG.md](CHANGELOG.md). What works: the Docker, Kubernetes and VM targets —
 create, read, update (inputs, then the release: upgrade or rollback), import and delete, with an
-opt-in plan-time dry run on Docker —, `stowage_vm_seed`, the first-boot material of a Kairos VM a
+opt-in plan-time dry run on each (the VM's needs Stowage 0.38.0 on its OS) —, `stowage_vm_seed`, the first-boot material of a Kairos VM a
 hypervisor's or cloud's resource makes, and the `stowage_install` data source. Each target
 is proven against a real installer: the Docker target over SSH (`make acc-docker`, Stowage
 0.35.0), the Kubernetes target on a kind cluster (`make acc-k8s`, 0.35.0 and 0.37.0), the VM

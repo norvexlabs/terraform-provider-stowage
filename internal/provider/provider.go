@@ -61,7 +61,10 @@ type Data struct {
 	RegistryCAKnown bool
 	// UsernameUnknown is true while the pull account's username is not known yet.
 	UsernameUnknown bool
-	NewRunner       RunnerFactory
+	// SettingsKnown: every setting a run reads is known (the pull account, the registry, its CA,
+	// the mirror's login); a plan's dry run is skipped otherwise.
+	SettingsKnown bool
+	NewRunner     RunnerFactory
 	// Kubernetes is the provider's kubernetes block, nil without one: the cluster every
 	// kubernetes target reaches.
 	Kubernetes *k8sConnModel
@@ -231,10 +234,12 @@ func (p *stowageProvider) Configure(ctx context.Context, req provider.ConfigureR
 		RegistryKnown:    !m.Registry.IsUnknown(),
 		RegistryCAKnown:  !m.RegistryCA.IsUnknown(),
 		UsernameUnknown:  m.Username.IsUnknown(),
-		NewRunner:        p.newRunner,
-		Poll:             p.poll,
-		TempDir:          p.tmp,
-		CacheDir:         p.cache,
+		SettingsKnown: !m.Username.IsUnknown() && !m.Password.IsUnknown() && !m.Registry.IsUnknown() && !m.RegistryCA.IsUnknown() &&
+			!m.RegistryUsername.IsUnknown() && !m.RegistryPassword.IsUnknown(),
+		NewRunner: p.newRunner,
+		Poll:      p.poll,
+		TempDir:   p.tmp,
+		CacheDir:  p.cache,
 	}
 	resp.ResourceData = d
 	resp.DataSourceData = d

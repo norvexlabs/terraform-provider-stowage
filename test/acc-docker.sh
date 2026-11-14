@@ -244,6 +244,7 @@ resource "stowage_install" "notes" {
   secret_inputs_wo_version = 1
   ports                    = { app = 18080, api = 18000 }
   allow_rollback           = ${ROLLBACK:-false}
+  plan_dry_run             = ${DRY:-false}
   deletion_protection      = ${PROTECT:-true}
   delete_data              = ${DATA:-false}
   docker {
@@ -269,6 +270,13 @@ apply_fails() {
 	local log=$WORK/$1.log re
 	shift
 	if tf apply -auto-approve -input=false >"$log" 2>&1; then cat "$log"; fail "$(basename "$log" .log): the apply succeeded"; fi
+	for re in "$@"; do tr -s ' \n' ' ' <"$log" | grep -E -- "$re" >/dev/null || { cat "$log"; fail "$(basename "$log" .log): no /$re/ in the error"; }; done
+}
+# plan_fails <log> <ERE…>: a plan that fails, its output matching each ERE.
+plan_fails() {
+	local log=$WORK/$1.log re
+	shift
+	if tf plan -input=false >"$log" 2>&1; then cat "$log"; fail "$(basename "$log" .log): the plan succeeded"; fi
 	for re in "$@"; do tr -s ' \n' ' ' <"$log" | grep -E -- "$re" >/dev/null || { cat "$log"; fail "$(basename "$log" .log): no /$re/ in the error"; }; done
 }
 # state <jq filter>: true when the filter holds on the resource's state.
@@ -345,6 +353,11 @@ env_is ADMIN_EMAIL refused@notes.test
 state ".version == \"3.0.0\" and .installer == \"$I3\" and .inputs.ADMIN_EMAIL == \"refused@notes.test\""
 INST=$I3 ADMIN=refused@notes.test NOTE=hello ROLLBACK=true config
 plan_nothing after-refused-upgrade
+
+step "plan_dry_run: the rollback across the barrier refused at plan, the barrier named"
+INST=$I1 ADMIN=refused@notes.test NOTE=hello ROLLBACK=true DRY=true config
+plan_fails dry-rollback 'notes moved to a new table' "The plan's dry run of the rollback"
+state ".version == \"3.0.0\" and .installer == \"$I3\""
 
 step "a rollback across the barrier: refused, the barrier named"
 INST=$I1 ADMIN=refused@notes.test NOTE=hello ROLLBACK=true config

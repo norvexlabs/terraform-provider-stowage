@@ -361,7 +361,7 @@ func connKnown(b *k8sConnModel) bool {
 		}
 	}
 	e := b.Exec
-	return e == nil || !(e.APIVersion.IsUnknown() || e.Command.IsUnknown() || e.Args.IsUnknown() || e.Env.IsUnknown())
+	return e == nil || !e.APIVersion.IsUnknown() && !e.Command.IsUnknown() && wholyKnown(e.Args) && wholyKnown(e.Env)
 }
 
 // k8sID is the resource's ID on Kubernetes.
@@ -881,49 +881,68 @@ func (run *k8sRun) login(ref string) *installer.Login {
 	return run.r.data.fetchLogin(host)
 }
 
-// k8sUpdate applies a plan to a release in DESIGN § 13's order: the inputs first, by `k8s upgrade
-// --given` of the running release's installer, state saved; then the release, by the new
-// release's `k8s upgrade` or the running one's `k8s rollback`.
-func (r *installResource) k8sUpdate(ctx context.Context, plan, state *installModel, secrets map[string]string, diags *diag.Diagnostics, save func(*installModel) bool) {
+// k8sPrep is what an update of a Kubernetes install reads and decides before it changes
+// anything: the apply's, and the plan's dry run's.
+type k8sPrep struct {
+	name          string
+	run           *k8sRun
+	cur, nextK    installer.K8s
+	st            *installer.Status
+	running, next *installer.Describe
+	runningRef    string
+	u             *update
+	step          releaseStep
+	rerun, up     installer.Change
+}
+
+// k8sPrepare reads the release and decides the update's step as the apply does, with every
+// refusal it makes before it runs anything: nil on one (said in diags). The caller closes
+// prep.run.
+func (r *installResource) k8sPrepare(ctx context.Context, plan, state *installModel, secrets map[string]string, diags *diag.Diagnostics, dry bool) *k8sPrep {
 	name := installName(plan)
 	run := r.k8sStart(ctx, plan, name, diags)
 	if run == nil {
-		return
+		return nil
 	}
-	defer run.close()
+	kept := false
+	defer func() {
+		if !kept {
+			run.close()
+		}
+	}()
 	statusRef := plan.Installer.ValueString()
 	if known(state.Installer) && state.Installer.ValueString() != "" {
 		statusRef = state.Installer.ValueString()
 	}
 	cur, ok := run.in("run", diags)
 	if !ok {
-		return
+		return nil
 	}
 	if err := run.script(ctx, cur, statusRef); err != nil {
 		addInstallerError(diags, "Fetching the installer", err)
-		return
+		return nil
 	}
 	st, err := cur.Status(ctx)
 	if err != nil {
 		addInstallerError(diags, "Reading the release", err)
-		return
+		return nil
 	}
 	switch {
 	case st == nil:
 		diags.AddError("No release to change", fmt.Sprintf("The namespace holds no release %s: an import names a release that exists; otherwise `tofu state rm` this resource and apply to install again.", k8sID(cur)))
-		return
+		return nil
 	case st.Name != name:
 		diags.AddError("Another project's release", fmt.Sprintf("The release %s holds %q, not %q.", k8sID(cur), st.Name, name))
-		return
+		return nil
 	case st.Installing:
 		helmBusy(diags, "helm is installing the release", cur)
-		return
+		return nil
 	case helmBusyOf(st) != "":
 		helmBusy(diags, helmBusyOf(st), cur)
-		return
+		return nil
 	case st.Installed == nil:
 		diags.AddError("Nothing runs", fmt.Sprintf("The release %s was uninstalled (helm keeps its history): `k8s rollback` brings it back, or `tofu state rm` this resource and apply to install again.", k8sID(cur)))
-		return
+		return nil
 	}
 	// One the release records is the cluster's word: of this project, by digest, from the
 	// configured installer's registry, or never fetched or run here.
@@ -931,7 +950,7 @@ func (r *installResource) k8sUpdate(ctx context.Context, plan, state *installMod
 	if ut != nil {
 		// Never fetched or run here, and nothing is run over it: refused before anything changes.
 		untrustedDiag(diags, true, "", cur, ut.ref, ut.why, plan.Installer.ValueString())
-		return
+		return nil
 	}
 	// The release records no installer (its values do not): state's, else the desired one, which
 	// must then carry the release that runs.
@@ -946,42 +965,59 @@ func (r *installResource) k8sUpdate(ctx context.Context, plan, state *installMod
 		running, err = cur.Describe(ctx)
 		if err != nil {
 			addInstallerError(diags, "Reading the installer of the release that runs", err)
-			return
+			return nil
 		}
 		cur = cur.Without(running)
 	}
 	if running == nil {
-		return
+		return nil
 	}
 	if st.Installed.Installer == "" && !running.Release.Same(*st.Installed) {
 		diags.AddAttributeError(path.Root("installer"), "the release names no installer",
 			fmt.Sprintf("The release %s runs %s %s (revision %d) and records no installer; %s carries %s (revision %d): set installer to %s %s's, apply (the release is taken over), then change installer.",
 				k8sID(cur), name, st.Installed.Version, st.Installed.Revision, runningRef, running.Release.Version, running.Release.Revision, name, st.Installed.Version))
-		return
+		return nil
 	}
 	u := &update{r: r, plan: plan, state: state, secrets: secrets, diags: diags}
-	step, next, nextK := r.k8sReleaseStep(ctx, run, u, st, runningRef)
+	step, next, nextK := r.k8sReleaseStep(ctx, run, u, st, runningRef, running, dry)
 	if diags.HasError() {
-		return
+		return nil
 	}
 	rerun, up := u.split(ctx, running, next)
 	refuseSecretInputs(diags, stringMap(ctx, plan.Inputs, diags), running, next)
 	refuseRunEnvInputs(diags, []string{"KUBECONFIG"}, "", stringMap(ctx, plan.Inputs, diags), secrets)
 	if diags.HasError() {
-		return
+		return nil
 	}
 	switch {
 	case step == rollback && imported(state):
 		diags.AddAttributeError(path.Root("installer"), "a rollback of an imported install",
 			fmt.Sprintf("An imported release is taken over first: apply with installer = %s, the release it runs, then set installer back to previous.installer.", runningRef))
-		return
+		return nil
 	case step == rollback && !rerun.Empty():
 		rollbackAlone(diags, "inputs or secret inputs")
-		return
+		return nil
 	case step == rollback && plan.Kubernetes.ImagePullLogin.ValueBool() && !state.Kubernetes.ImagePullLogin.ValueBool():
 		rollbackAlone(diags, "image_pull_login") // helm's rollback writes no pull Secret
+		return nil
+	}
+	kept = true
+	return &k8sPrep{name: name, run: run, cur: cur, nextK: nextK, st: st, running: running, next: next, runningRef: runningRef, u: u, step: step, rerun: rerun, up: up}
+}
+
+// k8sUpdate applies a plan to a release in DESIGN § 13's order: the inputs first, by `k8s upgrade
+// --given` of the running release's installer, state saved; then the release, by the new
+// release's `k8s upgrade` or the running one's `k8s rollback`.
+func (r *installResource) k8sUpdate(ctx context.Context, plan, state *installModel, secrets map[string]string, diags *diag.Diagnostics, save func(*installModel) bool) {
+	p := r.k8sPrepare(ctx, plan, state, secrets, diags, false)
+	if p == nil {
 		return
 	}
+	defer p.run.close()
+	name, runningRef, u, step := p.name, p.runningRef, p.u, p.step
+	st, cur, running := p.st, p.cur, p.running // the release as read, and its installer
+	next, nextK := p.next, p.nextK             // the new release, on an upgrade
+	rerun, up := p.rerun, p.up                 // what the running release's re-run and the upgrade are given
 	short := running.ShortName
 	base := state // what the final read falls back to: the state saved last
 	if rerun.Empty() && step == stay && plan.Kubernetes.ImagePullLogin.ValueBool() && !state.Kubernetes.ImagePullLogin.ValueBool() {
@@ -1102,7 +1138,7 @@ func k8sFill(m *installModel, k installer.K8s, short, registry string, ca types.
 // k8sReleaseStep decides the release change, as the Docker target's releaseStep: none when the
 // release runs the desired installer (or the plan keeps state's), rollback to previous with
 // allow_rollback, else the desired installer's upgrade, fetched and described here.
-func (r *installResource) k8sReleaseStep(ctx context.Context, run *k8sRun, u *update, st *installer.Status, runningRef string) (releaseStep, *installer.Describe, installer.K8s) {
+func (r *installResource) k8sReleaseStep(ctx context.Context, run *k8sRun, u *update, st *installer.Status, runningRef string, running *installer.Describe, dry bool) (releaseStep, *installer.Describe, installer.K8s) {
 	desired := u.plan.Installer.ValueString()
 	switch {
 	case runningRef == desired:
@@ -1110,12 +1146,15 @@ func (r *installResource) k8sReleaseStep(ctx context.Context, run *k8sRun, u *up
 	case u.plan.Installer.Equal(u.state.Installer) && !imported(u.state):
 		return stay, nil, installer.K8s{}
 	case st.Previous != nil && st.Previous.Installer == desired:
-		if !u.plan.AllowRollback.ValueBool() {
+		if rollbackRefused(u.plan.AllowRollback) {
 			u.diags.AddAttributeError(path.Root("allow_rollback"), "a rollback needs allow_rollback",
 				fmt.Sprintf("installer is %s, the release the last upgrade replaced: reaching it is k8s rollback, which takes the previous release back. Set allow_rollback = true to roll back.", desired))
 			return stay, nil, installer.K8s{}
 		}
 		return rollback, nil, installer.K8s{}
+	}
+	if dry && u.rerunCertain(ctx, running) {
+		return stay, nil, installer.K8s{}
 	}
 	k, next := run.fetch(ctx, "next", desired, u.diags)
 	if next == nil {

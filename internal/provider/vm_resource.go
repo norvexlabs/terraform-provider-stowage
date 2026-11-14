@@ -99,11 +99,17 @@ func planVM(ctx context.Context, plan, state *installModel, resp *resource.Modif
 	desired := plan.VM.Version.ValueString()
 	if !plan.VM.Version.Equal(state.VM.Version) {
 		if prev := previousVersion(ctx, state); prev != "" && prev == desired {
-			if !plan.AllowRollback.ValueBool() {
+			// allow_rollback not known yet is the apply's to read: only a known false refuses now.
+			switch {
+			case !known(plan.AllowRollback):
+				// Not known yet: the apply reads it and refuses or rolls back alone.
+			case rollbackRefused(plan.AllowRollback):
 				resp.Diagnostics.AddAttributeError(path.Root("allow_rollback"), "a rollback needs allow_rollback",
 					fmt.Sprintf("vm.version is now %s, the release the VM's last upgrade replaced (previous.version): reaching it is `rollback`, which reboots the VM into its passive system, the previous release (every input keeps its value). Set allow_rollback = true to roll back, or set vm.version back to %s.", prev, state.VM.Version.ValueString()))
-			} else if changed := slices.DeleteFunc(remoteChange(plan, state), func(a string) bool { return a == "vm.version" }); len(changed) > 0 {
-				vmRollbackAlone(&resp.Diagnostics, strings.Join(changed, ", "))
+			default:
+				if changed := slices.DeleteFunc(remoteChange(plan, state), func(a string) bool { return a == "vm.version" }); len(changed) > 0 {
+					vmRollbackAlone(&resp.Diagnostics, strings.Join(changed, ", "))
+				}
 			}
 		}
 	}
@@ -859,72 +865,14 @@ func (r *installResource) updateVM(ctx context.Context, req resource.UpdateReque
 		resp.Diagnostics.Append(resp.State.Set(ctx, m)...)
 		return !resp.Diagnostics.HasError()
 	}
-	// The connection is the plan's, with the keys state learnt.
-	conn := *plan
-	vmc := *plan.VM
-	vmc.HostKeyLine, vmc.SeedBootID = state.VM.HostKeyLine, state.VM.SeedBootID
-	conn.VM = &vmc
-	v, err := r.vm(&conn)
-	if err != nil {
-		resp.Diagnostics.AddError("Cannot reach the VM", err.Error())
+	p := r.vmPrepare(ctx, plan, state, secrets, &resp.Diagnostics)
+	if p == nil {
 		return
 	}
-	st, err := v.Status(ctx)
-	if err != nil {
-		addInstallerError(&resp.Diagnostics, "Reading the VM", renamed(ctx, v, err))
-		return
-	}
-	if st.Installed == nil {
-		resp.Diagnostics.AddError("No install to change", "The VM holds no install: `tofu state rm` this resource and apply to install again.")
-		return
-	}
-	running, err := v.Describe(ctx)
-	if err != nil {
-		addInstallerError(&resp.Diagnostics, "Reading the VM's installer", err)
-		return
-	}
+	conn, v, st, step, u := p.conn, p.v, p.st, p.step, p.u
+	now, later := p.now, p.later // what the running release's re-run, and the new release's, are given
+	var err error
 	desired := plan.VM.Version.ValueString()
-	step := stay
-	switch {
-	// The release changes only when the plan changes it: a VM that runs another release than
-	// state says (a refresh skipped) is the next refresh's to show.
-	case plan.VM.Version.Equal(state.VM.Version) && !imported(state):
-	case st.Installed.Version == desired:
-	case st.Previous != nil && st.Previous.Version == desired:
-		if !plan.AllowRollback.ValueBool() {
-			resp.Diagnostics.AddAttributeError(path.Root("allow_rollback"), "a rollback needs allow_rollback",
-				fmt.Sprintf("vm.version is %s, the release the VM's last upgrade replaced: reaching it is `rollback`, which reboots the VM into the previous release (every input keeps its value). Set allow_rollback = true to roll back.", desired))
-			return
-		}
-		step = rollback
-	default:
-		step = upgrade
-	}
-	u := &update{r: r, plan: plan, state: state, secrets: secrets, diags: &resp.Diagnostics}
-	now, later := vmSplit(ctx, u, running, step == upgrade)
-	refuseSecretInputs(&resp.Diagnostics, stringMap(ctx, plan.Inputs, &resp.Diagnostics), running)
-	if resp.Diagnostics.HasError() {
-		return
-	}
-	if step == rollback && !now.Empty() {
-		vmRollbackAlone(&resp.Diagnostics, "inputs, secret inputs, tls, domains or ports")
-		return
-	}
-	// An imported state records the configuration's vm.channel, first-install only from then on:
-	// it must be the channel the VM follows.
-	if imported(state) && !vmChannelCheck(&resp.Diagnostics, plan.VM.Channel, st.Channel, "Nothing was run.") {
-		return
-	}
-	if step != stay && st.BootID == "" {
-		resp.Diagnostics.AddError("The VM reports no boot_id",
-			"Its status has no boot_id, so the release change's reboot could not be followed: nothing was run. Read `<short>-stow status` on the VM.")
-		return
-	}
-	if step != stay && st.Events == nil {
-		resp.Diagnostics.AddError("The VM reports no event journal",
-			fmt.Sprintf("Its status has no events (%s), so the health gate's verdict on the release change's reboot could not be read: nothing was run. Read `<short>-stow status` on the VM.", cmp.Or(st.EventsError, "no events_error either")))
-		return
-	}
 	// The keys, before anything else changes on the VM: its own, when state has none yet (it
 	// could not be read at create; an imported state), learnt as a create learns it — read, the
 	// one-time key retired; or the retirement a create could not make, tried again. Either is
@@ -1013,6 +961,98 @@ func (r *installResource) updateVM(ctx context.Context, req resource.UpdateReque
 	tried := !known(state.VM.HostKeyLine) && known(seed)
 	vu := &vmUpdate{r: r, v: v, tried: tried, diags: &resp.Diagnostics, save: save}
 	vu.release(ctx, &final, &was, st, desired, later, step == rollback)
+}
+
+// vmPrep is what an update of a VM reads and decides before it changes anything: the apply's,
+// and the plan's dry run's.
+type vmPrep struct {
+	conn       installModel // the plan's connection, with the keys state learnt
+	v          installer.VM
+	st         *installer.VMStatus
+	step       releaseStep
+	u          *update
+	now, later installer.Change
+}
+
+// vmPrepare reads the VM and decides the update's step as the apply does, with every refusal it
+// makes before it runs anything: nil on one (said in diags).
+func (r *installResource) vmPrepare(ctx context.Context, plan, state *installModel, secrets map[string]string, diags *diag.Diagnostics) *vmPrep {
+	// The connection is the plan's, with the keys state learnt.
+	conn := *plan
+	vmc := *plan.VM
+	vmc.HostKeyLine, vmc.SeedBootID = state.VM.HostKeyLine, state.VM.SeedBootID
+	conn.VM = &vmc
+	v, err := r.vm(&conn)
+	if err != nil {
+		diags.AddError("Cannot reach the VM", err.Error())
+		return nil
+	}
+	st, err := v.Status(ctx)
+	if err != nil {
+		addInstallerError(diags, "Reading the VM", renamed(ctx, v, err))
+		return nil
+	}
+	if st.Installed == nil {
+		diags.AddError("No install to change", "The VM holds no install: `tofu state rm` this resource and apply to install again.")
+		return nil
+	}
+	running, err := v.Describe(ctx)
+	if err != nil {
+		addInstallerError(diags, "Reading the VM's installer", err)
+		return nil
+	}
+	step := vmStep(plan, state, st, diags)
+	if diags.HasError() {
+		return nil
+	}
+	u := &update{r: r, plan: plan, state: state, secrets: secrets, diags: diags}
+	now, later := vmSplit(ctx, u, running, step == upgrade)
+	refuseSecretInputs(diags, stringMap(ctx, plan.Inputs, diags), running)
+	if diags.HasError() {
+		return nil
+	}
+	if step == rollback && !now.Empty() {
+		vmRollbackAlone(diags, "inputs, secret inputs, tls, domains or ports")
+		return nil
+	}
+	// An imported state records the configuration's vm.channel, first-install only from then on:
+	// it must be the channel the VM follows.
+	if imported(state) && !vmChannelCheck(diags, plan.VM.Channel, st.Channel, "Nothing was run.") {
+		return nil
+	}
+	if step != stay && st.BootID == "" {
+		diags.AddError("The VM reports no boot_id",
+			"Its status has no boot_id, so the release change's reboot could not be followed: nothing was run. Read `<short>-stow status` on the VM.")
+		return nil
+	}
+	if step != stay && st.Events == nil {
+		diags.AddError("The VM reports no event journal",
+			fmt.Sprintf("Its status has no events (%s), so the health gate's verdict on the release change's reboot could not be read: nothing was run. Read `<short>-stow status` on the VM.", cmp.Or(st.EventsError, "no events_error either")))
+		return nil
+	}
+	return &vmPrep{conn: conn, v: v, st: st, step: step, u: u, now: now, later: later}
+}
+
+// vmStep is the release step an update of a VM makes from st, its status (installed): an error in
+// diags for a rollback without allow_rollback.
+func vmStep(plan, state *installModel, st *installer.VMStatus, diags *diag.Diagnostics) releaseStep {
+	desired := plan.VM.Version.ValueString()
+	switch {
+	// The release changes only when the plan changes it: a VM that runs another release than
+	// state says (a refresh skipped) is the next refresh's to show.
+	case plan.VM.Version.Equal(state.VM.Version) && !imported(state):
+	case st.Installed.Version == desired:
+	case st.Previous != nil && st.Previous.Version == desired:
+		if rollbackRefused(plan.AllowRollback) {
+			diags.AddAttributeError(path.Root("allow_rollback"), "a rollback needs allow_rollback",
+				fmt.Sprintf("vm.version is %s, the release the VM's last upgrade replaced: reaching it is `rollback`, which reboots the VM into the previous release (every input keeps its value). Set allow_rollback = true to roll back.", desired))
+			return stay
+		}
+		return rollback
+	default:
+		return upgrade
+	}
+	return stay
 }
 
 // rekey is m with the keys given, and the driver accepting them: every change of the keys an

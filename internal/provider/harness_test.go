@@ -55,6 +55,8 @@ func (c call) op() string {
 	case installer.K8sScript:
 		// sh -c K8sScript sh <dir> <kubeconfig> <files> <host> <user> sh ./<name>.sh <args…>
 		switch {
+		case len(c.argv) > 12 && c.argv[11] == "k8s" && contains(c.argv, "--dry-run"):
+			return "k8s-dry-" + c.argv[12]
 		case len(c.argv) > 12 && c.argv[11] == "k8s":
 			return "k8s-" + c.argv[12]
 		case len(c.argv) > 11:

@@ -103,10 +103,6 @@ func (r *installResource) ValidateConfig(ctx context.Context, req resource.Valid
 		resp.Diagnostics.AddAttributeError(path.Root("installer"), "installer is required",
 			"Give the installer image by digest, <prefix>/<name>-installer@sha256:<64 hex>, as `ship` prints it.")
 	}
-	if m.Docker == nil && (m.VM != nil || m.Kubernetes != nil) && m.PlanDryRun.ValueBool() {
-		resp.Diagnostics.AddAttributeError(path.Root("plan_dry_run"), "plan_dry_run is Docker's",
-			"A plan's dry run runs on a Docker target alone: a plan of a Kubernetes or VM install runs nothing on the target. Remove plan_dry_run.")
-	}
 	if m.VM != nil && m.DeleteData.ValueBool() {
 		resp.Diagnostics.AddAttributeError(path.Root("delete_data"), "delete_data is not the VM's",
 			"A destroy of a VM's install forgets it and deletes nothing: the VM's data goes with the VM, removed by its hypervisor's or cloud's resource. Remove delete_data.")
@@ -421,6 +417,10 @@ func previousInstaller(ctx context.Context, m *installModel) string {
 	return prev.Installer.ValueString()
 }
 
+// rollbackRefused is the one rule of allow_rollback: a rollback is refused on a known false; a
+// value not known yet (at plan, from another resource) is the apply's to read, where it is known.
+func rollbackRefused(allow types.Bool) bool { return known(allow) && !allow.ValueBool() }
+
 // planRollback refuses, at plan time, a change of the release back to the previous one without
 // allow_rollback: a rollback takes the previous release back, so a variable edit never makes one.
 func (r *installResource) planRollback(ctx context.Context, plan, state *installModel, diags *diag.Diagnostics) {
@@ -428,7 +428,10 @@ func (r *installResource) planRollback(ctx context.Context, plan, state *install
 		return
 	}
 	if prev := previousInstaller(ctx, state); prev != "" && prev == plan.Installer.ValueString() {
-		if plan.AllowRollback.ValueBool() {
+		if !known(plan.AllowRollback) {
+			return // not known yet: the apply reads it and refuses or rolls back alone
+		}
+		if !rollbackRefused(plan.AllowRollback) {
 			if changed := slices.DeleteFunc(remoteChange(plan, state), func(a string) bool { return a == "installer" }); len(changed) > 0 {
 				rollbackAlone(diags, strings.Join(changed, ", "))
 			}
@@ -1232,7 +1235,7 @@ func (u *update) releaseStep(ctx context.Context, d installer.Docker, st *instal
 	case u.plan.Installer.Equal(u.state.Installer) && !imported(u.state):
 		return stay, nil
 	case st.Previous != nil && st.Previous.Installer == desired:
-		if !u.plan.AllowRollback.ValueBool() {
+		if rollbackRefused(u.plan.AllowRollback) {
 			u.diags.AddAttributeError(path.Root("allow_rollback"), "a rollback needs allow_rollback",
 				fmt.Sprintf("installer is %s, the release the install's last upgrade replaced: reaching it is the kept installer's rollback, which takes the previous release back (every input keeps its value). Set allow_rollback = true to roll back.", desired))
 			return stay, nil

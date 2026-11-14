@@ -7,13 +7,19 @@ follow [SemVer](https://semver.org/).
 
 The provider is in **beta**: the Docker, Kubernetes and VM targets are proven by their acceptance
 tests (Docker and the VM against Stowage 0.35.0, Kubernetes against 0.35.0 and 0.37.0; the VM's
-import is proven by unit tests until its acceptance walk runs); its schema and behaviour may still
-change before 1.0, each change named here.
+import, and the plan-time dry runs on Kubernetes and the VM, are proven by unit tests until the
+acceptance walks run against Stowage 0.38.0); its schema and behaviour may still change before 1.0,
+each change named here.
+
+### Added
+
+- `plan_dry_run` on Kubernetes and the VM: a plan changing the release runs the new installer's `k8s
+  upgrade --dry-run` (or `k8s rollback --dry-run`), or the VM's `upgrade --version V --dry-run` (or
+  `rollback --dry-run`) over SSH, so a refusal is a plan error; the VM's OS needs Stowage 0.38.0 or
+  later.
 
 ### Changed
 
-- `plan_dry_run = true` with a `kubernetes` or `vm` block is refused at validation (`plan_dry_run is
-  Docker's`): their plans run nothing on the target, so the setting checked nothing.
 - `delete_data = true` with a `vm` block is refused at validation (`delete_data is not the VM's`): a
   VM's destroy forgets the install and deletes nothing, its data going with the VM.
 - A read of a Docker host or VM that ssh fails (exit 255) is an error naming what ssh met and the

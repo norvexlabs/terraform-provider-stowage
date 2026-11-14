@@ -45,10 +45,7 @@ func TestSchemaValidation(t *testing.T) {
 		"vm with installer": {fill(h.typ, map[string]tftypes.Value{"installer": str(image), "vm": vmBlock}), "installer is not the VM's release"},
 		"vm without version": {fill(h.typ, map[string]tftypes.Value{"vm": h.block("vm", map[string]tftypes.Value{
 			"host": str("vm.example"), "user": str("ops"), "known_hosts_line": str(hostLine)})}), "vm.version is required"},
-		"vm with plan_dry_run": {fill(h.typ, map[string]tftypes.Value{"plan_dry_run": boolean(true), "vm": vmBlock}), "plan_dry_run is Docker's"},
-		"vm with delete_data":  {fill(h.typ, map[string]tftypes.Value{"delete_data": boolean(true), "vm": vmBlock}), "delete_data is not the VM's"},
-		"k8s with plan_dry_run": {fill(h.typ, map[string]tftypes.Value{"installer": str(image), "plan_dry_run": boolean(true),
-			"kubernetes": h.block("kubernetes", map[string]tftypes.Value{"namespace": str("notes")})}), "plan_dry_run is Docker's"},
+		"vm with delete_data":   {fill(h.typ, map[string]tftypes.Value{"delete_data": boolean(true), "vm": vmBlock}), "delete_data is not the VM's"},
 		"k8s without namespace": {fill(h.typ, map[string]tftypes.Value{"installer": str(image), "kubernetes": h.block("kubernetes", nil)}), "kubernetes.namespace is required"},
 		"host, no known_hosts":  {h.dockerConfig(map[string]tftypes.Value{"docker": ssh(map[string]tftypes.Value{"known_hosts_line": tftypes.NewValue(tftypes.String, nil)})}), "known_hosts_line is required with host"},
 		"bad known_hosts":       {h.dockerConfig(map[string]tftypes.Value{"docker": ssh(map[string]tftypes.Value{"known_hosts_line": str("@cert-authority * ssh-ed25519 " + edKey)})}), "known_hosts_line does not parse"},
@@ -71,13 +68,17 @@ func TestSchemaValidation(t *testing.T) {
 			t.Errorf("%s: got %q, want %q", name, got, c.want)
 		}
 	}
-	// plan_dry_run: on Docker taken, off Docker taken while false.
+	// plan_dry_run is taken on every target.
 	if d := errorsOf(h.validate(h.dockerConfig(map[string]tftypes.Value{"plan_dry_run": boolean(true)}))); d != "" {
 		t.Errorf("plan_dry_run on Docker: %s", d)
 	}
-	if d := errorsOf(h.validate(fill(h.typ, map[string]tftypes.Value{"plan_dry_run": boolean(false), "delete_data": boolean(false), "vm": h.block("vm", map[string]tftypes.Value{
+	if d := errorsOf(h.validate(fill(h.typ, map[string]tftypes.Value{"plan_dry_run": boolean(true), "delete_data": boolean(false), "vm": h.block("vm", map[string]tftypes.Value{
 		"host": str("vm.example"), "user": str("ops"), "known_hosts_line": str(hostLine), "version": str("1.2.0"), "short_name": str("notes")})}))); d != "" {
-		t.Errorf("plan_dry_run = false on a VM: %s", d)
+		t.Errorf("plan_dry_run on a VM: %s", d)
+	}
+	if d := errorsOf(h.validate(fill(h.typ, map[string]tftypes.Value{"installer": str(image), "plan_dry_run": boolean(true),
+		"kubernetes": h.block("kubernetes", map[string]tftypes.Value{"namespace": str("notes")})}))); d != "" {
+		t.Errorf("plan_dry_run on Kubernetes: %s", d)
 	}
 	// A write-only map without its version is applied once only: a warning says so.
 	got := h.validate(h.dockerConfig(map[string]tftypes.Value{"secret_inputs_wo": strMap(map[string]string{"K": "y"})}))

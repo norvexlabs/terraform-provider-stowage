@@ -255,10 +255,59 @@ var ErrCut = errors.New("the connection ended before the result")
 // Upgrade runs `sudo -n <short>-stow upgrade --version version --yes --json`: the job ends as it
 // schedules the reboot, so the result's release is the one installed before it.
 func (v VM) Upgrade(ctx context.Context, version string) (*Result, error) {
-	if version == "" || strings.HasPrefix(version, "-") || strings.ContainsAny(version, " \t\r\n") {
-		return nil, fmt.Errorf("vm.version %q is not a version", version)
+	if err := versionArg(version); err != nil {
+		return nil, err
 	}
 	return v.rebooting(ctx, "upgrade", "upgrade", "--version", version, "--yes", "--json")
+}
+
+// versionArg refuses a vm.version that is no command-line argument: empty, an option, or holding
+// a blank.
+func versionArg(version string) error {
+	if version == "" || strings.HasPrefix(version, "-") || strings.ContainsAny(version, " \t\r\n") {
+		return fmt.Errorf("vm.version %q is not a version", version)
+	}
+	return nil
+}
+
+// DryRunUpgrade runs `sudo -n <short>-stow upgrade --version version --dry-run --json`: every
+// check the upgrade runs before its job, nothing asked, nothing changed.
+func (v VM) DryRunUpgrade(ctx context.Context, version string) (*Result, error) {
+	if err := versionArg(version); err != nil {
+		return nil, err
+	}
+	return v.dryRun(ctx, "upgrade --dry-run", "upgrade", "--version", version, "--dry-run", "--json")
+}
+
+// DryRunRollback runs `sudo -n <short>-stow rollback --dry-run --json`: every check the rollback
+// runs before its job, nothing asked, nothing changed.
+func (v VM) DryRunRollback(ctx context.Context) (*Result, error) {
+	return v.dryRun(ctx, "rollback --dry-run", "rollback", "--dry-run", "--json")
+}
+
+// ErrNoDryRun is a VM's `<short>-stow` that has no --dry-run on upgrade and rollback: one of an
+// OS built with Stowage before 0.38.0.
+var ErrNoDryRun = errors.New("the VM's installer has no --dry-run (an OS built with Stowage before 0.38.0)")
+
+// dryRun runs `sudo -n <short>-stow <args…>`, a verb's dry run: logged as the verbs are, and a
+// connection cut before its result is an error like any other (nothing was scheduled). An
+// installer that does not know the flag is ErrNoDryRun.
+func (v VM) dryRun(ctx context.Context, verb string, args ...string) (*Result, error) {
+	ctl, err := v.ctl()
+	if err != nil {
+		return nil, err
+	}
+	argv := append([]string{"sudo", "-n", ctl}, args...)
+	stdout, stderr, exit, err := v.Runner.Run(ctx, argv, nil)
+	logRun(ctx, argv, stdout, stderr, false, exit, err)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", verb, err)
+	}
+	// pflag's refusal of an unknown flag: "unknown flag: --dry-run".
+	if exit != 0 && exit != 3 && bytes.Contains(stderr, []byte("unknown flag")) && bytes.Contains(stderr, []byte("--dry-run")) {
+		return nil, fmt.Errorf("%s: %w", verb, ErrNoDryRun)
+	}
+	return Outcome(verb, stdout, stderr, exit)
 }
 
 // Rollback runs `sudo -n <short>-stow rollback --yes --json`: the reboot into the passive

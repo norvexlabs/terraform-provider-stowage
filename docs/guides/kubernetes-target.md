@@ -84,6 +84,19 @@ operation first refuses a machine that is not linux/amd64 and names the programs
   uninstalled with its history kept: `not installed`). An imported state,
   never applied, is not read; nor is any while a value of the provider's `kubernetes` block is not
   known yet (its cluster made again in the same plan): state stands until the apply.
+- **Plan, with `plan_dry_run`**: a plan changing `installer` reads the release and chooses the step
+  as the update does (the same reads, fetches, checks and errors, in a private directory on this
+  machine removed after), then runs the new installer's `k8s upgrade --dry-run --no-input --json`
+  given what the upgrade would be (the inputs and secret inputs the new release adds) — the
+  installer's checks and its chart pulled, the deploy it would make printed, nothing applied and
+  helm not run — or `k8s rollback --dry-run --json`, the installer's checks and helm's own dry run of
+  the rollback. A refusal is a plan error, its reason the summary and its fix the detail. A plan
+  that also re-runs the running release gets a warning instead (`No dry run of this plan`), told
+  before the new installer is fetched when the change is the running release's whatever the new one
+  is. While any value of the configuration (but `deletion_protection`, `delete_data` and `timeouts`), the provider's `kubernetes` block or a setting a run reads (the pull account, `registry`, `registry_ca`, the
+  mirror's login) is not known, no dry run, with a warning (`No dry run of this plan yet`): OpenTofu
+  plans again at apply, with it known, and that plan runs it (a dry run runs again there in any
+  case). Skipped for an imported state never applied.
 - **Update**: a change of the provider's own settings alone touches nothing. Otherwise, in
   DESIGN § 13's order:
   1. `k8s status --json`, by state's installer (an imported state's: the desired one). No release,

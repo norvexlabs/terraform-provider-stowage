@@ -322,6 +322,15 @@ func (k K8s) Reapply(ctx context.Context, registryCA string) (*Result, error) {
 // Upgrade runs the fetched bootstrap script's `k8s upgrade`: the new release's installer, given
 // the inputs the release adds.
 func (k K8s) Upgrade(ctx context.Context, c Change, registryCA string) (*Result, error) {
+	return k.upgrade(ctx, c, registryCA, false)
+}
+
+// DryRunUpgrade is Upgrade with `--dry-run`: what the upgrade would refuse, changing nothing.
+func (k K8s) DryRunUpgrade(ctx context.Context, c Change, registryCA string) (*Result, error) {
+	return k.upgrade(ctx, c, registryCA, true)
+}
+
+func (k K8s) upgrade(ctx context.Context, c Change, registryCA string, dry bool) (*Result, error) {
 	args, files, err := k8sChange(Change{Inputs: c.Inputs, SecretInputs: c.SecretInputs, Ports: c.Ports})
 	if err != nil {
 		return nil, err
@@ -329,12 +338,17 @@ func (k K8s) Upgrade(ctx context.Context, c Change, registryCA string) (*Result,
 	if registryCA != "" {
 		files["registry-ca"] = registryCA
 	}
-	args, login := k.pull(append(k.verb("upgrade", "--no-input", "--json"), args...))
+	verb := "k8s upgrade"
+	flags := []string{"--no-input", "--json"}
+	if dry {
+		verb, flags = "k8s upgrade --dry-run", append(flags, "--dry-run")
+	}
+	args, login := k.pull(append(k.verb("upgrade", flags...), args...))
 	stdout, stderr, exit, err := k.runLogin(ctx, login, files, args...)
 	if err != nil {
-		return nil, fmt.Errorf("k8s upgrade: %w", err)
+		return nil, fmt.Errorf("%s: %w", verb, err)
 	}
-	return Outcome("k8s upgrade", stdout, stderr, exit)
+	return Outcome(verb, stdout, stderr, exit)
 }
 
 // Rollback runs `k8s rollback --json`: back one upgrade, to the release status --json names
@@ -345,6 +359,16 @@ func (k K8s) Rollback(ctx context.Context) (*Result, error) {
 		return nil, fmt.Errorf("k8s rollback: %w", err)
 	}
 	return Outcome("k8s rollback", stdout, stderr, exit)
+}
+
+// DryRunRollback runs `k8s rollback --dry-run --json`: what the rollback would refuse, changing
+// nothing.
+func (k K8s) DryRunRollback(ctx context.Context) (*Result, error) {
+	stdout, stderr, exit, err := k.run(ctx, nil, k.verb("rollback", "--dry-run", "--json")...)
+	if err != nil {
+		return nil, fmt.Errorf("k8s rollback --dry-run: %w", err)
+	}
+	return Outcome("k8s rollback --dry-run", stdout, stderr, exit)
 }
 
 // Uninstall runs `k8s uninstall --yes`, with --data when data is true.

@@ -17,9 +17,4 @@ installable and verifiable by a user. A finished item is deleted, not ticked.
 
 ## Should
 
-1. **A plan-time dry run on Kubernetes**: `plan_dry_run` is Docker's alone (refused elsewhere);
-   Stowage's `k8s upgrade --dry-run` and `k8s rollback --dry-run` exist, run locally like every
-   Kubernetes verb.
-2. **A plan-time dry run on the VM** — blocked on Stowage: the VM's `<short>-stow upgrade` and
-   `rollback` have no `--dry-run` (Stowage 0.37.0), which DESIGN § 13's "an upgrade's dry run over
-   SSH" needs; Stowage is adding it.
+None.

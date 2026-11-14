@@ -86,6 +86,8 @@ func vmOp(argv []string) string {
 		return "boot"
 	case len(argv) == 5 && argv[0] == "sudo" && argv[3] == "host-key" && argv[4] == "--json":
 		return "retire"
+	case len(argv) > 3 && argv[0] == "sudo" && contains(argv, "--dry-run"):
+		return "dry-" + argv[3]
 	case len(argv) > 3 && argv[0] == "sudo":
 		return argv[3]
 	case len(argv) == 2 && argv[0] == "cat":

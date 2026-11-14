@@ -179,6 +179,12 @@ runs 3.0.0
 [[ $(st version) == 3.0.0 && $(st previous | jq -r .installer) == "$I2" ]] || fail "state after the upgrade to 3.0.0: version $(st version), previous $(st previous)"
 
 step "1.0.0's installer while 3.0.0 runs (not the previous release): its upgrade refused by the installer, state kept"
+# plan_dry_run: the new installer's k8s upgrade --dry-run refuses at plan.
+config "$I1" ops@notes.test $'allow_rollback = true\n  plan_dry_run = true'
+rc=0; tf plan -no-color >"$WORK/plan-dry-refused.log" 2>&1 || rc=$?
+[[ $rc != 0 ]] && tr -s ' \n' ' ' <"$WORK/plan-dry-refused.log" | grep -E "The plan's dry run of the upgrade to 1[.]0[.]0.*refused by the installer" >/dev/null ||
+	{ cat "$WORK/plan-dry-refused.log"; fail "plan_dry_run did not refuse the upgrade to an older release at plan"; }
+runs 3.0.0
 config "$I1" ops@notes.test "allow_rollback = true"
 rc=0; tf apply -auto-approve -no-color >"$WORK/apply-refused.log" 2>&1 || rc=$?
 [[ $rc != 0 ]] && tr -s ' \n' ' ' <"$WORK/apply-refused.log" | grep -E 'refused by the installer [(][^)]*exit 3[)] before anything changed' >/dev/null ||
@@ -193,6 +199,11 @@ step "back to 2.0.0's installer: refused without allow_rollback, then k8s rollba
 config "$I2" ops@notes.test
 rc=0; tf plan -no-color >"$WORK/plan3.log" 2>&1 || rc=$?
 [[ $rc != 0 ]] && grep -q 'a rollback needs allow_rollback' "$WORK/plan3.log" || { cat "$WORK/plan3.log"; fail "the plan back to 2.0.0 without allow_rollback was not refused"; }
+# plan_dry_run: k8s rollback --dry-run passes at plan, and changes nothing.
+config "$I2" ops@notes.test $'allow_rollback = true\n  plan_dry_run = true'
+rc=0; tf plan -detailed-exitcode -no-color >"$WORK/plan-dry-rollback.log" 2>&1 || rc=$?
+[[ $rc == 2 ]] || { cat "$WORK/plan-dry-rollback.log"; fail "the rollback's plan with plan_dry_run exited $rc, not 2 (a change)"; }
+runs 3.0.0
 config "$I2" ops@notes.test "allow_rollback = true"
 tf apply -auto-approve -no-color >"$WORK/apply4.log" 2>&1 || { cat "$WORK/apply4.log"; cluster_logs >&2; fail "tofu apply (rollback)"; }
 runs 2.0.0

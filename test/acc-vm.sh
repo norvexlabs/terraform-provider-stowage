@@ -8,7 +8,7 @@
 #     TrueNAS's API, the pool, dataset and bridge, the domain the DHCP server registers host names
 #     under, an SSH key): given at run time, never written in the tree;
 #   - a Stowage checkout at STOWAGE_REPO (default ~/stowage) whose `make build` made bin/stowage, at
-#     a release this provider reads (0.35.0 or later): its suite library runs zot, ships
+#     a release this provider reads (0.38.0 or later: the plan's dry runs use the VM's --dry-run): its suite library runs zot, ships
 #     examples/minimal and its mirror;
 #   - this repository's `make build` (bin/terraform-provider-stowage), installed by tofu init from
 #     a filesystem mirror of this run's own;
@@ -26,9 +26,11 @@
 #      (ssh pinned to it alone refused from then on);
 #   3. `tofu plan -detailed-exitcode` shows no change; a refresh reads the VM's release;
 #   4. an input changed: the re-run alone;
-#   5. 1.0.1 shipped and mirrored, vm.version 1.0.1: the upgrade, its reboot followed, the VM on
+#   5. 1.0.1 shipped and mirrored, vm.version 1.0.1: a plan with plan_dry_run runs the VM's
+#      upgrade --dry-run and changes nothing; then the upgrade, its reboot followed, the VM on
 #      1.0.1 with seed_boot_id null, and only its own key accepted from then on;
-#   6. vm.version back to 1.0.0 without allow_rollback: a plan error; with it, the rollback;
+#   6. vm.version back to 1.0.0 without allow_rollback: a plan error; with it, a plan with
+#      plan_dry_run runs rollback --dry-run, then the rollback;
 #   7. the install forgotten (tofu state rm) and imported (vm:<host>/notes-stow), its first apply
 #      under the VM's own key (vm.known_hosts_line), then no change planned;
 #   8. a destroy of the install refused by deletion_protection, the VM's install untouched;
@@ -137,6 +139,7 @@ variable "token" {
 variable "release_version" { type = string }
 variable "admin" { type = string }
 variable "allow_rollback" { default = false }
+variable "plan_dry_run" { default = false }
 variable "deletion_protection" { default = true }
 # The VM's own key, for an imported install's first apply; null: the seed's one-time key.
 variable "vm_known_hosts_line" {
@@ -191,6 +194,7 @@ resource "stowage_install" "vm" {
   tls                      = "internal"
   domains                  = { app = "app.notes.test", api = "api.notes.test" }
   allow_rollback           = var.allow_rollback
+  plan_dry_run             = var.plan_dry_run
   deletion_protection      = var.deletion_protection
 
   vm {
@@ -232,11 +236,14 @@ on() { ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes -o
 # off; one logging otherwise still could), keeps from it this provider's "ran on the VM" entries alone — the command, its exit, its
 # standard output, and the indented `  | …` lines of a multi-line field — in $WORK/<name>.vm.log,
 # and removes the raw log, which another provider could have written a credential to.
-apply_logged() {
-	local name=$1 rc=0
-	shift
+apply_logged() { tf_logged apply "$@"; }
+# plan_logged <name> <tofu plan arguments…>: apply_logged's for a plan.
+plan_logged() { tf_logged plan "$@"; }
+tf_logged() {
+	local verb=$1 name=$2 rc=0
+	shift 2
 	TF_LOG_PROVIDER=DEBUG TF_LOG_PROVIDER_TRUENAS=OFF TF_LOG_PROVIDER_EXTERNAL=OFF TF_LOG_PATH="$WORK/$name.raw.log" \
-		tf apply "$@" >"$WORK/$name.log" 2>&1 || rc=$?
+		tf "$verb" "$@" >"$WORK/$name.log" 2>&1 || rc=$?
 	if [[ -f $WORK/$name.raw.log ]]; then
 		awk '/ran on the VM/ { on = 1; print; next } on && /^[[:space:]]+\|/ { print; next } { on = 0 }' "$WORK/$name.raw.log" >"$WORK/$name.vm.log" || true
 		rm -f "$WORK/$name.raw.log"
@@ -304,6 +311,16 @@ printf '1.0.1\n' >"$P/VERSION"
 printf '### Changed\n- Release 1.0.1.\n' >"$P/changes/1.0.1.md"
 "${S[@]}" ship --channel beta 2>"$WORK/ship-1.0.1.log" || { tail -50 "$WORK/ship-1.0.1.log"; fail "ship 1.0.1"; }
 mirror "$WORK/r2.oci.tar" --disks none
+# plan_dry_run: the VM's upgrade --dry-run passes at plan; nothing reboots, nothing changes: the
+# last job's state, the release, the boot and the event journal's last entry as before the plan.
+vm_now() { on notes-stow status --json | jq -c '{job, installed, boot_id, events}'; }
+before=$(vm_now)
+rc=0
+TF_VAR_release_version=1.0.1 TF_VAR_plan_dry_run=true plan_logged plan-dry-upgrade -detailed-exitcode -input=false || rc=$?
+[[ $rc == 2 ]] && grep -q 'notes-stow upgrade --version 1.0.1 --dry-run --json' "$WORK/plan-dry-upgrade.vm.log" ||
+	{ cat "$WORK/plan-dry-upgrade.log" "$WORK/plan-dry-upgrade.vm.log"; fail "the upgrade's plan with plan_dry_run exited $rc, or ran no dry run"; }
+[[ $(on cat /proc/sys/kernel/random/boot_id) == "$boot" ]] || fail "the plan's dry run rebooted the VM"
+[[ $(vm_now) == "$before" ]] || fail "the plan's dry run changed the VM: $before, then $(vm_now)"
 TF_VAR_release_version=1.0.1 apply_logged apply3 -input=false -auto-approve || { tail -80 "$WORK/apply3.log"; vm_dump apply3; fail "the upgrade"; }
 [[ $(tf output -raw version) == 1.0.1 ]] || fail "state's version after the upgrade: $(tf output -raw version)"
 [[ -z $(tf output -raw seed_boot_id 2>/dev/null || true) ]] || fail "seed_boot_id is set after the upgrade's reboot"
@@ -318,6 +335,13 @@ if [[ $rc == 0 ]] || ! grep -q 'a rollback needs allow_rollback' "$WORK/plan2.lo
 	cat "$WORK/plan2.log"
 	fail "a rollback without allow_rollback is not a plan error"
 fi
+# plan_dry_run: the VM's rollback --dry-run passes at plan; nothing reboots, nothing changes.
+before=$(vm_now)
+rc=0
+TF_VAR_release_version=1.0.0 TF_VAR_allow_rollback=true TF_VAR_plan_dry_run=true plan_logged plan-dry-rollback -detailed-exitcode -input=false || rc=$?
+[[ $rc == 2 ]] && grep -q 'notes-stow rollback --dry-run --json' "$WORK/plan-dry-rollback.vm.log" ||
+	{ cat "$WORK/plan-dry-rollback.log" "$WORK/plan-dry-rollback.vm.log"; fail "the rollback's plan with plan_dry_run exited $rc, or ran no dry run"; }
+[[ $(vm_now) == "$before" ]] || fail "the plan's dry run of the rollback changed the VM: $before, then $(vm_now)"
 TF_VAR_release_version=1.0.0 TF_VAR_allow_rollback=true apply_logged apply4 -input=false -auto-approve || { tail -80 "$WORK/apply4.log"; vm_dump apply4; fail "the rollback"; }
 [[ $(tf output -raw version) == 1.0.0 ]] || { vm_dump apply4; fail "state's version after the rollback: $(tf output -raw version)"; }
 on notes-stow status --json | jq -e '.installed.version == "1.0.0" and .boot == "passive"' >/dev/null || { vm_dump apply4; fail "the VM is not on 1.0.0, in its passive system"; }
