@@ -22,13 +22,14 @@ the installer's machine interface (`describe --json`, `status --json`, the verbs
 and exit status): it decides nothing the installer does not decide, orders no version and keeps no
 copy of a rule.
 
-**Status: pre-release (0.1.0, unpublished).** What works: the Docker, Kubernetes and VM targets —
+**Status: beta** (0.1.0, released on GitHub, signed; not in a registry yet). The schema and
+behaviour may still change before 1.0, each change named in [CHANGELOG.md](CHANGELOG.md). What works: the Docker, Kubernetes and VM targets —
 create, read, update (inputs, then the release: upgrade or rollback), import and delete, with an
 opt-in plan-time dry run on Docker —, `stowage_vm_seed`, the first-boot material of a Kairos VM a
-hypervisor's or cloud's resource makes, and the `stowage_install` data source. The Docker target
-is proven against a real installer over SSH (`make acc-docker`), the Kubernetes target on a kind
-cluster (`make acc-k8s`); the VM target by unit tests, its acceptance test (`make acc-vm`) pending
-(see [TODO.md](TODO.md)). Not in a registry: [install it locally](#install).
+hypervisor's or cloud's resource makes, and the `stowage_install` data source. Each target
+is proven against a real Stowage 0.35.0 installer: the Docker target over SSH (`make acc-docker`),
+the Kubernetes target on a kind cluster (`make acc-k8s`), the VM target and `stowage_vm_seed` on a
+TrueNAS VM (`make acc-vm`). Not in a registry yet: [install it locally](#install).
 
 - Provider address: `registry.opentofu.org/norvexlabs/stowage` (`norvexlabs/stowage`), plugin
   protocol 6.
@@ -44,7 +45,12 @@ cluster (`make acc-k8s`); the VM target by unit tests, its acceptance test (`mak
 
 ## Install
 
-The provider is not published yet. From a checkout (Docker is the only requirement):
+The provider is not in a registry yet. Each [GitHub
+release](https://github.com/norvexlabs/terraform-provider-stowage/releases) holds a signed zip per
+platform: check it and copy it into OpenTofu's local mirror,
+`~/.terraform.d/plugins/registry.opentofu.org/norvexlabs/stowage/` ([the
+steps](docs/guides/install-without-registry.md#a-releases-zip-in-the-implied-local-mirror)). Or
+build it from a checkout (Docker is the only requirement; linux/amd64):
 
 ```bash
 make install-local   # build, then copy into OpenTofu's local mirror, ~/.terraform.d/plugins
@@ -58,7 +64,7 @@ terraform {
   required_providers {
     stowage = {
       source  = "norvexlabs/stowage"
-      version = "0.1.0"
+      version = "~> 0.1"
     }
   }
 }
@@ -145,8 +151,7 @@ make acc-k8s        # acceptance: a kind cluster
 make acc-vm         # acceptance: a TrueNAS VM (STOWAGE_VM_ENV=<file>)
 ```
 
-Everything runs in Docker. The acceptance tests, the release procedure (held until the maintainer
-decides to publish) and the repository's map: [DEVELOPMENT.md](DEVELOPMENT.md).
+Everything runs in Docker. The acceptance tests, the release procedure and the repository's map: [DEVELOPMENT.md](DEVELOPMENT.md).
 
 ## Licence
 

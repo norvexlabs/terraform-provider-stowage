@@ -102,6 +102,14 @@ func (r *installResource) ValidateConfig(ctx context.Context, req resource.Valid
 		resp.Diagnostics.AddAttributeError(path.Root("installer"), "installer is required",
 			"Give the installer image by digest, <prefix>/<name>-installer@sha256:<64 hex>, as `ship` prints it.")
 	}
+	if m.Docker == nil && (m.VM != nil || m.Kubernetes != nil) && m.PlanDryRun.ValueBool() {
+		resp.Diagnostics.AddAttributeError(path.Root("plan_dry_run"), "plan_dry_run is Docker's",
+			"A plan's dry run runs on a Docker target alone: a plan of a Kubernetes or VM install runs nothing on the target. Remove plan_dry_run.")
+	}
+	if m.VM != nil && m.DeleteData.ValueBool() {
+		resp.Diagnostics.AddAttributeError(path.Root("delete_data"), "delete_data is not the VM's",
+			"A destroy of a VM's install forgets it and deletes nothing: the VM's data goes with the VM, removed by its hypervisor's or cloud's resource. Remove delete_data.")
+	}
 	if m.Docker != nil {
 		validateSSH(path.Root("docker"), m.Docker.Host, m.Docker.User, m.Docker.KnownHostsLine, m.Docker.PrivateKeyFile, m.Docker.Port, true, &resp.Diagnostics)
 		checkWorkDir(m.Docker.WorkDir, &resp.Diagnostics)

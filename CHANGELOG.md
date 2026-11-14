@@ -3,6 +3,24 @@
 The provider's releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.2.0]
+
+The provider is in **beta**: the Docker, Kubernetes and VM targets are proven by their acceptance
+tests against Stowage 0.35.0; its schema and behaviour may still change before 1.0, each change
+named here.
+
+### Changed
+
+- `plan_dry_run = true` with a `kubernetes` or `vm` block is refused at validation (`plan_dry_run is
+  Docker's`): their plans run nothing on the target, so the setting checked nothing.
+- `delete_data = true` with a `vm` block is refused at validation (`delete_data is not the VM's`): a
+  VM's destroy forgets the install and deletes nothing, its data going with the VM.
+
+### Documentation
+
+- Installing a GitHub release's signed zip into OpenTofu's local mirror, on any platform it is
+  built for; the quick starts take any 0.x release (`~> 0.1`).
+
 ## [0.1.0] - 2026-11-12
 
 ### Added

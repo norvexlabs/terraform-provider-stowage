@@ -6,7 +6,7 @@ terraform {
   required_providers {
     stowage = {
       source  = "norvexlabs/stowage"
-      version = "0.1.0"
+      version = "~> 0.1"
     }
   }
 }

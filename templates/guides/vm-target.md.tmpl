@@ -151,4 +151,4 @@ argument.
   on the VM); give `vm.known_hosts_line` the VM's own key. State records `vm.host`,
   `vm.short_name` and `deletion_protection = true`; the first apply runs the update above with
   every configured input, as on Docker.
-- **Delete**: refused while `deletion_protection`; else nothing runs: the resource is forgotten.
+- **Delete**: refused while `deletion_protection`; else nothing runs: the resource is forgotten. `delete_data = true` is refused at validation (`delete_data is not the VM's`), and `plan_dry_run = true` too (`plan_dry_run is Docker's`): a VM's plan runs nothing on it.

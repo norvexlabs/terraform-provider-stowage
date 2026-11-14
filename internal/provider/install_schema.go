@@ -180,11 +180,11 @@ func installSchema(ctx context.Context) schema.Schema {
 			},
 			"plan_dry_run": schema.BoolAttribute{
 				Optional: true, Computed: true, Default: booldefault.StaticBool(false),
-				MarkdownDescription: "On Docker, a plan changing `installer` runs the change's `--dry-run` on the target (the new release's `upgrade --dry-run`, fetched into a private directory beside the install and removed after; or the kept installer's `rollback --dry-run`), so the installer's refusal is a plan error. Opt-in: the plan reaches the target. Skipped for an imported state never applied, and while `installer` or the connection is not known.",
+				MarkdownDescription: "On Docker, a plan changing `installer` runs the change's `--dry-run` on the target (the new release's `upgrade --dry-run`, fetched into a private directory beside the install and removed after; or the kept installer's `rollback --dry-run`), so the installer's refusal is a plan error. Opt-in: the plan reaches the target. Skipped for an imported state never applied, and while `installer` or the connection is not known. Set `true` with a `kubernetes` or `vm` block, refused at validation (`plan_dry_run is Docker's`): their plans run nothing on the target.",
 			},
 			"delete_data": schema.BoolAttribute{
 				Optional: true, Computed: true, Default: booldefault.StaticBool(false),
-				MarkdownDescription: "A destroy runs `uninstall --data`, deleting the volumes, instead of `uninstall`, which keeps them.",
+				MarkdownDescription: "A destroy runs `uninstall --data`, deleting the volumes, instead of `uninstall`, which keeps them. Docker and Kubernetes: `true` with a `vm` block is refused at validation (`delete_data is not the VM's`), as a VM's destroy forgets the install and deletes nothing.",
 			},
 			"registry":           computedString("The provider's `registry` at the install, which a later plan compares; null in an imported state until its first apply."),
 			"registry_ca_digest": computedString("`sha256:<hex>` of the registry CA the install keeps (the provider's `registry_ca` at its first install), as `status --json` reports it; null when it keeps none. A later plan compares it with the provider's `registry_ca`: first-install only on Docker and the VM."),

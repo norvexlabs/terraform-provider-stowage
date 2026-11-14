@@ -2,14 +2,40 @@
 page_title: "Installing without the registry - stowage"
 subcategory: "Guides"
 description: |-
-  The provider is not in a registry yet: install it from a checkout into OpenTofu's local mirror, or point OpenTofu at the build.
+  The provider is not in a registry yet: install a release's signed zip, or a checkout's build, into OpenTofu's local mirror, or point OpenTofu at the build.
 ---
 
 # Installing without the registry
 
-The provider is not published to a registry yet. Build it from a checkout of
-`terraform-provider-stowage` (Docker is the only requirement) and give it to OpenTofu in one of
-two ways.
+The provider is not published to a registry yet. Its releases are on GitHub, signed; or build it
+from a checkout of `terraform-provider-stowage` (Docker is the only requirement). Either is given
+to OpenTofu through its implied local mirror; a checkout's build also through `dev_overrides`.
+
+## A release's zip, in the implied local mirror
+
+Each [release](https://github.com/norvexlabs/terraform-provider-stowage/releases) holds
+`terraform-provider-stowage_<version>_<os>_<arch>.zip` for linux, darwin, windows and freebsd,
+`terraform-provider-stowage_<version>_SHA256SUMS` and its GPG signature by the release key
+(fingerprint `686D3351040F9F4463D9D3AC0C705E9BAA4F4981`, in the repository's
+`keys/norvexlabs-gpg-public.asc`). Check the signature and the zip's checksum, then copy the zip
+unopened into the mirror's directory for the provider:
+
+```bash
+v=0.1.0 platform=linux_amd64   # darwin_arm64, windows_amd64, …
+base=https://github.com/norvexlabs/terraform-provider-stowage/releases/download/v$v
+curl -fLO "$base/terraform-provider-stowage_${v}_${platform}.zip" \
+     -fLO "$base/terraform-provider-stowage_${v}_SHA256SUMS" \
+     -fLO "$base/terraform-provider-stowage_${v}_SHA256SUMS.sig"
+gpg --import keys/norvexlabs-gpg-public.asc   # from the repository
+gpg --verify "terraform-provider-stowage_${v}_SHA256SUMS.sig" "terraform-provider-stowage_${v}_SHA256SUMS"
+grep "_${platform}.zip\$" "terraform-provider-stowage_${v}_SHA256SUMS" | sha256sum --check   # macOS: shasum -a 256 --check
+mkdir -p ~/.terraform.d/plugins/registry.opentofu.org/norvexlabs/stowage
+cp "terraform-provider-stowage_${v}_${platform}.zip" ~/.terraform.d/plugins/registry.opentofu.org/norvexlabs/stowage/
+```
+
+On Windows the directory is `%APPDATA%\terraform.d\plugins\registry.opentofu.org\norvexlabs\stowage`.
+A root requiring `norvexlabs/stowage` at that version (`version = "~> 0.1"` takes any 0.x) then
+installs it with `tofu init`, which records the zip's hash in `.terraform.lock.hcl`.
 
 ## The implied local mirror (`make install-local`)
 
@@ -19,18 +45,18 @@ make install-local   # build, then copy into ~/.terraform.d/plugins
 
 This copies `bin/terraform-provider-stowage` to
 `~/.terraform.d/plugins/registry.opentofu.org/norvexlabs/stowage/<version>/linux_amd64/terraform-provider-stowage_v<version>`,
-`<version>` being the top entry of `CHANGELOG.md` (`0.1.0`). `PLUGIN_DIR=<dir>` picks another of
+`<version>` being the top entry of `CHANGELOG.md` (on `main`, the next release's). `PLUGIN_DIR=<dir>` picks another of
 OpenTofu's implied mirror directories (`~/.local/share/opentofu/plugins`, say). The build is
 linux/amd64.
 
-A root then names the provider as it will once published, with that version:
+A root then names the provider as it will once published, at a version that takes it:
 
 ```hcl
 terraform {
   required_providers {
     stowage = {
       source  = "norvexlabs/stowage"
-      version = "0.1.0"
+      version = "~> 0.1"
     }
   }
 }
