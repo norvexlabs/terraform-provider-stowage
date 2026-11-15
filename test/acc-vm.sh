@@ -234,7 +234,8 @@ on() { ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes -o
 # apply_logged <name> <tofu apply arguments…> runs the apply with the provider's debug log on
 # (TF_LOG_PROVIDER opens OpenTofu's provider log; the TrueNAS and external providers are turned
 # off; one logging otherwise still could), keeps from it this provider's "ran on the VM" entries alone — the command, its exit, its
-# standard output, and the indented `  | …` lines of a multi-line field — in $WORK/<name>.vm.log,
+# standard output, and every indented line after it (a multi-line field's `  | …` lines, and the
+# fields hclog writes after one) — in $WORK/<name>.vm.log,
 # and removes the raw log, which another provider could have written a credential to.
 apply_logged() { tf_logged apply "$@"; }
 # plan_logged <name> <tofu plan arguments…>: apply_logged's for a plan.
@@ -245,7 +246,7 @@ tf_logged() {
 	TF_LOG_PROVIDER=DEBUG TF_LOG_PROVIDER_TRUENAS=OFF TF_LOG_PROVIDER_EXTERNAL=OFF TF_LOG_PATH="$WORK/$name.raw.log" \
 		tf "$verb" "$@" >"$WORK/$name.log" 2>&1 || rc=$?
 	if [[ -f $WORK/$name.raw.log ]]; then
-		awk '/ran on the VM/ { on = 1; print; next } on && /^[[:space:]]+\|/ { print; next } { on = 0 }' "$WORK/$name.raw.log" >"$WORK/$name.vm.log" || true
+		awk '/ran on the VM/ { on = 1; print; next } on && /^[[:space:]]/ { print; next } { on = 0 }' "$WORK/$name.raw.log" >"$WORK/$name.vm.log" || true
 		rm -f "$WORK/$name.raw.log"
 	fi
 	return "$rc"
