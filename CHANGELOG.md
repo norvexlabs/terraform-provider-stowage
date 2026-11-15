@@ -3,7 +3,7 @@
 The provider's releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.2.0]
+## [0.2.0] - 2026-11-15
 
 The provider is in **beta**: the Docker, Kubernetes and VM targets are proven by their acceptance
 tests (Docker and the VM against Stowage 0.35.0, Kubernetes against 0.35.0 and 0.37.0; the VM's
