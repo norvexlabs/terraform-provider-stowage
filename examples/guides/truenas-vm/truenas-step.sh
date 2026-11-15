@@ -36,14 +36,15 @@ sha_of() { sha256sum "$1" | cut -d' ' -f1; }
 remote_sha() { nas "if [ -f $(printf %q "$1") ]; then sha256sum $(printf %q "$1") | cut -d' ' -f1; fi"; }
 
 # upload SRC DEST SHA256 — SRC to DEST through a .part file, checked on TrueNAS before it takes
-# DEST's name; a DEST already holding those bytes is kept. Mode 0644: the VM's process
-# (libvirt-qemu) reads a CD-ROM's file.
+# DEST's name; a DEST already holding those bytes is kept. Mode 0600 (the seed holds the one-time
+# host key, the disk the release's pull account): libvirt hands a VM's file to its process as it
+# starts it.
 upload() {
 	local src=$1 dest=$2 sha=$3
 	[[ $(remote_sha "$dest") == "$sha" ]] && return 0
-	nas_in "umask 022; cat > $(printf %q "$dest.part")" <"$src"
+	nas_in "umask 077; cat > $(printf %q "$dest.part")" <"$src"
 	[[ $(remote_sha "$dest.part") == "$sha" ]] || { nas "rm -f $(printf %q "$dest.part")"; die "the upload of $src to $dest does not match its SHA-256"; }
-	nas "chmod 0644 $(printf %q "$dest.part") && mv -f $(printf %q "$dest.part") $(printf %q "$dest")"
+	nas "chmod 0600 $(printf %q "$dest.part") && mv -f $(printf %q "$dest.part") $(printf %q "$dest")"
 }
 
 case "${1:-}" in

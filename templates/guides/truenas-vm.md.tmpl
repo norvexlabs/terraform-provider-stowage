@@ -45,8 +45,9 @@ an SSH user whose shell runs `midclt` as an administrator. The provider reads it
    leaves such a zvol: replace it (`tofu apply -replace=truenas_zvol.disk`) to try again.
 3. `seed` builds the NoCloud ISO in a private directory and uploads it, named by the seed's `id`.
    `user_data` carries the one-time host key's private key: it goes in the step's environment,
-   never an argument. Uploads are mode 0644, as Stowage's own TrueNAS steps make them: the VM's
-   process (`libvirt-qemu`) reads the ISO; the key retires once the VM's install is done and it rebooted.
+   never an argument. Uploads are mode 0600, as Stowage's own TrueNAS steps make them (libvirt
+   hands a VM's files to its process as it starts it); the key retires once the VM's install is
+   done and it rebooted.
 4. One NIC device per role of `var.nic_roles` (the release's `host.interfaces` NICs, the primary
    first; empty: one NIC), keyed by position so the plan knows them before the seed exists. Each
    takes the MAC the seed's cloud-config names its role by (`nics[role].mac`; null for a VM of one

@@ -47,9 +47,10 @@ release-check: | $(GOCACHE_DIR)    ## .goreleaser.yml checked, a snapshot releas
 test: | $(GOCACHE_DIR)             ## fast loop: unit tests only, no race detector; never the gate
 	$(GO) go test -count=1 -p 4 ./...
 
-# STOWAGE_SRC: a Stowage checkout (>= 0.34.0) with ./bin/stowage built; its examples/minimal is shipped.
-acc-docker: build ## acceptance: the Docker target against a real installer, through OpenTofu (test/acc-docker.sh)
-	STOWAGE_SRC="$(STOWAGE_SRC)" bash test/acc-docker.sh
+# STOWAGE_REPO (below; default ~/stowage): a Stowage checkout with ./bin/stowage built; its
+# examples/minimal is shipped.
+acc-docker: build ## acceptance: the Docker target against a real installer (STOWAGE_REPO, default ~/stowage), through OpenTofu (test/acc-docker.sh)
+	STOWAGE_REPO="$(STOWAGE_REPO)" bash test/acc-docker.sh
 
 # The acceptance tests run in a container of their own (test/acc.Dockerfile), capped in memory,
 # driving the host's Docker through its socket: the paths they hand it (the work directory in the

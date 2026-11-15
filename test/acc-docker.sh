@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Acceptance test of the Docker target against a real Stowage installer, through OpenTofu.
 #
-#   STOWAGE_SRC=<a Stowage checkout, its ./bin/stowage built> make acc-docker
+#   STOWAGE_REPO=<a Stowage checkout, its ./bin/stowage built> make acc-docker
 #
 # A real registry (zot), Stowage's examples/minimal shipped to it three times (1.0.0; 2.0.0, which
 # adds an input and a migration 1.0.0 reads; 3.0.0, a rollback barrier), and a Docker host reached
@@ -16,9 +16,9 @@
 set -euo pipefail
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-: "${STOWAGE_SRC:?set STOWAGE_SRC to a Stowage checkout (>= 0.35.0) whose ./bin/stowage is built}"
-STOWAGE=$STOWAGE_SRC/bin/stowage
-[[ -x $STOWAGE ]] || { echo "FAIL: $STOWAGE is missing: run make build in $STOWAGE_SRC" >&2; exit 1; }
+: "${STOWAGE_REPO:?set STOWAGE_REPO to a Stowage checkout (>= 0.38.0) whose ./bin/stowage is built}"
+STOWAGE=$STOWAGE_REPO/bin/stowage
+[[ -x $STOWAGE ]] || { echo "FAIL: $STOWAGE is missing: run make build in $STOWAGE_REPO" >&2; exit 1; }
 PROVIDER_BIN=${PROVIDER_BIN:-$REPO/bin/terraform-provider-stowage}
 [[ -x $PROVIDER_BIN ]] || { echo "FAIL: $PROVIDER_BIN is missing: run make build" >&2; exit 1; }
 
@@ -109,7 +109,7 @@ done
 
 step "examples/minimal, shipped: 1.0.0, 2.0.0 (an input added), 3.0.0 (a rollback barrier)"
 P=$WORK/notes
-cp -r "$STOWAGE_SRC/examples/minimal" "$P"
+cp -r "$STOWAGE_REPO/examples/minimal" "$P"
 export STOWAGE_COSIGN=$WORK/cosign COSIGN_PASSWORD
 COSIGN_PASSWORD=$(token)
 cat >"$STOWAGE_COSIGN" <<SH

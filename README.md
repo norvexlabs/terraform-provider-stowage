@@ -150,7 +150,7 @@ full: [Docker](docs/guides/docker-target.md), [Kubernetes](docs/guides/kubernete
 | `make build` | `./bin/terraform-provider-stowage`, after green checks |
 | `make install-local` | the build in OpenTofu's local mirror |
 | `make docs` | docs/ from OpenTofu's schema of the build (tfplugindocs) |
-| `make acc-docker` | acceptance: Docker over SSH against a real installer (`STOWAGE_SRC=<Stowage checkout>`) |
+| `make acc-docker` | acceptance: Docker over SSH against a real installer (`STOWAGE_REPO=<Stowage checkout>`, default `~/stowage`) |
 | `make acc-k8s` | acceptance: a kind cluster |
 | `make acc-vm` | acceptance: a TrueNAS VM (`STOWAGE_VM_ENV=<file>`) |
 

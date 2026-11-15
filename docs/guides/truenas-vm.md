@@ -45,8 +45,9 @@ an SSH user whose shell runs `midclt` as an administrator. The provider reads it
    leaves such a zvol: replace it (`tofu apply -replace=truenas_zvol.disk`) to try again.
 3. `seed` builds the NoCloud ISO in a private directory and uploads it, named by the seed's `id`.
    `user_data` carries the one-time host key's private key: it goes in the step's environment,
-   never an argument. Uploads are mode 0644, as Stowage's own TrueNAS steps make them: the VM's
-   process (`libvirt-qemu`) reads the ISO; the key retires once the VM's install is done and it rebooted.
+   never an argument. Uploads are mode 0600, as Stowage's own TrueNAS steps make them (libvirt
+   hands a VM's files to its process as it starts it); the key retires once the VM's install is
+   done and it rebooted.
 4. One NIC device per role of `var.nic_roles` (the release's `host.interfaces` NICs, the primary
    first; empty: one NIC), keyed by position so the plan knows them before the seed exists. Each
    takes the MAC the seed's cloud-config names its role by (`nics[role].mac`; null for a VM of one
@@ -430,14 +431,15 @@ sha_of() { sha256sum "$1" | cut -d' ' -f1; }
 remote_sha() { nas "if [ -f $(printf %q "$1") ]; then sha256sum $(printf %q "$1") | cut -d' ' -f1; fi"; }
 
 # upload SRC DEST SHA256 — SRC to DEST through a .part file, checked on TrueNAS before it takes
-# DEST's name; a DEST already holding those bytes is kept. Mode 0644: the VM's process
-# (libvirt-qemu) reads a CD-ROM's file.
+# DEST's name; a DEST already holding those bytes is kept. Mode 0600 (the seed holds the one-time
+# host key, the disk the release's pull account): libvirt hands a VM's file to its process as it
+# starts it.
 upload() {
 	local src=$1 dest=$2 sha=$3
 	[[ $(remote_sha "$dest") == "$sha" ]] && return 0
-	nas_in "umask 022; cat > $(printf %q "$dest.part")" <"$src"
+	nas_in "umask 077; cat > $(printf %q "$dest.part")" <"$src"
 	[[ $(remote_sha "$dest.part") == "$sha" ]] || { nas "rm -f $(printf %q "$dest.part")"; die "the upload of $src to $dest does not match its SHA-256"; }
-	nas "chmod 0644 $(printf %q "$dest.part") && mv -f $(printf %q "$dest.part") $(printf %q "$dest")"
+	nas "chmod 0600 $(printf %q "$dest.part") && mv -f $(printf %q "$dest.part") $(printf %q "$dest")"
 }
 
 case "${1:-}" in

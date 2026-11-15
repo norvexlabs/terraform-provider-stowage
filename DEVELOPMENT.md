@@ -26,7 +26,7 @@ Docker is the only requirement.
 | `make acc-vm` | the VM target and `stowage_vm_seed` on a real TrueNAS VM (`STOWAGE_VM_ENV=<file>`), in the same container; prints PASS |
 | `make acc-vm-names` | the names of the variables STOWAGE_VM_ENV gives that container (never a value); runs nothing |
 
-**`make acc-docker`** (`STOWAGE_SRC=<a Stowage checkout ≥ 0.35.0, its ./bin/stowage built>`)
+**`make acc-docker`** (`STOWAGE_REPO=<a Stowage checkout ≥ 0.38.0, its ./bin/stowage built>`, default `~/stowage`)
 runs `test/acc-docker.sh`, the Docker target's acceptance test against a real installer through
 OpenTofu: a registry (zot) and a Docker host — sshd beside Docker-in-Docker, its host key pinned
 by `known_hosts_line` — share one network namespace; Stowage's `examples/minimal` is shipped there
