@@ -3,7 +3,7 @@
 The provider's releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.3.0]
+## [0.3.0] - 2026-11-16
 
 For Stowage 0.40.0, which leaves VM creation to OpenTofu: the provider makes no VM, and every
 platform has a complete root among its examples. Proven against Stowage 0.40.0's tree: the Docker
