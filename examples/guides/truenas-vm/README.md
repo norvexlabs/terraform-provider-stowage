@@ -35,7 +35,6 @@ destroy the VM with Stowage 0.39.0's `vm destroy` before moving on, or adopt it 
 | `truenas_zvol.disk` | `<pool>/<parent_dataset>/<name>` (the zvol's name) |
 | `truenas_vm.vm` | the VM's id (`vm.query` on TrueNAS, its URL in the UI) |
 | `truenas_vm_device.disk`, `truenas_vm_device.nic["0"]…`, `truenas_vm_device.seed`, `truenas_vm_device.extra_nic["<role>"]` | each device's id (`vm.device.query`) |
-| `truenas_vm_power.vm` | the VM's id |
 | `stowage_vm_install.vm` | `<vm_address>/<short_name>-stow` |
 
 `stowage_vm_install`'s first apply after its import takes the configuration's settings over (give
@@ -44,6 +43,8 @@ plan shows no change. `truenas_dataset` and `truenas_zvol` import with `force_de
 destroy. The `terraform_data` steps cannot be imported: their first apply runs them again —
 `import-image` leaves a zvol that already holds the image as it is, `seed` uploads the seed ISO
 again; `stowage_vm_seed` has no import either (a seed is generated once): it makes a new seed, whose
-ISO the seed device then names, and `truenas_vm_power` restarts the VM once to take it; the VM, its
-install done, keeps its own host key. The modules up to Stowage 0.39.0 used the community
+ISO the seed device then names, which the VM reads at its next start; the VM, its install done,
+keeps its own host key. `truenas_vm_power` is not imported but created: creating it over a running
+VM leaves it running, where an import records no `restart_triggers` and its first apply restarts
+the VM. The modules up to Stowage 0.39.0 used the community
 `pjsalty/truenas` provider: a `moved` block cannot carry their state over; `import` blocks can.
