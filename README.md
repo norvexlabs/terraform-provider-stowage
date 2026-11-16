@@ -22,15 +22,16 @@ the installer's machine interface (`describe --json`, `status --json`, the verbs
 and exit status): it decides nothing the installer does not decide, orders no version and keeps no
 copy of a rule.
 
-**Status: beta** (0.1.0, released on GitHub, signed; not in a registry yet). The schema and
-behaviour may still change before 1.0, each change named in [CHANGELOG.md](CHANGELOG.md). What works: the Docker, Kubernetes and VM targets —
-create, read, update (inputs, then the release: upgrade or rollback), import and delete, with an
-opt-in plan-time dry run on each (the VM's needs Stowage 0.38.0 on its OS) —, `stowage_vm_seed`, the first-boot material of a Kairos VM a
-hypervisor's or cloud's resource makes, and the `stowage_install` data source. Each target
-is proven against a real installer: the Docker target over SSH (`make acc-docker`, Stowage
-0.35.0), the Kubernetes target on a kind cluster (`make acc-k8s`, 0.35.0 and 0.37.0), the VM
-target and `stowage_vm_seed` on a TrueNAS VM (`make acc-vm`, 0.35.0; its walk of the VM's import
-and of a destroy refused by `deletion_protection` is written, not run yet: [TODO.md](TODO.md)). Not in a registry yet: [install it locally](#install).
+**Status: beta** (0.2.0 released on GitHub, signed; 0.3.0 in progress; not in a registry yet). The
+schema and behaviour may still change before 1.0, each change named in [CHANGELOG.md](CHANGELOG.md).
+What works: one resource type per shape — `stowage_docker_install`, `stowage_kubernetes_install`,
+`stowage_vm_install`: create, read, update (inputs, then the release: upgrade or rollback), import
+and delete, with an opt-in plan-time dry run on each (the VM's needs Stowage 0.38.0 on its OS) —,
+`stowage_vm_seed`, the first-boot material of a Kairos VM a hypervisor's or cloud's resource makes,
+and a data source per shape. A complete root per platform makes the VM itself, with the platform's
+own provider ([the platform guides](docs/guides/platforms.md)). Each target is proven by its
+acceptance test against a real installer (`make acc-docker`, `acc-k8s`, `acc-vm`: [DEVELOPMENT.md](DEVELOPMENT.md));
+what waits for a proof is in [TODO.md](TODO.md). Not in a registry yet: [install it locally](#install).
 
 - Provider address: `registry.opentofu.org/norvexlabs/stowage` (`norvexlabs/stowage`), plugin
   protocol 6.
@@ -39,10 +40,13 @@ and of a destroy refused by `deletion_protection` is written, not run yet: [TODO
   a POSIX `sh`, `tar`, `mktemp` and Docker; a VM, those of its OS bundle and `sudo` without a
   password for its SSH user (the bundle's admin group).
 - The Kubernetes target and `stowage_vm_seed` run the installer on the machine running OpenTofu,
-  which must be **linux/amd64** (installers are built for it) with `docker` (to fetch the
-  installer image); the Kubernetes target also needs `helm` ≥ 3.14 (the installer checks the
-  version) and `kubectl` on `PATH`.
-- Reads installers made by **Stowage 0.35.0 or later** (machine interface format 1).
+  natively and with **no Docker**: the installer image's entry for that machine's platform
+  (linux/amd64, linux/arm64, darwin/amd64 or darwin/arm64, from Stowage 0.40.0; before, linux/amd64
+  alone), read from the registry and checked as [trust](docs/guides/trust.md) says (the provider's
+  `public_keys`, the keys of the release installed). The Kubernetes target
+  also needs `helm` ≥ 3.14 (the installer checks the version) and `kubectl` on `PATH`.
+- Reads installers made by **Stowage 0.35.0 or later** (machine interface format 1); the 0.40.0
+  values (`pull_login`, `acme_ca_root`, the seed's `size` and `firewall`) from Stowage 0.40.0.
 
 ## Install
 
@@ -66,7 +70,7 @@ terraform {
   required_providers {
     stowage = {
       source  = "norvexlabs/stowage"
-      version = "~> 0.1"
+      version = "~> 0.3"
     }
   }
 }
@@ -81,26 +85,26 @@ One root per target in [`examples/quickstart/`](examples/quickstart/), each `tof
 validate` clean once the provider is installed locally:
 
 - [**Docker**](examples/quickstart/docker/main.tf): a host reached over SSH, its key pinned by
-  `known_hosts_line`; the installer runs there.
+  `known_hosts_line`; the installer runs there. A whole root, the host made too:
+  [`examples/guides/docker-aws`](examples/guides/docker-aws/).
 - [**Kubernetes**](examples/quickstart/kubernetes/main.tf): the provider's `kubernetes` block
   reaches the cluster (as the helm provider's); the installer runs on the machine running OpenTofu.
+  A whole root, the cluster and its prerequisites made too: [`examples/guides/kubernetes-kind`](examples/guides/kubernetes-kind/).
 - [**VM**](examples/quickstart/vm/main.tf): `stowage_vm_seed` makes the first-boot material once,
-  your hypervisor's resource the VM, and `stowage_install` installs and keeps it over SSH. A full
-  TrueNAS root: [`examples/resources/stowage_vm_seed`](examples/resources/stowage_vm_seed/resource.tf).
+  your hypervisor's resource the VM, and `stowage_vm_install` installs and keeps it over SSH. A
+  whole root per platform: [`examples/guides/<platform>-vm`](examples/guides/) (TrueNAS, Proxmox
+  VE, libvirt, VMware, AWS, Azure, Google Cloud, Scaleway).
 
 ```hcl
 provider "stowage" {}
 
-resource "stowage_install" "app" {
-  installer = "registry.example.com/app/app-installer@sha256:<64 hex>" # as `stowage ship` prints it
-  inputs    = { ADMIN_EMAIL = "ops@example.com" }
-
-  docker {
-    host             = "app.example.com"
-    user             = "ops"
-    known_hosts_line = "app.example.com ssh-ed25519 AAAA…"
-    work_dir         = "/srv"
-  }
+resource "stowage_docker_install" "app" {
+  installer        = "registry.example.com/app/app-installer@sha256:<64 hex>" # as `stowage ship` prints it
+  inputs           = { ADMIN_EMAIL = "ops@example.com" }
+  host             = "app.example.com"
+  user             = "ops"
+  known_hosts_line = "app.example.com ssh-ed25519 AAAA…"
+  work_dir         = "/srv"
 }
 ```
 
@@ -114,10 +118,13 @@ Generated from the schema, the templates and the examples (`make docs`) into [do
 
 | | |
 |---|---|
-| [Provider](docs/index.md) | the pull account, `registry`, `registry_ca`, the `kubernetes` block |
-| [`stowage_install`](docs/resources/install.md) | every argument and attribute, the plan-time errors, import IDs |
-| [`stowage_vm_seed`](docs/resources/vm_seed.md) | a Kairos VM's first-boot material, generated once |
-| [`stowage_install` data source](docs/data-sources/install.md) | an install's status, read without managing it |
+| [Provider](docs/index.md) | the pull account, `registry`, `registry_ca`, `public_keys`, the `kubernetes` block |
+| [`stowage_docker_install`](docs/resources/docker_install.md) | an install on a Docker host: every argument and attribute, the plan-time errors, its import ID |
+| [`stowage_kubernetes_install`](docs/resources/kubernetes_install.md) | a helm release on a cluster |
+| [`stowage_vm_install`](docs/resources/vm_install.md) | the install on a Kairos VM: its keys, `interfaces`, `platform` |
+| [`stowage_vm_seed`](docs/resources/vm_seed.md) | a Kairos VM's first-boot material, generated once: `ctl_path`, `size`, `firewall` |
+| Data sources: [Docker](docs/data-sources/docker_install.md), [Kubernetes](docs/data-sources/kubernetes_install.md), [VM](docs/data-sources/vm_install.md) | an install's status, read without managing it |
+| Guides: [a VM per platform](docs/guides/platforms.md), [without the internet](docs/guides/offline.md), [trust](docs/guides/trust.md) | complete roots per platform, with import IDs; a root on premises; what an installer is checked against |
 
 ## How it works
 
@@ -129,18 +136,17 @@ read](docs/guides/machine-interface.md). What runs where:
 | | Docker | Kubernetes | VM |
 |---|---|---|---|
 | runs on | the host, over SSH (or this machine) | this machine, against the cluster | the VM, over SSH |
-| installer | fetched there by digest (`docker run --rm <installer>`) | fetched here by digest | the VM's OS bundle's `<short>-stow` |
+| installer | checked here ([trust](docs/guides/trust.md)), then fetched there by digest (`docker run --rm <installer>`) | read here from the registry, this machine's entry, checked ([trust](docs/guides/trust.md)), run natively | the VM's OS bundle's `<short>-stow`, whose `upgrade --version` checks a release itself |
 | create | `sh <name>.sh --no-input --json` | `k8s install --json` | its first boot, then `sudo -n <short>-stow install --json` |
 | read | `<short>-stow status --json` | `k8s status --json` | `<short>-stow status --json` |
 | inputs | the running release's re-run | `k8s upgrade --given` | `install` (re-run) |
 | release | `upgrade` / `rollback` | `k8s upgrade` / `k8s rollback` | `upgrade --version V`, its reboot followed / `rollback` |
 | delete | `uninstall [--data]` | `k8s uninstall [--data]` | forgets it (the VM is its own resource's) |
 
-Secrets (`secret_inputs_wo`, `given_wo`, `secrets_wo`) are write-only: on standard input, never on
+Secrets (`secret_inputs_wo`, `given_wo`, `secrets_wo`, `registry_login_wo`, `kit_code_wo`) are write-only: on standard input, never on
 a command line or in state. Every SSH connection accepts the pinned key alone. Each target in
 full: [Docker](docs/guides/docker-target.md), [Kubernetes](docs/guides/kubernetes-target.md),
-[VM](docs/guides/vm-target.md); a VM made on TrueNAS by the upstream TrueNAS provider alone:
-[guide](docs/guides/truenas-vm.md).
+[VM](docs/guides/vm-target.md); a VM per platform: [guide](docs/guides/platforms.md).
 
 ## Building and testing
 
@@ -152,7 +158,9 @@ full: [Docker](docs/guides/docker-target.md), [Kubernetes](docs/guides/kubernete
 | `make docs` | docs/ from OpenTofu's schema of the build (tfplugindocs) |
 | `make acc-docker` | acceptance: Docker over SSH against a real installer (`STOWAGE_REPO=<Stowage checkout>`, default `~/stowage`) |
 | `make acc-k8s` | acceptance: a kind cluster |
-| `make acc-vm` | acceptance: a TrueNAS VM (`STOWAGE_VM_ENV=<file>`) |
+| `make acc-vm` | acceptance: a TrueNAS VM made by `examples/guides/truenas-vm` (`STOWAGE_VM_ENV=<file>`) |
+| `make acc-libvirt` | acceptance: `examples/guides/libvirt-vm`'s domain against libvirtd under QEMU, in a container |
+| `make examples-test` | `tofu validate` and `tofu test` (plan, mocked providers) of every example root |
 
 Everything runs in Docker. The acceptance tests, the release procedure and the repository's map: [DEVELOPMENT.md](DEVELOPMENT.md).
 

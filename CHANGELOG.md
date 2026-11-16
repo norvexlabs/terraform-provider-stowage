@@ -3,6 +3,122 @@
 The provider's releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.3.0]
+
+For Stowage 0.40.0, which leaves VM creation to OpenTofu: the provider makes no VM, and every
+platform has a complete root among its examples. Proven against Stowage 0.40.0's tree: the Docker
+and Kubernetes targets (`make acc-docker`, `make acc-k8s`, no Docker on the machine running
+OpenTofu), the libvirt root (`make acc-libvirt`) and the TrueNAS root applied for real (`make acc-vm`).
+
+### Changed
+
+- **`stowage_install` is gone**: one resource type per shape, `stowage_docker_install`,
+  `stowage_kubernetes_install` and `stowage_vm_install`, each with its target's settings at the top
+  (no `docker`, `kubernetes` or `vm` block), and the data source split the same way. There is no
+  compatibility before 1.0: for each install, `tofu state rm stowage_install.<name>`, then `tofu
+  import` it into its new type — Docker `[<host>:]<work_dir>/<name>/<short>-stow`, Kubernetes
+  `<namespace>/<release>` (no `kubernetes:` prefix), VM `<host>/<short>-stow` (no `vm:` prefix) —
+  and apply once. A VM's `vm.version`, `vm.channel` and `vm.short_name` are `version`, `channel`
+  and `short_name`; its type has no `installer`, `address` nor `delete_data`; a Kubernetes install's
+  has none of the front's settings nor `secrets_wo`.
+- **No Docker on the machine running OpenTofu**: `stowage_vm_seed` and the Kubernetes runs read
+  the installer image from its registry — its entry for the machine's own platform (linux/amd64,
+  linux/arm64, darwin/amd64, darwin/arm64; one it has none for is refused, naming those it has) —
+  streamed into the cache by the image's digest, and run natively. A Kubernetes
+  run needs `helm` and `kubectl` alone. The Docker target still runs `docker run` on its host.
+- Every example's root is the platform's own: `examples/guides/<platform>-vm` for TrueNAS
+  (`truenas/truenas` 1.9.1 with Stowage's `vm truenas` steps), Proxmox VE, libvirt, VMware, AWS,
+  Azure, Google Cloud and Scaleway, each with its import IDs for a VM Stowage 0.39.0 or earlier
+  made; the TrueNAS guide's SSH step script and the community TrueNAS provider are gone.
+
+### Added
+
+- `stowage_vm_seed`'s `ctl_path` (the release's installer for this machine, which a root's steps
+  run), `size` (the VM's least and recommended CPUs, memory and app space, which the examples
+  refuse under and warn under), `firewall` (what a cloud's firewall lets through) and
+  `await_given`.
+- `registry_login_wo` with `registry_login_wo_version` on the three install types: the install's
+  own registry login, write-only — Docker's and Kubernetes's `--registry-login-file`, a VM's
+  `registry-login` over SSH — sent again when the version changes, and taken out of state by a
+  refresh that finds the install holds none.
+- `acme_ca` and `acme_ca_root` on Docker and the VM (`--acme-ca`, `--acme-ca-root`), read back by a
+  refresh.
+- `kit_file` with write-only `kit_code_wo` on the three install types: a handoff kit given to the
+  first install (`--kit`).
+- `stowage_vm_install`'s `interfaces`: a NIC the platform attached after the seed named and
+  addressed by `network attach` over SSH, the VM rebooted and its boot followed; and `platform`,
+  with which a wait that runs out names the platform's console and a destroy's plan warns, before
+  it is approved, when the registry holds no disk set to make the VM again.
+- A Docker example (an EC2 host made by cloud-init, its SSH key pinned from the first connection)
+  and a Kubernetes example (a kind cluster, ingress-nginx by `helm_release`); a guide to running a
+  root without the internet (`tofu providers mirror`, Stowage's `mirror export` and `import`).
+- `pull_login` on the three data sources; a Kubernetes data source.
+- The provider's `public_keys`: every installer it fetches must carry a signature by one of them
+  (a cosign signature over the image's digest, checked as Stowage checks one), and its release
+  keys of its own. An upgrade over a Docker or Kubernetes install is checked against the keys of
+  the release installed, read from its installer by the digest the install records, as Stowage's
+  own `upgrade --version` checks one — on Docker, read from the installer the install keeps when
+  the registry cannot give them; a first install without `public_keys` trusts the digest alone,
+  which its plan warns of, as it warns that an upgrade over a release carrying no keys is checked
+  by the digest alone too. On Docker the check runs before the target pulls anything.
+
+### Fixed
+
+- A VM's first boot that failed in Kairos's recovery system (`reset_failed`) fails the create at
+  once instead of waiting out the timeout.
+- The pull account goes only to the registry of an installer the configuration names, or of the
+  provider's `registry`: never to a host a target or a release reported.
+- A create whose NIC attach fails, or that cannot reach the VM under its keys for it, records the
+  install as planned, its interfaces pending: the next plan is an update that attaches them (it
+  was an error after apply, which planned the install's replacement).
+- An imported VM's first apply attaches only the NICs the VM does not name already by their MAC,
+  read from it, and never reattaches or reboots for one it has: a role addressed otherwise than
+  `interfaces` gives is a warning naming the `network set --role` that aligns it, and state records
+  the configuration. A release change beside NICs to attach is refused before anything runs, at
+  the plan's dry run too; one beside NICs the VM already names is not.
+- The update attaching NICs left pending plans the VM's keys unknown: it may learn its own key and
+  retire the one-time key (it was an inconsistent result).
+- A create that re-runs an install already there gives it the kit only while nothing is installed
+  yet (a first install left unfinished), as Stowage's re-run takes `--kit`.
+- A Kubernetes run or a seed runs its own hard link to the cached installer (a copy, renamed into
+  place, on a file system that takes no link), in a private directory inside the cache (removed
+  after the run, or a day later when a run was cut off), which another run's prune of the cache
+  cannot remove under it; a run whose program was busy (`text file busy`: a program forked
+  meanwhile holding a copy open for writing) is made again, a few times within a second; part
+  files a fetch cut off left are removed.
+- A Kubernetes run's kubeconfig and working directory are in the system's temporary directory,
+  never in the cache: only the installer's program is there.
+- An upgrade over a release installed that carries no key says so in a warning (the upgrade checked
+  by `public_keys`, or by its digest alone). Keys of the release installed that cannot be read
+  refuse the upgrade before anything is fetched or run on the target, naming `public_keys` among
+  the fixes; with `public_keys`, the new installer is checked against them alone, said in a warning.
+- A create over an install already there names the kit in its warning only when `kit_file` is
+  given (given while nothing is installed yet).
+- An imported VM's first apply whose NIC attach fails records the roles it took over, so the next
+  apply attaches only the others; it waits for the VM's SSH first, as an update attaching NICs
+  does; a `dhcp` role with no address yet is not taken for one addressed otherwise.
+- NICs attached whose reboot the health gate found unhealthy are recorded attached (a warning at
+  create, an error at an update), and never attached again.
+- The wait for a VM's SSH before attaching NICs stops at once on a refused login or another host
+  key, with the read's ways on, and its timeout names the bound it ran out (the plan's dry run's
+  10 minutes at plan).
+- A VM whose status reports no `boot_id` or no event journal refuses the NIC attach before any
+  NIC is attached (it attached them, then refused the reboot).
+- On Docker, an upgrade over an install that records no installer is refused, without
+  `public_keys`, before the new installer is fetched or run on the target; with them, the same
+  release is taken over as before.
+- `registry_login_wo_version` without `registry_login_wo` is refused at validation.
+- A VM's destroy no longer waits on a VM that does not answer: its disk-set check, at the
+  destroy's plan, connects within 10 seconds, and says it was not checked otherwise.
+- The hypervisor roots (TrueNAS, Proxmox VE, libvirt, VMware) give every NIC the release names the
+  MAC `stowage_vm_seed`'s `nics` gives it, the one NIC of a root without `nic_roles` too (the
+  platform's, or the root's own, when the seed gives its one role none: the primary's alone), and
+  refuse at plan a role in `nic_roles` the seed gives no MAC and two NICs sharing a MAC. Their
+  `nic_macs` (role → MAC) gives a role its MAC, to the seed and the NIC alike, and is the refusal's
+  fix.
+- The TrueNAS root's destroy step names `tofu apply -refresh-only` when the installer is not on
+  the machine.
+
 ## [0.2.0] - 2026-11-15
 
 The provider is in **beta**: the Docker, Kubernetes and VM targets are proven by their acceptance

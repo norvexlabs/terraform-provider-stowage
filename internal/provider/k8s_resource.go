@@ -2,8 +2,6 @@ package provider
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -11,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -24,40 +21,31 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
+	"github.com/norvexlabs/terraform-provider-stowage/internal/fetch"
 	"github.com/norvexlabs/terraform-provider-stowage/internal/installer"
 	"go.yaml.in/yaml/v3"
 )
 
-// k8sPlatform is the platform the installers are built for: a Kubernetes run executes one on the
-// machine running OpenTofu. A variable so a test can run on another.
-var k8sPlatform = runtime.GOOS + "/" + runtime.GOARCH
-
 // dnsLabel is a Kubernetes namespace's form, and a helm release's (at most 53 characters).
 var dnsLabel = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 
-// validateK8s checks the resource's kubernetes block and the settings Kubernetes does not take:
-// the front's (tls, domains, ports, address) are Docker's and the VM's, and secrets_wo is a
-// secrets export, which a release keeping its secrets in the cluster has none of.
+// validateK8s checks the Kubernetes type's own attributes (the model's kubernetes block). The
+// type has none of the front's (tls, domains, ports, address, acme_ca), nor secrets_wo: a release
+// keeps its secrets in the cluster.
 func validateK8s(m *installModel, diags *diag.Diagnostics) {
 	b, p := m.Kubernetes, path.Root("kubernetes")
 	if b.Namespace.IsNull() {
-		diags.AddAttributeError(p.AtName("namespace"), "kubernetes.namespace is required", "Give the namespace the release lives in.")
+		diags.AddAttributeError(p.AtName("namespace"), "namespace is required", "Give the namespace the release lives in.")
 	}
 	for name, v := range map[string]types.String{"namespace": b.Namespace, "release": b.Release} {
 		if known(v) && (!dnsLabel.MatchString(v.ValueString()) || name == "release" && len(v.ValueString()) > 53) {
-			diags.AddAttributeError(p.AtName(name), "kubernetes."+name+" is not a DNS label",
+			diags.AddAttributeError(p.AtName(name), name+" is not a DNS label",
 				fmt.Sprintf("%q: lower-case letters, digits and -, starting and ending with a letter or digit, at most 63 characters (53 for a release).", v.ValueString()))
 		}
 	}
 	if known(b.Values) {
 		if err := chartValues(b.Values.ValueString()); err != nil {
-			diags.AddAttributeError(p.AtName("values"), "kubernetes.values is not a chart values file", err.Error())
-		}
-	}
-	for name, v := range map[string]interface{ IsNull() bool }{"tls": m.TLS, "domains": m.Domains, "ports": m.Ports, "address": m.Address, "secrets_wo": m.SecretsWO} {
-		if !v.IsNull() {
-			diags.AddAttributeError(path.Root(name), name+" is not Kubernetes's",
-				fmt.Sprintf("%s is a setting of the Docker and VM shapes: on Kubernetes the chart's ingress owns TLS and routes, and the release keeps its secrets in the cluster. Remove %s.", name, name))
+			diags.AddAttributeError(p.AtName("values"), "values is not a chart values file", err.Error())
 		}
 	}
 }
@@ -221,11 +209,11 @@ func (r *installResource) k8sModifyPlan(ctx context.Context, plan, state *instal
 		}
 	}
 	if plan.Kubernetes.Values.IsNull() && known(state.Kubernetes.Values) {
-		diags.AddAttributeWarning(path.Root("kubernetes").AtName("values"), "kubernetes.values left out: the release keeps its values",
+		diags.AddAttributeWarning(path.Root("kubernetes").AtName("values"), "values left out: the release keeps its values",
 			"Nothing runs for it: helm keeps the values the earlier runs gave (`--reset-then-reuse-values`). To drop a key, give it null in values and apply, then leave values out.")
 	}
 	if !plan.Kubernetes.Namespace.IsUnknown() {
-		firstInstallOnly(diags, path.Root("kubernetes").AtName("namespace"), "kubernetes.namespace", state.Kubernetes.Namespace.ValueString(), plan.Kubernetes.Namespace.ValueString())
+		firstInstallOnly(diags, path.Root("kubernetes").AtName("namespace"), "namespace", state.Kubernetes.Namespace.ValueString(), plan.Kubernetes.Namespace.ValueString())
 	}
 	if plan.Kubernetes.Release.IsUnknown() || !known(plan.Installer) {
 		return
@@ -233,16 +221,29 @@ func (r *installResource) k8sModifyPlan(ctx context.Context, plan, state *instal
 	name, _, _ := parseInstaller(plan.Installer.ValueString())
 	was := baseName(state.ID.ValueString()) // <namespace>/<release>
 	if now := k8sDriver(plan, name).ReleaseName(); was != "" && was != now {
-		firstInstallOnly(diags, path.Root("kubernetes").AtName("release"), "the helm release (kubernetes.release, else the project's name)", was, now)
+		firstInstallOnly(diags, path.Root("kubernetes").AtName("release"), "the helm release (release, else the project's name)", was, now)
 	}
 }
 
-// k8sRun is a Kubernetes run's private directory on this machine (the kubeconfig written there,
-// each installer fetched in a directory of its own) and the driver set for it.
+// k8sRun is a Kubernetes run's private directories on this machine and the driver set for it.
+// dir, in Data.TempDir (never the cache), holds what may hold a credential: the kubeconfig written,
+// and each installer's working directory (dir/<sub>: its bootstrap script `<name>.sh`, whatever the
+// installer writes in it). progs, in the cache's runs/ (Data.runDir), holds only each installer's
+// program (progs/<sub>/<short>-stow), linked to the one the cache keeps. The run's files on
+// standard input (secret inputs, logins, values) go to a directory the run's script makes with
+// mktemp -d and removes. close removes both.
 type k8sRun struct {
-	r   *installResource
-	dir string
-	k   installer.K8s
+	r     *installResource
+	dir   string
+	progs string
+	k     installer.K8s
+	// configured are the installers the configuration names (Want.Configured).
+	configured []string
+	// keys are the keys each installer fetched carries, by reference.
+	keys map[string]map[string][]byte
+	// installed, while set, is the trust of the release installed, which a fetch must meet: the
+	// new release's, on an upgrade.
+	installed *fetch.Trust
 }
 
 // k8sStart prepares a run on m's cluster for the project name: the platform and the programs
@@ -253,24 +254,28 @@ func (r *installResource) k8sStart(ctx context.Context, m *installModel, name st
 		diags.AddError("The provider is not configured", "the provider block was not read")
 		return nil
 	}
-	if k8sPlatform != "linux/amd64" {
-		diags.AddError("The Kubernetes target needs linux/amd64",
-			fmt.Sprintf("OpenTofu runs on %s: the installer runs on this machine, and installers are built for linux/amd64. Run OpenTofu on a linux/amd64 machine (a CI runner) to reach the cluster.", k8sPlatform))
-		return nil
-	}
 	runner, err := r.data.NewRunner(Connection{})
 	if err != nil {
 		diags.AddError("Cannot run the installer here", err.Error())
 		return nil
 	}
-	dir, err := os.MkdirTemp(r.data.TempDir, "stowage-k8s-")
+	dir, err := os.MkdirTemp(r.data.TempDir, "stowage-k8s-") // 0700
 	if err != nil {
 		diags.AddError("A private directory for the run", err.Error())
 		return nil
 	}
-	run := &k8sRun{r: r, dir: dir}
+	progs, err := r.data.runDir("stowage-k8s-")
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		diags.AddError("A private directory for the run", err.Error())
+		return nil
+	}
+	run := &k8sRun{r: r, dir: dir, progs: progs, keys: map[string]map[string][]byte{}}
+	if known(m.Installer) {
+		run.configured = append(run.configured, m.Installer.ValueString())
+	}
 	run.k = k8sDriver(m, name)
-	run.k.Runner = installer.Filtered(runner)
+	run.k.Runner = busyRunner{Runner: installer.Filtered(runner), dir: progs}
 	run.k.Mirror = r.data.mirrorLogin()
 	if m.Kubernetes.ImagePullLogin.ValueBool() {
 		run.k.PullLogin = r.pullLogin(m)
@@ -331,7 +336,7 @@ func (r *installResource) k8sStart(ctx context.Context, m *installModel, name st
 		addInstallerError(diags, "Looking for the programs a Kubernetes run needs", err)
 	case len(missing) > 0:
 		diags.AddError("Missing on this machine: "+strings.Join(missing, ", "),
-			"The Kubernetes target runs the installer on the machine running OpenTofu: it fetches it with docker and drives the cluster with helm (3.14 or later, which the installer checks) and kubectl, each found on PATH. Install "+strings.Join(missing, ", ")+".")
+			"The Kubernetes target runs the installer on the machine running OpenTofu, which drives the cluster with helm (3.14 or later, which the installer checks) and kubectl, each found on PATH. Install "+strings.Join(missing, ", ")+".")
 	}
 	if diags.HasError() {
 		run.close()
@@ -340,8 +345,12 @@ func (r *installResource) k8sStart(ctx context.Context, m *installModel, name st
 	return run
 }
 
-// close removes the run's directory: the kubeconfig and the installers fetched.
-func (run *k8sRun) close() { _ = os.RemoveAll(run.dir) }
+// close removes the run's directories: the kubeconfig, the working directories and the installers
+// fetched.
+func (run *k8sRun) close() {
+	_ = os.RemoveAll(run.dir)
+	_ = os.RemoveAll(run.progs)
+}
 
 // in is the driver working in the run's subdirectory sub (made once).
 func (run *k8sRun) in(sub string, diags *diag.Diagnostics) (installer.K8s, bool) {
@@ -493,6 +502,7 @@ func (r *installResource) k8sCreate(ctx context.Context, m *installModel, in ins
 		return
 	}
 	defer run.close()
+	run.k.RegistryLogin = r.wo.login
 	ref := m.Installer.ValueString()
 	k, desc := run.fetch(ctx, "run", ref, diags)
 	if desc == nil {
@@ -523,7 +533,7 @@ func (r *installResource) k8sCreate(ctx context.Context, m *installModel, in ins
 			return
 		}
 	case existing.Name != name:
-		diags.AddError("Another project's release", fmt.Sprintf("The release %s holds %q, not %q: give another kubernetes.release or namespace.", k8sID(k), existing.Name, name))
+		diags.AddError("Another project's release", fmt.Sprintf("The release %s holds %q, not %q: give another release or namespace.", k8sID(k), existing.Name, name))
 		return
 	case existingUntrusted != nil:
 		untrustedDiag(diags, true, "", k, existingUntrusted.ref, existingUntrusted.why, ref)
@@ -553,7 +563,7 @@ func (r *installResource) k8sCreate(ctx context.Context, m *installModel, in ins
 	default:
 		diags.AddWarning("A release is already there",
 			fmt.Sprintf("The release %s already runs %s: the create takes it over, giving it given_wo, then inputs and secret_inputs_wo, again (k8s upgrade --given), which replace the values it records; "+
-				"with nothing to give, a release whose latest helm revision failed, or with kubernetes.values, is applied again (k8s upgrade). "+
+				"with nothing to give, a release whose latest helm revision failed, or with values, is applied again (k8s upgrade). "+
 				"The settings only a first install takes (the provider's registry, registry_ca) are not given: the release keeps what it recorded.", k8sID(k), name))
 		if in.Given != "" {
 			if _, err := k.Give(ctx, in.Given, r.registryCA()); err != nil {
@@ -647,7 +657,7 @@ func (r *installResource) k8sRead(ctx context.Context, m *installModel, state *t
 		addInstallerError(diags, "Fetching the installer", err)
 		return
 	}
-	st, err := k.Status(ctx)
+	st, err := k.StatusOf(ctx, true)
 	if err != nil {
 		addInstallerError(diags, "Reading the release", err)
 		return
@@ -656,6 +666,7 @@ func (r *installResource) k8sRead(ctx context.Context, m *installModel, state *t
 		state.RemoveResource(ctx)
 		return
 	}
+	readBack(m, st.Values)
 	if st.Name != name {
 		diags.AddError("Another project's release", fmt.Sprintf("The release %s holds %q, not %q.", k8sID(run.k), st.Name, name))
 		return
@@ -673,9 +684,9 @@ func (r *installResource) k8sRead(ctx context.Context, m *installModel, state *t
 	diags.Append(state.Set(ctx, m)...)
 }
 
-// script writes ref's bootstrap script to k's directory: the one kept for its digest in the
-// provider's cache when there is one (an installer by digest prints one script, ever), else
-// fetched (`docker run`), then kept there. A cache that cannot be written is only not kept.
+// script writes, in k's directory, `<name>.sh` running ref's installer for this machine
+// (InstallerSource: its index entry for this platform, checked against the release's keys, kept
+// in the provider's cache by digest).
 func (run *k8sRun) script(ctx context.Context, k installer.K8s, ref string) error {
 	n, _, err := installer.ParseInstaller(ref)
 	if err != nil {
@@ -684,56 +695,38 @@ func (run *k8sRun) script(ctx context.Context, k installer.K8s, ref string) erro
 	if n != k.Name {
 		return fmt.Errorf("installer %s is of the project %q, not %q", ref, n, k.Name)
 	}
-	dest := filepath.Join(k.Dir, k.Name+".sh")
-	_, digest, _ := strings.Cut(ref, "@sha256:") // 64 lower-case hex: ParseInstaller holds it to that
-	dir := run.r.data.CacheDir
-	if dir != "" {
-		if b, ok := cached(filepath.Join(dir, digest)); ok {
-			return os.WriteFile(dest, b, 0o600)
-		}
-	}
-	if err := k.Fetch(ctx, ref, run.login(ref)); err != nil {
+	// The program apart from k.Dir, in the cache's runs/: one directory per working directory, as
+	// two installers of a run (an upgrade's) have the same name.
+	progs := filepath.Join(run.progs, filepath.Base(k.Dir))
+	if err := os.MkdirAll(progs, 0o700); err != nil {
 		return err
 	}
-	if dir != "" {
-		if b, err := os.ReadFile(dest); err == nil && len(b) > 0 {
-			keep(dir, digest, b)
-		}
+	p, err := run.r.data.source().Program(ctx, run.r.data, Want{Ref: ref, Configured: run.configured, Installed: run.installed}, progs)
+	if err != nil {
+		return err
 	}
-	return nil
+	run.keys[ref] = p.Keys
+	return wrapper(k.Dir, k.Name, p.Path)
 }
 
-// cacheKeep is how many installers' scripts the cache keeps, the last used: each embeds an
-// installer binary (tens of MB).
+// installedTrust is the trust of the release installed, whose installer ref carries keys.
+func installedTrust(ref string, keys map[string][]byte) *fetch.Trust {
+	return &fetch.Trust{Name: "the keys of the release installed (" + ref + ")", Keys: keys}
+}
+
+// cacheKeep is how many installers the cache keeps, the last used: each is an installer binary
+// (tens of MB).
 const cacheKeep = 8
 
-// cached is the script kept in entry, checked against the checksum kept beside it (a script that
-// does not match is not used, and fetched again), its use time refreshed.
-func cached(entry string) ([]byte, bool) {
-	b, err := os.ReadFile(filepath.Join(entry, "bootstrap.sh"))
-	sum, serr := os.ReadFile(filepath.Join(entry, "bootstrap.sh.sha256"))
-	if err != nil || serr != nil || len(b) == 0 || string(sum) != checksum(b) {
-		return nil, false
-	}
+// touch refreshes dir's use time, which prune orders by.
+func touch(dir string) {
 	now := time.Now()
-	_ = os.Chtimes(entry, now, now)
-	return b, true
+	_ = os.Chtimes(dir, now, now)
 }
 
-func checksum(b []byte) string {
-	s := sha256.Sum256(b)
-	return hex.EncodeToString(s[:])
-}
-
-// keep writes b and its checksum in the cache's entry for digest, each through a temporary file
-// renamed into place (0600, in 0700 directories): a run reading the cache meanwhile sees a whole
-// script or none, and one whose checksum is not yet there is fetched. Then the entries but the
-// cacheKeep last used are removed.
-func keep(dir, digest string, b []byte) {
-	entry := filepath.Join(dir, digest)
-	if os.MkdirAll(entry, 0o700) != nil || !writeFile(entry, "bootstrap.sh", b) || !writeFile(entry, "bootstrap.sh.sha256", []byte(checksum(b))) {
-		return
-	}
+// prune removes the cache's entries (one directory per index digest) but keep and the
+// cacheKeep-1 others last used.
+func prune(dir, keep string) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
@@ -744,25 +737,38 @@ func keep(dir, digest string, b []byte) {
 	}
 	var all []used
 	for _, e := range entries {
-		if fi, err := e.Info(); err == nil && e.IsDir() && len(e.Name()) == 64 && e.Name() != digest {
+		if fi, err := e.Info(); err == nil && e.IsDir() && len(e.Name()) == 64 && e.Name() != keep {
 			all = append(all, used{e.Name(), fi.ModTime()})
 		}
 	}
-	// The entry just kept, then the others last used first.
 	slices.SortFunc(all, func(a, b used) int { return b.at.Compare(a.at) })
 	for _, u := range all[min(len(all), cacheKeep-1):] {
 		_ = os.RemoveAll(filepath.Join(dir, u.name))
 	}
+	// The part files fetches cut off left in the entries kept (each platform's directory).
+	now := time.Now()
+	for _, u := range append(all[:min(len(all), cacheKeep-1)], used{name: keep}) {
+		plats, _ := os.ReadDir(filepath.Join(dir, u.name))
+		for _, p := range plats {
+			if p.IsDir() {
+				removeStaleParts(filepath.Join(dir, u.name, p.Name()), now)
+			}
+		}
+	}
 }
 
 // writeFile writes b to dir/name through a temporary file renamed into place, 0600.
-func writeFile(dir, name string, b []byte) bool {
+func writeFile(dir, name string, b []byte) bool { return writeFileMode(dir, name, b, 0o600) }
+
+// writeFileMode is writeFile with the file's mode.
+func writeFileMode(dir, name string, b []byte, mode os.FileMode) bool {
 	f, err := os.CreateTemp(dir, "."+name+"-")
 	if err != nil {
 		return false
 	}
 	_, werr := f.Write(b)
-	if cerr := f.Close(); werr != nil || cerr != nil || os.Rename(f.Name(), filepath.Join(dir, name)) != nil {
+	cerr := f.Close()
+	if werr != nil || cerr != nil || os.Chmod(f.Name(), mode) != nil || os.Rename(f.Name(), filepath.Join(dir, name)) != nil {
 		_ = os.Remove(f.Name())
 		return false
 	}
@@ -918,12 +924,6 @@ func untrustedFix(k installer.K8s, configured string) string {
 	return fmt.Sprintf("If it is this release's own reference from another registry (a mirror's, an alias), set installer to it, or the provider's registry to its registry. Else install the configured release over it by hand (%s's `k8s upgrade --namespace %s --release %s`), or remove it (`k8s uninstall`), then refresh; or `tofu state rm` this resource to forget it.", configured, k.Namespace, k.ReleaseName())
 }
 
-// login is the login ref's fetch runs with (fetchLogin), nil without one.
-func (run *k8sRun) login(ref string) *installer.Login {
-	_, host, _ := parseInstaller(ref)
-	return run.r.data.fetchLogin(host)
-}
-
 // k8sPrep is what an update of a Kubernetes install reads and decides before it changes
 // anything: the apply's, and the plan's dry run's.
 type k8sPrep struct {
@@ -936,7 +936,7 @@ type k8sPrep struct {
 	u             *update
 	step          releaseStep
 	rerun, up     installer.Change
-	// backK and back, on a rollback with kubernetes.values: the installer of the release it
+	// backK and back, on a rollback with values: the installer of the release it
 	// reaches, which gives the values again after it (helm's rollback takes back that revision's).
 	backK installer.K8s
 	back  *installer.Describe
@@ -947,10 +947,17 @@ type k8sPrep struct {
 // prep.run.
 func (r *installResource) k8sPrepare(ctx context.Context, plan, state *installModel, secrets map[string]string, diags *diag.Diagnostics, dry bool) *k8sPrep {
 	name := installName(plan)
+	login := ""
+	if !dry {
+		if login = r.login(plan, state, diags); diags.HasError() {
+			return nil
+		}
+	}
 	run := r.k8sStart(ctx, plan, name, diags)
 	if run == nil {
 		return nil
 	}
+	run.k.RegistryLogin = login
 	kept := false
 	defer func() {
 		if !kept {
@@ -960,6 +967,7 @@ func (r *installResource) k8sPrepare(ctx context.Context, plan, state *installMo
 	statusRef := plan.Installer.ValueString()
 	if known(state.Installer) && state.Installer.ValueString() != "" {
 		statusRef = state.Installer.ValueString()
+		run.configured = append(run.configured, statusRef)
 	}
 	cur, ok := run.in("run", diags)
 	if !ok {
@@ -1050,7 +1058,10 @@ func (r *installResource) k8sPrepare(ctx context.Context, plan, state *installMo
 		rollbackAlone(diags, "image_pull_login") // helm's rollback writes no pull Secret
 		return nil
 	case step == rollback && valuesChanged(plan, state):
-		rollbackAlone(diags, "kubernetes.values") // helm's rollback takes back the values it reaches
+		rollbackAlone(diags, "values") // helm's rollback takes back the values it reaches
+		return nil
+	case step == rollback && loginChanged(plan, state):
+		rollbackAlone(diags, "registry_login_wo_version") // helm's rollback writes no pull Secret
 		return nil
 	}
 	p := &k8sPrep{name: name, run: run, cur: cur, nextK: nextK, st: st, running: running, next: next, runningRef: runningRef, u: u, step: step, rerun: rerun, up: up}
@@ -1080,7 +1091,7 @@ func (r *installResource) k8sUpdate(ctx context.Context, plan, state *installMod
 	short := running.ShortName
 	base := state // what the final read falls back to: the state saved last
 	pullLogin := plan.Kubernetes.ImagePullLogin.ValueBool() && !state.Kubernetes.ImagePullLogin.ValueBool()
-	if rerun.Empty() && step == stay && (pullLogin || valuesChanged(plan, state)) {
+	if rerun.Empty() && step == stay && (pullLogin || valuesChanged(plan, state) || loginChanged(plan, state)) {
 		// image_pull_login turned on or the chart values changed, no input: the release applied
 		// again writes the Secret and gives helm the values.
 		if _, err := cur.Reapply(ctx, r.registryCA()); err != nil {
@@ -1141,12 +1152,12 @@ func (r *installResource) k8sUpdate(ctx context.Context, plan, state *installMod
 			addInstallerError(diags, "Rolling "+name+" back", err)
 			return
 		}
-		// helm's rollback takes back the values the release it reaches was given: kubernetes.values
+		// helm's rollback takes back the values the release it reaches was given: values
 		// given again by that release's installer, so the release runs what state records.
 		if p.back != nil {
 			short, after = p.back.ShortName, p.backK
 			if _, err := p.backK.Reapply(ctx, r.registryCA()); err != nil {
-				addInstallerError(diags, "Applying "+name+" again with kubernetes.values after its rollback", err)
+				addInstallerError(diags, "Applying "+name+" again with values after its rollback", err)
 				// Rolled back, the values not given again: state records none, so the next plan
 				// gives them.
 				final := *plan
@@ -1235,7 +1246,11 @@ func (r *installResource) k8sReleaseStep(ctx context.Context, run *k8sRun, u *up
 	if dry && u.rerunCertain(ctx, running) {
 		return stay, nil, installer.K8s{}
 	}
+	// The new release is checked against the keys the release installed carries (its installer,
+	// fetched and read above), as the release's own upgrade --version checks it.
+	run.installed = installedTrust(runningRef, run.keys[runningRef])
 	k, next := run.fetch(ctx, "next", desired, u.diags)
+	run.installed = nil
 	if next == nil {
 		return stay, nil, k
 	}
@@ -1285,12 +1300,12 @@ func (r *installResource) k8sDelete(ctx context.Context, m *installModel, diags 
 	}
 }
 
-// k8sImport reads `kubernetes:<namespace>/<release>`: the release; the configuration gives the
-// cluster, the installer and the rest at the first apply.
+// k8sImport reads stowage_kubernetes_install's import ID, `<namespace>/<release>`: the release;
+// the configuration gives the cluster, the installer and the rest at the first apply.
 func (r *installResource) k8sImport(ctx context.Context, id string, resp *resource.ImportStateResponse) {
-	ns, release, ok := strings.Cut(strings.TrimPrefix(id, "kubernetes:"), "/")
+	ns, release, ok := strings.Cut(id, "/")
 	if !ok || !dnsLabel.MatchString(ns) || !dnsLabel.MatchString(release) || len(release) > 53 {
-		resp.Diagnostics.AddError("Import ID", fmt.Sprintf("%q: want kubernetes:<namespace>/<release> (helm list --all-namespaces)", id))
+		resp.Diagnostics.AddError("Import ID", fmt.Sprintf("%q: want <namespace>/<release> (helm list --all-namespaces)", id))
 		return
 	}
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("kubernetes"), &k8sModel{Namespace: types.StringValue(ns), Release: types.StringValue(release)})...)

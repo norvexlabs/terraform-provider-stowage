@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
-	"github.com/hashicorp/terraform-plugin-framework-validators/resourcevalidator"
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -25,6 +24,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
 
+	"github.com/norvexlabs/terraform-provider-stowage/internal/fetch"
 	"github.com/norvexlabs/terraform-provider-stowage/internal/installer"
 	"github.com/norvexlabs/terraform-provider-stowage/internal/target"
 )
@@ -38,17 +38,16 @@ const (
 
 type installResource struct {
 	data *Data
+	// wo are the write-only values of the create or update this instance runs (the framework
+	// makes an instance per request), read from its configuration.
+	wo writeOnly
 }
 
 var (
-	_ resource.ResourceWithConfigure        = (*installResource)(nil)
-	_ resource.ResourceWithModifyPlan       = (*installResource)(nil)
-	_ resource.ResourceWithValidateConfig   = (*installResource)(nil)
-	_ resource.ResourceWithConfigValidators = (*installResource)(nil)
-	_ resource.ResourceWithImportState      = (*installResource)(nil)
+	_ resource.ResourceWithConfigure      = (*installResource)(nil)
+	_ resource.ResourceWithModifyPlan     = (*installResource)(nil)
+	_ resource.ResourceWithValidateConfig = (*installResource)(nil)
 )
-
-func newInstallResource() resource.Resource { return &installResource{} }
 
 func parseInstaller(ref string) (string, string, error) { return installer.ParseInstaller(ref) }
 
@@ -72,12 +71,6 @@ func (r *installResource) Configure(_ context.Context, req resource.ConfigureReq
 	r.data = d
 }
 
-func (r *installResource) ConfigValidators(context.Context) []resource.ConfigValidator {
-	return []resource.ConfigValidator{
-		resourcevalidator.ExactlyOneOf(path.MatchRoot("docker"), path.MatchRoot("kubernetes"), path.MatchRoot("vm")),
-	}
-}
-
 func known(v attr.Value) bool { return !v.IsNull() && !v.IsUnknown() }
 
 func stringMap(ctx context.Context, m types.Map, diags *diag.Diagnostics) map[string]string {
@@ -98,7 +91,7 @@ func (r *installResource) ValidateConfig(ctx context.Context, req resource.Valid
 	switch {
 	case m.VM != nil && !m.Installer.IsNull():
 		resp.Diagnostics.AddAttributeError(path.Root("installer"), "installer is not the VM's release",
-			"A VM's release is vm.version (its disk carried the first): remove installer.")
+			"A VM's release is version (its disk carried the first): remove installer.")
 	case m.VM == nil && m.Installer.IsNull() && (m.Docker != nil || m.Kubernetes != nil):
 		resp.Diagnostics.AddAttributeError(path.Root("installer"), "installer is required",
 			"Give the installer image by digest, <prefix>/<name>-installer@sha256:<64 hex>, as `ship` prints it.")
@@ -117,6 +110,7 @@ func (r *installResource) ValidateConfig(ctx context.Context, req resource.Valid
 	if m.Kubernetes != nil {
 		validateK8s(&m, &resp.Diagnostics)
 	}
+	validateExtras(&m, &resp.Diagnostics)
 
 	// The configuration's maps are read by key: a value may not be known yet (a write-only one
 	// from an ephemeral variable, one computed from another resource); a null one is refused.
@@ -221,7 +215,7 @@ func workDir(d *dockerModel) string {
 	return d.WorkDir.ValueString()
 }
 
-// checkWorkDir refuses a docker.work_dir that is not an absolute, clean path.
+// checkWorkDir refuses a work_dir that is not an absolute, clean path.
 func checkWorkDir(v types.String, diags *diag.Diagnostics) {
 	if w := v.ValueString(); known(v) && (!strings.HasPrefix(w, "/") || pathpkg.Clean(w) != w) {
 		diags.AddAttributeError(path.Root("docker").AtName("work_dir"), "work_dir is not an absolute, clean path",
@@ -282,13 +276,23 @@ func firstInstallOnlyFix(diags *diag.Diagnostics, p path.Path, name, was, now, f
 
 func (r *installResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
 	if req.Plan.Raw.IsNull() {
-		return // a destroy
+		// A destroy: a VM's install is forgotten, and its VM destroyed next. Whether a VM of its
+		// release can be made again is said here, before the destroy is approved.
+		var state installModel
+		resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+		if !resp.Diagnostics.HasError() && state.VM != nil {
+			r.vmDiskWarning(ctx, &state, &resp.Diagnostics)
+		}
+		return
 	}
 	if req.State.Raw.IsNull() {
 		var plan installModel
 		resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 		if !resp.Diagnostics.HasError() {
 			r.planPullLogin(&plan, nil, &resp.Diagnostics)
+			if plan.VM == nil {
+				digestTrustWarning(r.data, &resp.Diagnostics) // the VM's installer is its seed's
+			}
 		}
 		return // a create
 	}
@@ -304,7 +308,7 @@ func (r *installResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 	}
 	// Left out is the home directory (workDir): taking work_dir out is a change too.
 	if plan.Docker != nil && state.Docker != nil && !plan.Docker.WorkDir.IsUnknown() {
-		firstInstallOnly(&resp.Diagnostics, path.Root("docker").AtName("work_dir"), "docker.work_dir", heldWorkDir(&state, state.Docker), heldWorkDir(&state, plan.Docker))
+		firstInstallOnly(&resp.Diagnostics, path.Root("docker").AtName("work_dir"), "work_dir", heldWorkDir(&state, state.Docker), heldWorkDir(&state, plan.Docker))
 	}
 	// An imported state does not know the first install's address: the installer refuses a
 	// re-run given one, and none is given after the first install.
@@ -317,7 +321,7 @@ func (r *installResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 	}
 	// An imported state does not know the VM's channel: the first apply records the configuration's.
 	if plan.VM != nil && state.VM != nil && !plan.VM.Channel.IsUnknown() && !imported(&state) {
-		firstInstallOnly(&resp.Diagnostics, path.Root("vm").AtName("channel"), "vm.channel", state.VM.Channel.ValueString(), plan.VM.Channel.ValueString())
+		firstInstallOnly(&resp.Diagnostics, path.Root("vm").AtName("channel"), "channel", state.VM.Channel.ValueString(), plan.VM.Channel.ValueString())
 	}
 	if known(plan.Installer) && (known(state.Installer) || imported(&state)) {
 		// An imported release's project is told at the first apply, from its status.
@@ -325,6 +329,10 @@ func (r *installResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 			now, _, _ := parseInstaller(plan.Installer.ValueString())
 			firstInstallOnly(&resp.Diagnostics, path.Root("installer"), "the installer's project", was, now)
 		}
+	}
+	if !imported(&state) && !plan.KitFile.IsUnknown() && !plan.KitFile.Equal(state.KitFile) {
+		resp.Diagnostics.AddAttributeWarning(path.Root("kit_file"), "kit_file is first-install only",
+			"A kit is given to the first install alone: the change is recorded, and nothing is given to the install.")
 	}
 	r.k8sModifyPlan(ctx, &plan, &state, resp)
 	r.planPullLogin(&plan, &state, &resp.Diagnostics)
@@ -354,6 +362,10 @@ func (r *installResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 		// says (changed outside OpenTofu, a refresh skipped); a re-run may finish a first
 		// install that failed.
 		unknowns = []string{"version", "revision", "channel", "status", "previous"}
+	case plan.VM != nil && len(pendingRoles(ctx, resp.Private)) > 0:
+		// Interfaces a create recorded and could not attach: an update attaches them, and reads
+		// the VM after.
+		unknowns = []string{"status"}
 	}
 	if imported(&state) {
 		// The first apply records the provider's registry, and the registry CA the install keeps
@@ -536,6 +548,9 @@ func (r *installResource) Create(ctx context.Context, req resource.CreateRequest
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	if r.wo = readWriteOnly(ctx, req.Config, &resp.Diagnostics); resp.Diagnostics.HasError() {
+		return
+	}
 	if targetKind(&m) == "vm" {
 		r.createVM(ctx, req, resp)
 		return
@@ -555,16 +570,20 @@ func (r *installResource) Create(ctx context.Context, req resource.CreateRequest
 	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("given_wo"), &given)...)
 	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("secrets_wo"), &exported)...)
 	in := installer.Install{
-		Inputs:       stringMap(ctx, m.Inputs, &resp.Diagnostics),
-		SecretInputs: stringMap(ctx, secrets, &resp.Diagnostics),
-		Given:        given.ValueString(),
-		Secrets:      exported.ValueString(),
-		TLS:          m.TLS.ValueString(),
-		Domains:      stringMap(ctx, m.Domains, &resp.Diagnostics),
-		Address:      m.Address.ValueString(),
-		Registry:     r.registry(),
-		RegistryCA:   r.registryCA(),
+		Inputs:        stringMap(ctx, m.Inputs, &resp.Diagnostics),
+		SecretInputs:  stringMap(ctx, secrets, &resp.Diagnostics),
+		Given:         given.ValueString(),
+		Secrets:       exported.ValueString(),
+		TLS:           m.TLS.ValueString(),
+		Domains:       stringMap(ctx, m.Domains, &resp.Diagnostics),
+		Address:       m.Address.ValueString(),
+		Registry:      r.registry(),
+		RegistryCA:    r.registryCA(),
+		AcmeCA:        m.AcmeCA.ValueString(),
+		AcmeCARoot:    m.AcmeCARoot.ValueString(),
+		RegistryLogin: r.wo.login,
 	}
+	in.Kit, in.KitCode = r.kit(&m, &resp.Diagnostics)
 	in.Ports = portMap(ctx, m.Ports, &resp.Diagnostics)
 	if resp.Diagnostics.HasError() {
 		return
@@ -579,7 +598,7 @@ func (r *installResource) Create(ctx context.Context, req resource.CreateRequest
 		resp.Diagnostics.AddError("Cannot reach the Docker target", err.Error())
 		return
 	}
-	desc := r.fetchDescribe(ctx, d, m.Installer.ValueString(), &resp.Diagnostics)
+	desc := r.fetchDescribe(ctx, d, m.Installer.ValueString(), nil, &resp.Diagnostics)
 	if desc == nil {
 		return
 	}
@@ -613,19 +632,30 @@ func (r *installResource) Create(ctx context.Context, req resource.CreateRequest
 	if existing != nil {
 		if existing.Name != d.Name {
 			resp.Diagnostics.AddError("Another project's install",
-				fmt.Sprintf("%s/%s holds an install of %q, not %q: give another docker.work_dir.", d.WorkDir, d.Name, existing.Name, d.Name))
+				fmt.Sprintf("%s/%s holds an install of %q, not %q: give another work_dir.", d.WorkDir, d.Name, existing.Name, d.Name))
 			return
 		}
 		if bad := heldMismatch(existing, in.Address, in.Registry, desc.Registry, in.RegistryCA); len(bad) > 0 {
 			resp.Diagnostics.AddError("The install there was made otherwise",
-				fmt.Sprintf("%s/%s already holds an install of %s whose first install recorded other settings, which a re-run cannot change: %s. Give the settings the install holds (status --json), or another docker.work_dir.", d.WorkDir, d.Name, d.Name, strings.Join(bad, "; ")))
+				fmt.Sprintf("%s/%s already holds an install of %s whose first install recorded other settings, which a re-run cannot change: %s. Give the settings the install holds (status --json), or another work_dir.", d.WorkDir, d.Name, d.Name, strings.Join(bad, "; ")))
 			return
+		}
+		// A kit goes with the re-run of a first install left unfinished (nothing installed yet):
+		// the installer's re-run takes --kit; once an install exists, kit_file is first-install
+		// only, as at an update. Said only when kit_file is given.
+		notGiven, kit := "", ""
+		switch {
+		case !known(m.KitFile):
+		case existing.Installed != nil:
+			notGiven = "; kit_file with kit_code_wo, as an install exists"
+		default:
+			kit = " kit_file with kit_code_wo is given, as nothing is installed yet."
 		}
 		resp.Diagnostics.AddWarning("An install is already there",
 			fmt.Sprintf("%s/%s already holds an install of %s: the create runs the installer again on it (its re-run), which finishes a first install left unfinished; "+
 				"an install of another release there is refused by the installer: set installer to the one it runs (status --json installed.installer), apply, then change installer to upgrade it. "+
-				"The settings only a first install takes (describe's first_install_only: address, the provider's registry and registry_ca; and secrets_wo) are not given: the install keeps the ones it recorded, which the configuration's match.", d.WorkDir, d.Name, d.Name))
-		withoutFirstInstallOnly(&in, desc.FirstInstallOnly)
+				"The settings only a first install takes (describe's first_install_only: address, the provider's registry and registry_ca; secrets_wo%s) are not given: the install keeps the ones it recorded, which the configuration's match.%s", d.WorkDir, d.Name, d.Name, notGiven, kit))
+		withoutFirstInstallOnly(&in, desc.FirstInstallOnly, existing.Installed != nil)
 	}
 	if _, err := d.Install(ctx, in); err != nil {
 		addInstallerError(&resp.Diagnostics, "Installing "+desc.Name, err)
@@ -747,10 +777,14 @@ func applyHeld(m *installModel, st *installer.Status, read bool) {
 const defaultAddress = "127.0.0.1"
 
 // withoutFirstInstallOnly leaves out of in the settings a re-run refuses: those describe names
-// first-install only that the provider gives, and the secrets export (a re-run keeps the
-// install's secrets).
-func withoutFirstInstallOnly(in *installer.Install, names []string) {
+// first-install only that the provider gives and the secrets export (a re-run keeps the install's
+// secrets); and, once an install exists (installed), the kit and its code: kit_file is given to
+// the first install alone, which a re-run finishing it is.
+func withoutFirstInstallOnly(in *installer.Install, names []string, installed bool) {
 	in.Secrets = ""
+	if installed {
+		in.Kit, in.KitCode = "", ""
+	}
 	for _, n := range names {
 		switch n {
 		case "address":
@@ -764,10 +798,17 @@ func withoutFirstInstallOnly(in *installer.Install, names []string) {
 }
 
 // fetchDescribe writes ref's bootstrap script on the target and reads its describe: it must be
-// of d's project and offer the Docker shape. Nil, with the error in diags, otherwise.
-func (r *installResource) fetchDescribe(ctx context.Context, d installer.Docker, ref string, diags *diag.Diagnostics) *installer.Describe {
+// of d's project and offer the Docker shape. ref is checked first, on this machine, against the
+// trust (the provider's public_keys, and installed: the keys of the release installed, on an
+// upgrade): every platform's image of its index, so the image the target pulls by that digest is
+// one checked. Nil, with the error in diags, otherwise.
+func (r *installResource) fetchDescribe(ctx context.Context, d installer.Docker, ref string, installed *fetch.Trust, diags *diag.Diagnostics) *installer.Describe {
 	_, host, _ := parseInstaller(ref)
-	if err := d.Fetch(ctx, ref, r.data.fetchLogin(host)); err != nil {
+	if err := r.data.source().Check(ctx, r.data, Want{Ref: ref, Configured: []string{ref}, Installed: installed}); err != nil {
+		addInstallerError(diags, "Checking the installer's signature", err)
+		return nil
+	}
+	if err := d.Fetch(ctx, ref, r.data.fetchLogin(host, ref)); err != nil {
 		addInstallerError(diags, "Fetching the installer", err)
 		return nil
 	}
@@ -907,11 +948,11 @@ func (r *installResource) Read(ctx context.Context, req resource.ReadRequest, re
 		resp.Diagnostics.AddError("Cannot reach the Docker target", err.Error())
 		return
 	}
-	st, err := d.Status(ctx)
+	st, err := d.StatusOf(ctx, true)
 	if err != nil {
 		if known(m.Docker.Host) && sshFailed(err) {
-			unreachable(&resp.Diagnostics, "Docker host", "docker", m.Docker.Host.ValueString(),
-				"A read accepts the key state holds alone: check the new key on the host's console, give it in docker.known_hosts_line, "+
+			unreachable(&resp.Diagnostics, "Docker host", m.Docker.Host.ValueString(),
+				"A read accepts the key state holds alone: check the new key on the host's console, give it in known_hosts_line, "+
 					"then `tofu apply -refresh=false`, which saves a change of the connection alone without running anything on the target.", err)
 			return
 		}
@@ -924,6 +965,7 @@ func (r *installResource) Read(ctx context.Context, req resource.ReadRequest, re
 	}
 	applyStatus(&m, st, true)
 	applyHeld(&m, st, true)
+	readBack(&m, st.Values)
 	resp.Diagnostics.Append(dropUnrecorded(ctx, &m, st)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }
@@ -940,13 +982,18 @@ func (r *installResource) Read(ctx context.Context, req resource.ReadRequest, re
 var sshLoginRefused = regexp.MustCompile(`: Permission denied \((?:(?:publickey|password|keyboard-interactive|hostbased|gssapi-[a-z-]+)(?:,(?:publickey|password|keyboard-interactive|hostbased|gssapi-[a-z-]+))*)?\)|` +
 	`Received disconnect from \S+?(?: port \d+)?: ?(?:2: Too many authentication failures|14: No supported authentication methods available)`)
 
+// hostKeyFailed says whether msg, ssh's, is its refusal of the host key the host served.
+func hostKeyFailed(msg string) bool {
+	return strings.Contains(msg, "Host key verification failed") || strings.Contains(msg, "REMOTE HOST IDENTIFICATION HAS CHANGED")
+}
+
 // unreachable is a read's error for a remote target ssh did not reach (exit 255: ssh's own failure,
 // or the program's own exit 255). The install stays in state whatever ssh met: nothing a read sees
 // tells a host gone for good from one down or unreachable for a while, and forgetting an install
 // that still runs loses state's record of it. ssh's message picks the summary and the way on: a
-// refused login (block's user and private_key_file, saved by an apply that does not read), another
+// refused login (user and private_key_file, saved by an apply that does not read), another
 // host key served (keyWay), else no connection. Every detail ends on the ways common to all.
-func unreachable(diags *diag.Diagnostics, kind, block, host, keyWay string, err error) {
+func unreachable(diags *diag.Diagnostics, kind, host, keyWay string, err error) {
 	msg := err.Error()
 	common := fmt.Sprintf(" Only once the %s is known to be gone (deleted outside OpenTofu): `tofu state rm` this resource; nothing runs on the target, "+
 		"the next apply installs again, and what state recorded of the install (its previous release, its inputs) is lost. "+
@@ -955,12 +1002,12 @@ func unreachable(diags *diag.Diagnostics, kind, block, host, keyWay string, err 
 	switch {
 	case sshLoginRefused.MatchString(msg):
 		summary = fmt.Sprintf("ssh's login to the %s %s was refused", kind, host)
-		way = fmt.Sprintf("ssh's message names the host that refused it (a jump host's own, through an ssh configuration) and a key file it could not load (`Load key …`). "+
-			"A read logs in with the connection state holds: a fix outside the configuration (the ssh agent's keys, ssh_config's IdentityFile entries, "+
-			"the keys the host accepts or its MaxAuthTries) needs a plan again alone; "+
-			"a fix of %s.user or %s.private_key_file is saved by `tofu apply -refresh=false`, which saves a change of the connection alone without running anything on the target, "+
-			"then a plan reads the install again.", block, block)
-	case strings.Contains(msg, "Host key verification failed") || strings.Contains(msg, "REMOTE HOST IDENTIFICATION HAS CHANGED"):
+		way = "ssh's message names the host that refused it (a jump host's own, through an ssh configuration) and a key file it could not load (`Load key …`). " +
+			"A read logs in with the connection state holds: a fix outside the configuration (the ssh agent's keys, ssh_config's IdentityFile entries, " +
+			"the keys the host accepts or its MaxAuthTries) needs a plan again alone; " +
+			"a fix of user or private_key_file is saved by `tofu apply -refresh=false`, which saves a change of the connection alone without running anything on the target, " +
+			"then a plan reads the install again."
+	case hostKeyFailed(msg):
 		summary = fmt.Sprintf("The %s %s serves another host key", kind, host)
 		way = keyWay
 	default:
@@ -1004,14 +1051,18 @@ func remoteChange(plan, state *installModel) []string {
 		"tls":                      plan.TLS.Equal(state.TLS),
 		"domains":                  plan.Domains.Equal(state.Domains),
 		"ports":                    plan.Ports.Equal(state.Ports),
-		"vm.version":               plan.VM == nil || state.VM == nil || plan.VM.Version.Equal(state.VM.Version),
+		"version":                  plan.VM == nil || state.VM == nil || plan.VM.Version.Equal(state.VM.Version),
 		// Turned on, the release is applied again to write the pull Secret; turned off, the
 		// Secret stays (nothing removes it) and nothing runs.
-		"kubernetes.image_pull_login": plan.Kubernetes == nil || state.Kubernetes == nil ||
+		"image_pull_login": plan.Kubernetes == nil || state.Kubernetes == nil ||
 			!plan.Kubernetes.ImagePullLogin.ValueBool() || state.Kubernetes.ImagePullLogin.ValueBool(),
 		// Changed, the release is applied again with them; left out, nothing runs (the release
 		// keeps the values it has).
-		"kubernetes.values": !valuesChanged(plan, state),
+		"values":                    !valuesChanged(plan, state),
+		"acme_ca":                   plan.AcmeCA.Equal(state.AcmeCA),
+		"acme_ca_root":              plan.AcmeCARoot.Equal(state.AcmeCARoot),
+		"registry_login_wo_version": !loginChanged(plan, state),
+		"interfaces":                plan.VM == nil || state.VM == nil || plan.VM.Interfaces.Equal(state.VM.Interfaces),
 	} {
 		if !eq {
 			changed = append(changed, name)
@@ -1031,9 +1082,13 @@ func (r *installResource) Update(ctx context.Context, req resource.UpdateRequest
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	if len(remoteChange(&plan, &state)) == 0 && !imported(&state) {
+	if r.wo = readWriteOnly(ctx, req.Config, &resp.Diagnostics); resp.Diagnostics.HasError() {
+		return
+	}
+	if len(remoteChange(&plan, &state)) == 0 && !imported(&state) && (plan.VM == nil || len(pendingRoles(ctx, req.Private)) == 0) {
 		// Only the provider's own settings changed (the connection, deletion_protection,
-		// delete_data, allow_rollback, timeouts): the target has nothing to do.
+		// delete_data, allow_rollback, timeouts), and no interface is pending: the target has
+		// nothing to do.
 		plan.ID, plan.Registry, plan.Version, plan.Revision = state.ID, state.Registry, state.Version, state.Revision
 		plan.Channel, plan.Status, plan.Previous, plan.ShortName = state.Channel, state.Status, state.Previous, state.ShortName
 		plan.RegistryCADigest = state.RegistryCADigest
@@ -1139,6 +1194,7 @@ func (u *update) run(ctx context.Context, save func(*installModel) bool) {
 		return
 	}
 	rerun, up := u.split(ctx, running, next)
+	rerun.RegistryLogin = u.r.login(plan, state, u.diags)
 	refuseSecretInputs(u.diags, stringMap(ctx, plan.Inputs, u.diags), running, next)
 	if d.Local() {
 		refuseRunEnvInputs(u.diags, nil, "", stringMap(ctx, plan.Inputs, u.diags), u.secrets)
@@ -1156,7 +1212,7 @@ func (u *update) run(ctx context.Context, save func(*installModel) bool) {
 			return
 		}
 	case step == rollback && !rerun.Empty():
-		rollbackAlone(u.diags, "inputs, secret inputs, tls, domains or ports")
+		rollbackAlone(u.diags, "inputs, secret inputs, tls, domains, ports, acme_ca, acme_ca_root or the registry login")
 		return
 	}
 	short := running.ShortName
@@ -1262,6 +1318,7 @@ func (u *update) keptChecks(d installer.Docker, st *installer.Status, running *i
 // step is stay).
 func (u *update) releaseStep(ctx context.Context, d installer.Docker, st *installer.Status, fetchTo func() (installer.Docker, bool)) (releaseStep, *installer.Describe) {
 	desired := u.plan.Installer.ValueString()
+	kept := d // the install's, whose kept installer installedTrust may read
 	switch {
 	case st.Installed != nil && st.Installed.Installer == desired:
 		return stay, nil
@@ -1275,13 +1332,30 @@ func (u *update) releaseStep(ctx context.Context, d installer.Docker, st *instal
 		}
 		return rollback, nil
 	}
+	// The keys of the release installed are read first. Keys that cannot be read, without the
+	// provider's public_keys, refuse here, before anything is fetched or run on the target; with
+	// them, the new installer is checked against public_keys alone. What the read says otherwise
+	// (a warning) is told after the new installer's own checks: the same release's stay, or its
+	// refusal, comes first.
+	var told diag.Diagnostics
+	installed, untold := u.installedTrust(ctx, kept, st, &told)
+	if told.HasError() {
+		u.diags.Append(told...)
+		return stay, nil
+	}
+	// No keys to tell and no public_keys: the new installer would be checked by nothing but its
+	// digest, so it is not fetched, nor run on the target, to read its release.
+	if untold && (u.r.data == nil || len(u.r.data.PublicKeys) == 0) {
+		untoldRefusal(u.diags, "Nothing was fetched or run on the target. Set the provider's public_keys to the project's release keys to have an installer of the release installed read under them and taken over; ")
+		return stay, nil
+	}
 	if fetchTo != nil {
 		var ok bool
 		if d, ok = fetchTo(); !ok {
 			return stay, nil
 		}
 	}
-	next := u.r.fetchDescribe(ctx, d, desired, u.diags)
+	next := u.r.fetchDescribe(ctx, d, desired, installed, u.diags)
 	if next == nil {
 		return stay, nil
 	}
@@ -1294,7 +1368,94 @@ func (u *update) releaseStep(ctx context.Context, d installer.Docker, st *instal
 		}
 		return stay, nil
 	}
+	if untold {
+		untoldRefusal(u.diags, "")
+		return stay, nil
+	}
+	u.diags.Append(told...)
 	return upgrade, next
+}
+
+// untoldRefusal refuses a release change over an install whose installed keys cannot be told
+// (installedTrust's untold); way, when given, comes before the way on common to both refusals.
+func untoldRefusal(diags *diag.Diagnostics, way string) {
+	upgrade := "upgrade it by hand with the installer it keeps (`<short>-stow upgrade --version V --dir <dir>`, which checks the release against those keys), then refresh."
+	if way == "" {
+		upgrade = "Upgrade" + strings.TrimPrefix(upgrade, "upgrade")
+	}
+	diags.AddAttributeError(path.Root("installer"), "The keys of the release installed cannot be told",
+		"The install records no installer image (status --json installed.installer: an install made --offline, or before Stowage recorded it) and state names none: the new release cannot be checked against the keys the install trusts. "+way+upgrade)
+}
+
+// digestTrustWarning warns, at a first install's plan, that without the provider's public_keys
+// the installer it fetches is trusted by its digest alone.
+func digestTrustWarning(d *Data, diags *diag.Diagnostics) {
+	if d == nil || !d.PublicKeysKnown || len(d.PublicKeys) > 0 {
+		return
+	}
+	diags.AddAttributeWarning(path.Root("installer"), "The installer is trusted by its digest alone",
+		"The provider has no public_keys: this first install's installer is checked against nothing but the digest installer names, so an image pushed under that digest's repository and configured here would run. "+
+			"Set the provider's public_keys to the project's release keys to require their signature. "+
+			"An upgrade over the install is checked against the keys the release installed carries (its payload's keys/; on a VM, by its own upgrade): a release that carries none, its project not signing, leaves every upgrade over it checked by the digest installer names alone as well.")
+}
+
+// installedTrust is the trust of the release the install runs, for an upgrade over it: the keys
+// its installer carries — the installer image status --json records for it (installed.installer,
+// the digest its signed release manifest gives), else state's (the one this provider installed) —
+// read from the registry, as the release's own `upgrade --version` takes the keys of the
+// installer the install keeps. When the registry cannot give them, they are read from that kept
+// installer on the target (d's, <dir>/<short>-stow: its payload's keys/), said in a warning;
+// neither readable is, without the provider's public_keys, an error naming both and public_keys
+// as fixes; with them, a warning, and no trust (public_keys alone checks). A release that carries no key is said in
+// a warning: the upgrade is checked by the provider's public_keys, or by its digest alone. What it
+// says goes to told. untold when no image is known: without the provider's public_keys,
+// releaseStep refuses before anything is fetched; with them, the new installer is read under them
+// alone, an upgrade to it refused, and the same release taken over.
+func (u *update) installedTrust(ctx context.Context, d installer.Docker, st *installer.Status, told *diag.Diagnostics) (trust *fetch.Trust, untold bool) {
+	ref := ""
+	if st.Installed != nil {
+		ref = st.Installed.Installer
+	}
+	if ref == "" && known(u.state.Installer) && !imported(u.state) {
+		ref = u.state.Installer.ValueString()
+	}
+	if ref == "" {
+		return nil, true
+	}
+	file := d.WorkDir + "/" + d.Name + "/" + d.Short + "-stow"
+	keys, err := u.r.data.source().Keys(ctx, u.r.data, Want{Ref: ref, Configured: []string{u.plan.Installer.ValueString(), u.state.Installer.ValueString()}})
+	from := "its installer image, " + ref
+	if err != nil {
+		payload, kerr := d.KeptPayload(ctx)
+		if kerr == nil {
+			keys, kerr = fetch.TarKeys(payload)
+		}
+		if kerr != nil {
+			neither := fmt.Sprintf("the installer image the install records (%s) from its registry: %v; the installer the install keeps on the target (%s, its payload's keys/): %v", ref, err, file, kerr)
+			if u.r.data != nil && len(u.r.data.PublicKeys) > 0 {
+				told.AddAttributeWarning(path.Root("installer"), "The keys of the release installed cannot be read",
+					fmt.Sprintf("Neither source of the keys the release installed carries could be read (%s): the new release is checked against %s alone.", neither, publicKeysName))
+				return nil, false
+			}
+			told.AddAttributeError(path.Root("installer"), "The keys of the release installed cannot be read",
+				fmt.Sprintf("The new release is checked against the keys the release installed carries, read from either source, and neither could be read: %s. Nothing was fetched or run. Make that registry reachable from this machine (the provider's registry login, or its mirror), or put the release's installer back at %s (the release installed's `<short>-stow`), or set the provider's public_keys to the project's release keys (the new release is then checked against them alone), then apply again.", neither, file))
+			return nil, false
+		}
+		from = fmt.Sprintf("the installer the install keeps, %s, as its installer image (%s) could not be read from its registry: %v", file, ref, err)
+		if len(keys) > 0 {
+			told.AddAttributeWarning(path.Root("installer"), "The keys of the release installed were read on the target",
+				fmt.Sprintf("The installer image the install records (%s) could not be read from its registry (%v): the new release is checked against the keys the installer the install keeps carries (%s), the ones its own `upgrade --version` would check it against.", ref, err, file))
+		}
+	}
+	if len(keys) == 0 {
+		by := "its digest alone (installer)"
+		if u.r.data != nil && len(u.r.data.PublicKeys) > 0 {
+			by = publicKeysName + " alone"
+		}
+		told.AddAttributeWarning(path.Root("installer"), "The release installed carries no key",
+			fmt.Sprintf("The release installed carries no key (read from %s): the upgrade is checked by %s.", from, by))
+	}
+	return installedTrust(ref, keys), false
 }
 
 // split sorts the plan's changes between the re-run of the running release (running) and the
@@ -1356,6 +1517,7 @@ func (u *update) split(ctx context.Context, running, next *installer.Describe) (
 	if known(plan.TLS) && !plan.TLS.Equal(state.TLS) {
 		rerun.TLS = plan.TLS.ValueString()
 	}
+	rerun.AcmeCA, rerun.AcmeCARoot = acmeChange(plan, state)
 	oldDomains := stringMap(ctx, state.Domains, u.diags)
 	for k, v := range stringMap(ctx, plan.Domains, u.diags) {
 		if oldDomains[k] != v {
@@ -1498,19 +1660,11 @@ func portMap(ctx context.Context, m types.Map, diags *diag.Diagnostics) map[stri
 	return out
 }
 
-// ImportState reads an import ID naming the installer an install keeps, `[<host>:]<work_dir>/
+// importDocker reads a Docker import ID naming the installer an install keeps, `[<host>:]<work_dir>/
 // <name>/<short>-stow`: the target and the install's directory. The configuration gives the
 // connection and the rest at the first apply, which reconfigures the install with it.
-func (r *installResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
-	if id, ok := strings.CutPrefix(req.ID, "vm:"); ok {
-		r.importVM(ctx, id, resp)
-		return
-	}
-	if strings.HasPrefix(req.ID, "kubernetes:") {
-		r.k8sImport(ctx, req.ID, resp)
-		return
-	}
-	host, work, name, short, err := parseImportID(req.ID)
+func (r *installResource) importDocker(ctx context.Context, id string, resp *resource.ImportStateResponse) {
+	host, work, name, short, err := parseImportID(id)
 	if err != nil {
 		resp.Diagnostics.AddError("Import ID", err.Error())
 		return
@@ -1559,7 +1713,7 @@ func parseImportID(id string) (host, work, name, short string, err error) {
 		work = "."
 	case work == ".":
 	case !strings.HasPrefix(work, "/") || pathpkg.Clean(work) != work:
-		// docker.work_dir is an absolute, clean path, or left out (the home: <name>/… alone).
+		// work_dir is an absolute, clean path, or left out (the home: <name>/… alone).
 		return "", "", "", "", fmt.Errorf("%q: the work directory %q is neither absolute and clean nor the home: give its absolute path, or <name>/<short>-stow for an install in the SSH user's home", id, work)
 	}
 	return host, work, name, short, nil
@@ -1586,7 +1740,9 @@ func (r *installResource) Delete(ctx context.Context, req resource.DeleteRequest
 		return
 	}
 	if targetKind(&m) == "vm" {
-		return // forgotten: removing the VM is its hypervisor resource's job
+		// Forgotten: removing the VM is its hypervisor resource's job, which follows. Whether it
+		// can be made again was said at the destroy's plan (vmDiskWarning).
+		return
 	}
 	timeout, diags := m.Timeouts.Delete(ctx, deleteTimeout)
 	resp.Diagnostics.Append(diags...)

@@ -48,8 +48,8 @@ runs() {
 	got=$(helm list -n "$NS" --filter '^notes$' --output json | jq -r '.[0] | .app_version + " " + .status')
 	[[ $got == "$1 deployed" ]] || fail "helm lists '$got', want '$1 deployed'"
 }
-# st <attribute>: the attribute of stowage_install.notes in tofu's state.
-st() { (cd "$TF" && "${TF_ENV[@]}" "$TOFU" show -json) | jq -r --arg a "$1" '.values.root_module.resources[] | select(.address == "stowage_install.notes") | .values[$a] | if type == "object" then tojson else . end'; }
+# st <attribute>: the attribute of stowage_kubernetes_install.notes in tofu's state.
+st() { (cd "$TF" && "${TF_ENV[@]}" "$TOFU" show -json) | jq -r --arg a "$1" '.values.root_module.resources[] | select(.address == "stowage_kubernetes_install.notes") | .values[$a] | if type == "object" then tojson else . end'; }
 # config <installer> <admin email> [extra lines]: main.tf for that release and input, the secret
 # input from TF_VAR_e2e_token; KVALUES, a line of the kubernetes block (its chart values).
 config() {
@@ -65,8 +65,9 @@ variable "e2e_token" {
   ephemeral = true
 }
 provider "stowage" {
-  username = "pull"
-  password = "$PULL_TOKEN"
+  username    = "pull"
+  password    = "$PULL_TOKEN"
+  public_keys = [file("$P/keys/release.pub")]
   kubernetes {
     host                   = "$K8S_HOST"
     cluster_ca_certificate = file("$WORK/k8s-ca.pem")
@@ -74,7 +75,7 @@ provider "stowage" {
     client_key             = file("$WORK/k8s-key.pem")
   }
 }
-resource "stowage_install" "notes" {
+resource "stowage_kubernetes_install" "notes" {
   installer           = "$1"
   inputs              = { ADMIN_EMAIL = "$2" }
   secret_inputs_wo         = { E2E_TOKEN = var.e2e_token }
@@ -82,10 +83,8 @@ resource "stowage_install" "notes" {
   deletion_protection = ${PROTECT:-false}
   delete_data         = true
   ${3:-}
-  kubernetes {
-    namespace = "$NS"
-    ${KVALUES:-}
-  }
+  namespace = "$NS"
+  ${KVALUES:-}
 }
 HCL
 }
@@ -129,7 +128,11 @@ K8S_HOST=$(jq -r '.clusters[0].cluster.server' "$WORK/kc.json")
 	jq -r '.users[0].user."client-key-data"' "$WORK/kc.json" | base64 -d >"$WORK/k8s-key.pem")
 # No KUBECONFIG: the provider writes the kubeconfig each run reads, from the block.
 # TMPDIR: each run's private directory (its kubeconfig) is made there, and must be gone after it.
-TF_ENV=(env -i "PATH=$PATH" "HOME=$WORK/tfhome" "TMPDIR=$WORK/tmp" "TF_CLI_CONFIG_FILE=$WORK/tofurc" "TF_IN_AUTOMATION=1" "TF_VAR_e2e_token=$E2E_TOKEN")
+# No docker on tofu's PATH: the provider reads the installer from the registry and runs it natively.
+mkdir -p "$WORK/nodocker"
+printf '#!/bin/sh\necho "acc-k8s: the provider ran docker" >&2\nexit 99\n' >"$WORK/nodocker/docker"
+chmod 755 "$WORK/nodocker/docker"
+TF_ENV=(env -i "PATH=$WORK/nodocker:$PATH" "HOME=$WORK/tfhome" "TMPDIR=$WORK/tmp" "TF_CLI_CONFIG_FILE=$WORK/tofurc" "TF_IN_AUTOMATION=1" "TF_VAR_e2e_token=$E2E_TOKEN")
 for v in DOCKER_HOST DOCKER_CONTEXT; do
 	if [[ -n ${!v:-} ]]; then TF_ENV+=("$v=${!v}"); fi
 done
@@ -229,8 +232,8 @@ runs 2.0.0
 [[ $(mark) == two ]] || fail "after the rollback, the release's values are not kubernetes.values: $(helm get values notes -n "$NS" -o json)"
 
 step "import: the state forgotten, the release imported by its ID, its first apply, then a plan with no change"
-tf state rm stowage_install.notes >"$WORK/rm.log" 2>&1 || { cat "$WORK/rm.log"; fail "tofu state rm"; }
-tf import -input=false stowage_install.notes "kubernetes:$NS/notes" >"$WORK/import.log" 2>&1 || { cat "$WORK/import.log"; fail "tofu import"; }
+tf state rm stowage_kubernetes_install.notes >"$WORK/rm.log" 2>&1 || { cat "$WORK/rm.log"; fail "tofu state rm"; }
+tf import -input=false stowage_kubernetes_install.notes "$NS/notes" >"$WORK/import.log" 2>&1 || { cat "$WORK/import.log"; fail "tofu import"; }
 [[ $(st id) == notes/notes && $(st registry) == null ]] || fail "state after the import: id $(st id), registry $(st registry)"
 tf apply -auto-approve -no-color >"$WORK/apply5.log" 2>&1 || { cat "$WORK/apply5.log"; cluster_logs >&2; fail "tofu apply (the import's first)"; }
 runs 2.0.0

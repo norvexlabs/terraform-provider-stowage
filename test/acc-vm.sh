@@ -15,26 +15,29 @@
 #   - tofu ≥ 1.11, docker, ssh, jq, oras, zstd and xorriso on PATH, on a linux/amd64 machine TrueNAS
 #     reaches: `make acc-vm` runs it in the acceptance runner (test/acc.Dockerfile), which has them.
 #
-# What it runs, in one OpenTofu root (examples/resources/stowage_vm_seed's, its VM a host named by
-# DHCP under the env file's domain):
+# What it runs, in one OpenTofu root (examples/guides/truenas-vm, its VM a host named by DHCP under
+# the env file's domain), tofu's PATH holding a docker that fails (the provider runs none):
 #   1. examples/minimal with its kairos shape (and a secret input) shipped on beta with its qcow2
-#      disk, carried to a TLS mirror of its own CA on the address TrueNAS reaches this host at;
-#   2. apply: stowage_vm_seed (truenas, the mirror), the disk pulled and an ISO of its user-data,
-#      Stowage's TrueNAS module creating and starting the VM, stowage_install's vm target waiting
-#      for its first boot under the one-time key, installing with the secret input over SSH (in
-#      neither the seed nor state), reading the VM's own host key and retiring the one-time key
-#      (ssh pinned to it alone refused from then on);
-#   3. `tofu plan -detailed-exitcode` shows no change; a refresh reads the VM's release;
+#      disk, carried to a TLS mirror of its own CA that asks for a sign-in, on the address TrueNAS
+#      reaches this host at;
+#   2. apply: stowage_vm_seed (truenas, the mirror read with its read account; the installer read
+#      from the registry for this machine, ctl_path), its disk and an ISO of its user-data,
+#      truenas/truenas making the VM with Stowage's `vm truenas` steps (ctl_path), and
+#      stowage_vm_install waiting for its first boot under the one-time key, giving it its
+#      registry login (registry-login) and the secret input over SSH (in neither the seed nor
+#      state), installing, reading the VM's own host key and retiring the one-time key;
+#   3. `tofu plan -detailed-exitcode` shows no change (the TrueNAS root and the install);
 #   4. an input changed: the re-run alone;
-#   5. 1.0.1 shipped and mirrored, vm.version 1.0.1: a plan with plan_dry_run runs the VM's
+#   5. 1.0.1 shipped and mirrored, version 1.0.1: a plan with plan_dry_run runs the VM's
 #      upgrade --dry-run and changes nothing; then the upgrade, its reboot followed, the VM on
 #      1.0.1 with seed_boot_id null, and only its own key accepted from then on;
-#   6. vm.version back to 1.0.0 without allow_rollback: a plan error; with it, a plan with
+#   6. version back to 1.0.0 without allow_rollback: a plan error; with it, a plan with
 #      plan_dry_run runs rollback --dry-run, then the rollback;
-#   7. the install forgotten (tofu state rm) and imported (vm:<host>/notes-stow), its first apply
-#      under the VM's own key (vm.known_hosts_line), then no change planned;
+#   7. the install forgotten (tofu state rm) and imported (<host>/notes-stow), its first apply
+#      under the VM's own key (vm_known_hosts_line), then no change planned;
 #   8. a destroy of the install refused by deletion_protection, the VM's install untouched;
-#   9. destroy with deletion_protection off: stowage_install forgotten, the module destroyed.
+#   9. destroy with deletion_protection off: stowage_vm_install forgotten, the VM, its devices,
+#      zvol and staging dataset destroyed (the stop step first).
 set -euo pipefail
 
 STOWAGE_REPO=${STOWAGE_REPO:-$HOME/stowage}
@@ -84,21 +87,23 @@ missing=$(jq -r '.inputs[] | select(.required and (.shapes == [] or (.shapes | i
 	| .key' "$WORK/describe.json" | while read -r k; do [[ $GIVEN == *" $k "* ]] || printf '%s ' "$k"; done)
 [[ -z $missing ]] || fail "the root gives none of the inputs the release requires on kairos: $missing(add them to the seed's and the install's inputs, secret inputs or domains, and to GIVEN)"
 
-step "the site's mirror, TLS of its own CA, on the address TrueNAS reaches this host at"
+step "the site's mirror, TLS of its own CA, a sign-in to read, on the address TrueNAS reaches this host at"
+export MIRROR_SIGN_IN=1
 vm_mirror
 mirror "$WORK/r1.oci.tar" --disks qcow2
 INSTALLER=$REG/notes/notes-installer@$(digest_of notes/notes-installer:beta-1.0.0)
 [[ $INSTALLER == *@sha256:* ]] || fail "no digest of the installer"
 
-step "the OpenTofu root: this provider from a filesystem mirror, the seed, the disk and ISO, Stowage's TrueNAS module, the install"
+step "the OpenTofu root: examples/guides/truenas-vm, this provider from a filesystem mirror"
 ROOT=$WORK/root
-mkdir -p "$ROOT" "$WORK/disks"
-cp "$PROV"/examples/resources/stowage_vm_seed/*.sh "$ROOT/"
+mkdir -p "$ROOT" "$WORK/disks" "$WORK/seeds"
+cp -a "$PROV/examples/guides/truenas-vm/." "$ROOT/"
+rm -rf "$ROOT/tests"
 # The provider built here, from a filesystem mirror of this run's own (dev_overrides would leave
 # tofu init querying the registry for it, which the root's other providers need init for).
-MIRRORDIR=$WORK/providers/registry.opentofu.org/norvexlabs/stowage/0.1.0/linux_amd64
+MIRRORDIR=$WORK/providers/registry.opentofu.org/norvexlabs/stowage/0.3.0/linux_amd64
 mkdir -p "$MIRRORDIR"
-cp "$PROV/bin/terraform-provider-stowage" "$MIRRORDIR/terraform-provider-stowage_v0.1.0"
+cp "$PROV/bin/terraform-provider-stowage" "$MIRRORDIR/terraform-provider-stowage_v0.3.0"
 cat >"$WORK/tofurc" <<EOF
 provider_installation {
   filesystem_mirror {
@@ -108,122 +113,54 @@ provider_installation {
   direct { exclude = ["registry.opentofu.org/norvexlabs/stowage"] }
 }
 EOF
+# No docker on the PATH tofu runs with: the provider reads the installer from the registry and
+# runs it natively (a docker run would fail here).
+mkdir -p "$WORK/nodocker"
+printf '#!/bin/sh\necho "acc-vm: the provider ran docker" >&2\nexit 99\n' >"$WORK/nodocker/docker"
+chmod 755 "$WORK/nodocker/docker"
 export TF_CLI_CONFIG_FILE=$WORK/tofurc TF_IN_AUTOMATION=1
-export STOWAGE_CTL=$CTL
 TOKEN=$(token)
-VMNAME=${H//-/}
-cat >"$ROOT/main.tf" <<EOF
-terraform {
-  required_version = ">= 1.11.0"
-  required_providers {
-    stowage = { source = "registry.opentofu.org/norvexlabs/stowage" }
-  }
-}
-
-provider "stowage" {
-  username    = "${PULL_USER:-pull}"
-  password    = var.pull_token
-  registry    = "$SITE"
-  registry_ca = file("$MIRROR_CA")
-}
-
-variable "pull_token" {
-  type      = string
-  sensitive = true
-}
-variable "token" {
+jq -n --arg installer "$INSTALLER" --arg name "$VMNAME" --arg h "$H" --arg addr "$ADDR" --arg key "$KEY" --argjson insecure "$TN_INSECURE" \
+	--arg pool "$POOL" --arg dataset "$DATASET" --arg bridge "$BRIDGE" --arg mirror_ip "$MIRROR_IP" --arg site "$SITE" --arg ca "$MIRROR_CA" \
+	--arg disks "$WORK/disks" --arg seeds "$WORK/seeds" \
+	'{installer: $installer, name: $name, hostname: $h, vm_address: $addr, user: "ops", ssh_key_file: $key, insecure: $insecure,
+	pool: $pool, parent_dataset: $dataset, nic_attach: $bridge, ssh_allow: [($mirror_ip + "/32")], cpus: 2, memory_mib: 4096,
+	tls: "internal", domains: {app: "app.notes.test", api: "api.notes.test"}, registry: $site, registry_ca_file: $ca,
+	pull_username: "pull", disk_dir: $disks, seed_dir: $seeds}' >"$ROOT/terraform.tfvars.json"
+# The VM's own registry login, the mirror's read account (it asks for a sign-in), given over SSH,
+# never in the seed or in state; the seed reads the mirror's disks with the same account, as the
+# provider's mirror login.
+cat >"$ROOT/acc.tf" <<'EOF'
+variable "registry_login" {
   type      = string
   sensitive = true
   ephemeral = true
 }
-variable "release_version" { type = string }
-variable "admin" { type = string }
-variable "allow_rollback" { default = false }
-variable "plan_dry_run" { default = false }
-variable "deletion_protection" { default = true }
-# The VM's own key, for an imported install's first apply; null: the seed's one-time key.
-variable "vm_known_hosts_line" {
-  type    = string
-  default = null
+
+variable "mirror_password" {
+  type      = string
+  sensitive = true
 }
-
-resource "stowage_vm_seed" "vm" {
-  installer      = "$INSTALLER"
-  platform       = "truenas"
-  hostname       = "$H"
-  user           = "ops"
-  ssh_public_key = file("$KEY.pub")
-  ssh_allow      = ["$MIRROR_IP/32"]
-  tls            = "internal"
-  domains        = { app = "app.notes.test", api = "api.notes.test" }
-  inputs         = { ADMIN_EMAIL = "admin@notes.test" }
-  disk_dir       = "$WORK/disks"
-}
-
-data "external" "seed" {
-  program = ["\${path.module}/seed-iso.sh"]
-  query = {
-    user_data = stowage_vm_seed.vm.user_data
-    meta_data = stowage_vm_seed.vm.meta_data
-    hostname  = "$H"
-    dir       = "$WORK/seeds"
-  }
-}
-
-module "vm" {
-  source = "$STOWAGE_REPO/internal/install/tofu/truenas"
-
-  name                 = "$VMNAME"
-  pool                 = "$POOL"
-  parent_dataset       = "$DATASET"
-  nic_attach           = "$BRIDGE"
-  insecure_skip_verify = ${TRUENAS_INSECURE_SKIP_VERIFY:-false}
-  cpus                 = 2
-  memory_mib           = 4096
-  disk_gib             = stowage_vm_seed.vm.disk_file.disk_gib
-  image                = stowage_vm_seed.vm.disk_file.path
-  image_sha256         = stowage_vm_seed.vm.disk_file.sha256
-  seed                 = data.external.seed.result.path
-  seed_sha256          = data.external.seed.result.sha256
-}
-
-resource "stowage_install" "vm" {
-  inputs                   = { ADMIN_EMAIL = var.admin }
-  secret_inputs_wo         = { ACC_TOKEN = var.token }
-  secret_inputs_wo_version = 1
-  tls                      = "internal"
-  domains                  = { app = "app.notes.test", api = "api.notes.test" }
-  allow_rollback           = var.allow_rollback
-  plan_dry_run             = var.plan_dry_run
-  deletion_protection      = var.deletion_protection
-
-  vm {
-    host             = "$ADDR"
-    user             = "ops"
-    private_key_file = "$KEY"
-    known_hosts_line = var.vm_known_hosts_line != null ? var.vm_known_hosts_line : stowage_vm_seed.vm.known_hosts_line
-    short_name       = stowage_vm_seed.vm.short_name
-    version          = var.release_version
-  }
-
-  timeouts {
-    create = "40m"
-    update = "40m"
-  }
-
-  depends_on = [module.vm]
-}
-
-output "host_key_line" { value = stowage_install.vm.vm.host_key_line }
-output "seed_boot_id" { value = stowage_install.vm.vm.seed_boot_id }
-output "version" { value = stowage_install.vm.version }
-output "fingerprint" { value = stowage_vm_seed.vm.fingerprint }
 EOF
-export TF_VAR_pull_token=$PULL_TOKEN TF_VAR_token=$TOKEN TF_VAR_admin=admin@notes.test TF_VAR_release_version=1.0.0
-tf() { (cd "$ROOT" && tofu "$@"); }
+python3 - "$ROOT" <<'PY'
+import sys
+root = sys.argv[1]
+def edit(f, old, new):
+    s = open(f).read()
+    assert s.count(old) == 1, (f, old)
+    open(f, "w").write(s.replace(old, new))
+edit(root + "/main.tf", "  inputs                   = var.inputs\n  secret_inputs_wo ",
+     "  inputs                   = var.inputs\n  registry_login_wo         = var.registry_login\n  registry_login_wo_version = 1\n  secret_inputs_wo ")
+edit(root + "/versions.tf", "  registry_ca = var.registry_ca_file != null ? file(var.registry_ca_file) : null\n",
+     "  registry_ca = var.registry_ca_file != null ? file(var.registry_ca_file) : null\n  registry_username = \"vm\"\n  registry_password = var.mirror_password\n")
+PY
+export TF_VAR_pull_password=$PULL_TOKEN TF_VAR_secret_inputs="{\"ACC_TOKEN\":\"$TOKEN\"}" TF_VAR_inputs='{"ADMIN_EMAIL":"admin@notes.test"}'
+TF_VAR_registry_login=$(cat "$MIRROR_VM_LOGIN")
+export TF_VAR_registry_login TF_VAR_mirror_password=$MIRROR_VM_TOKEN TF_VAR_release_version=1.0.0
+tf() { (cd "$ROOT" && PATH="$WORK/nodocker:$PATH" tofu "$@"); }
 destroyed=
-# A run that fails destroys the VM still: the install forgotten (its delete runs nothing), the module destroyed.
-CLEANUP=("[[ -n \$destroyed ]] || (cd $ROOT && tofu state rm stowage_install.vm >>$WORK/destroy.log 2>&1; tofu destroy -auto-approve >>$WORK/destroy.log 2>&1)" "${CLEANUP[@]}")
+# A run that fails destroys the VM still: the install forgotten (its delete runs nothing), the VM destroyed.
+CLEANUP=("[[ -n \$destroyed ]] || (cd $ROOT && tofu state rm stowage_vm_install.vm >>$WORK/destroy.log 2>&1; tofu destroy -auto-approve >>$WORK/destroy.log 2>&1)" "${CLEANUP[@]}")
 # A run killed mid-apply leaves apply_logged's raw debug log: removed here.
 CLEANUP=("rm -f $WORK/*.raw.log" "${CLEANUP[@]}")
 tf init -input=false >"$WORK/init.log" 2>&1 || { cat "$WORK/init.log"; fail "tofu init"; }
@@ -293,6 +230,9 @@ seed_refused() {
 seed_refused || fail "the VM still serves its one-time key after the install"
 ! grep -qF "$TOKEN" "$ROOT/terraform.tfstate" || fail "the secret input is in state"
 iso=$(jq -r '.resources[] | select(.type == "external" and .name == "seed") | .instances[0].attributes.result.path' "$ROOT/terraform.tfstate")
+! grep -qF "$MIRROR_VM_TOKEN" "$ROOT/terraform.tfstate" || fail "the VM's registry login is in state"
+on notes-stow status --json --values | jq -e '.values.pull_login == true' >/dev/null || { on notes-stow status --json --values >&2; fail "the VM holds no registry login"; }
+[[ $(jq -r '.resources[] | select(.type == "stowage_vm_seed") | .instances[0].attributes.ctl_path' "$ROOT/terraform.tfstate") == /* ]] || fail "the seed has no ctl_path"
 ! grep -aqF "$TOKEN" "$iso" || fail "the secret input is in the seed"
 
 step "no change planned; a refresh reads the VM"
@@ -302,10 +242,10 @@ tf plan -input=false -detailed-exitcode >"$WORK/plan1.log" 2>&1 || rc=$?
 
 step "an input changed: the re-run alone, no reboot"
 boot=$(on cat /proc/sys/kernel/random/boot_id)
-TF_VAR_admin=other@notes.test tf apply -input=false -auto-approve >"$WORK/apply2.log" 2>&1 || { tail -60 "$WORK/apply2.log"; fail "the re-run"; }
+TF_VAR_inputs='{"ADMIN_EMAIL":"other@notes.test"}' tf apply -input=false -auto-approve >"$WORK/apply2.log" 2>&1 || { tail -60 "$WORK/apply2.log"; fail "the re-run"; }
 [[ $(on cat /proc/sys/kernel/random/boot_id) == "$boot" ]] || fail "the re-run rebooted the VM"
 on sudo grep -q '^ADMIN_EMAIL=.*other@notes.test' /usr/local/notes/.env || fail "the re-run did not record the input"
-export TF_VAR_admin=other@notes.test
+export TF_VAR_inputs='{"ADMIN_EMAIL":"other@notes.test"}'
 
 step "1.0.1 shipped and mirrored; vm.version 1.0.1: the upgrade, its reboot followed"
 printf '1.0.1\n' >"$P/VERSION"
@@ -349,8 +289,8 @@ on notes-stow status --json | jq -e '.installed.version == "1.0.0" and .boot == 
 
 step "import: the install forgotten, imported by its ID, its first apply under the VM's own key, then no change planned"
 export TF_VAR_release_version=1.0.0
-tf state rm stowage_install.vm >"$WORK/rm.log" 2>&1 || { cat "$WORK/rm.log"; fail "tofu state rm"; }
-tf import -input=false stowage_install.vm "vm:$ADDR/notes-stow" >"$WORK/import.log" 2>&1 || { cat "$WORK/import.log"; fail "tofu import"; }
+tf state rm stowage_vm_install.vm >"$WORK/rm.log" 2>&1 || { cat "$WORK/rm.log"; fail "tofu state rm"; }
+tf import -input=false stowage_vm_install.vm "$ADDR/notes-stow" >"$WORK/import.log" 2>&1 || { cat "$WORK/import.log"; fail "tofu import"; }
 export TF_VAR_vm_known_hosts_line=$own
 boot=$(on cat /proc/sys/kernel/random/boot_id)
 tf apply -input=false -auto-approve >"$WORK/apply-import.log" 2>&1 || { tail -80 "$WORK/apply-import.log"; vm_dump; fail "the import's first apply"; }
@@ -364,13 +304,13 @@ tf plan -input=false -detailed-exitcode >"$WORK/plan3.log" 2>&1 || rc=$?
 
 step "a destroy of the install refused by deletion_protection: the VM's install untouched"
 rc=0
-tf destroy -input=false -auto-approve -target=stowage_install.vm >"$WORK/destroy-refused.log" 2>&1 || rc=$?
+tf destroy -input=false -auto-approve -target=stowage_vm_install.vm >"$WORK/destroy-refused.log" 2>&1 || rc=$?
 [[ $rc != 0 ]] && grep -q 'deletion_protection is on' "$WORK/destroy-refused.log" || { cat "$WORK/destroy-refused.log"; fail "the destroy was not refused by deletion_protection"; }
-[[ $(tf state list) == *stowage_install.vm* ]] || fail "the install left state though its destroy was refused"
+[[ $(tf state list) == *stowage_vm_install.vm* ]] || fail "the install left state though its destroy was refused"
 on notes-stow status --json | jq -e '.installed.version == "1.0.0"' >/dev/null || { vm_dump; fail "the VM does not run 1.0.0 after the refused destroy"; }
 
-step "destroy: the install forgotten, the VM destroyed by its module"
-TF_VAR_release_version=1.0.0 TF_VAR_deletion_protection=false tf apply -input=false -auto-approve -target=stowage_install.vm >"$WORK/apply5.log" 2>&1 || { tail -40 "$WORK/apply5.log"; fail "deletion_protection off"; }
+step "destroy: the install forgotten, the VM destroyed by its root"
+TF_VAR_release_version=1.0.0 TF_VAR_deletion_protection=false tf apply -input=false -auto-approve -target=stowage_vm_install.vm >"$WORK/apply5.log" 2>&1 || { tail -40 "$WORK/apply5.log"; fail "deletion_protection off"; }
 TF_VAR_release_version=1.0.0 TF_VAR_deletion_protection=false tf destroy -input=false -auto-approve >"$WORK/destroy.log" 2>&1 || { tail -60 "$WORK/destroy.log"; fail "tofu destroy"; }
 # shellcheck disable=SC2034 # read by the cleanup above
 destroyed=1

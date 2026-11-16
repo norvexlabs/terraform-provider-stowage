@@ -2,14 +2,15 @@
 page_title: "The Kubernetes target - stowage"
 subcategory: "Guides"
 description: |-
-  What each operation of stowage_install runs on a Kubernetes cluster, from the machine running OpenTofu.
+  What each operation of stowage_kubernetes_install runs on a Kubernetes cluster, from the machine running OpenTofu.
 ---
 
 # The Kubernetes target
 
-Everything runs on the machine running OpenTofu, in a private (0700) temporary directory removed
-when the operation ends, which holds the kubeconfig (when `host` gives it) and each installer
-fetched. Every run is one `sh -c` script, `KUBECONFIG` set to the kubeconfig when one is written or
+Everything runs on the machine running OpenTofu, in a private (0700) directory of the system's
+temporary directory (`stowage-k8s-*`, never in the cache), removed when the operation ends, which
+holds the kubeconfig (when `host` gives it) and each installer's working directory (its
+`<name>.sh`); each installer's program is apart, in the cache (below). Every run is one `sh -c` script, `KUBECONFIG` set to the kubeconfig when one is written or
 named (else the environment's), files sent on standard input as a tar into a private directory;
 nothing secret is an argument. The installer runs with OpenTofu's environment but for the
 variables named as an input the installer declares (the installer reads an exported variable of an
@@ -18,26 +19,53 @@ input's name before an answers file or a `--given` file; but those the run needs
 `DOCKER_*`, `XDG_*`, `SSL_CERT_*`, `LC_*`) and helm's `HELM_DRIVER`,
 `HELM_DRIVER_SQL_CONNECTION_STRING`, `HELM_KUBE*` and `HELM_NAMESPACE` (another release store, or
 another cluster than kubectl's), each unset. Each
-operation first refuses a machine that is not linux/amd64 and names the programs missing from
-`PATH` among `docker`, `helm` and `kubectl`. Every verb gets
+operation first names the programs missing from `PATH` among `helm` and `kubectl`: no Docker. Every verb gets
 `--namespace`, `--release` (when given) and `--kube-context` (with `config_context`).
 
-- **The installer** is fetched as on Docker (`docker run --rm <installer> > <name>.sh`, the pull
-  account's login in a Docker configuration of its own, removed afterwards), into the run's
-  directory, then `sh <name>.sh describe --json` (its `name` compared; its shapes must include
-  `kubernetes`). Each operation fetches the installer it runs, but for one fetched before: the
-  bootstrap script an installer prints is kept by its digest (an image by digest prints one, ever)
-  in the user's cache directory, `<cache>/terraform-provider-stowage/installers/<digest>/bootstrap.sh`
-  (`~/.cache` on Linux; 0600 in 0700 directories, written through a temporary file renamed into
-  place) with its SHA-256 beside it (`bootstrap.sh.sha256`), and copied into the run's directory
-  from there; a kept script that does not match its checksum is fetched again, and a cache that
-  cannot be written is only not kept. The cache keeps the 8 installers last used (each embeds an
-  installer binary) and removes the others; delete the directory to fetch again.
+- **The installer** is read from its registry for the machine running OpenTofu, with no Docker:
+  the installer image (an OCI index) by its digest, its entry for this machine's platform
+  (`linux/amd64`, `linux/arm64`, `darwin/amd64` or `darwin/arm64`; an index without one is refused,
+  naming the platforms it has; an image of one platform, as a Stowage before 0.40.0 published, is
+  taken for that platform alone), its one layer's one file, `<short_name>-stow` with the release's
+  payload. The mirror's own login goes to the provider `registry`'s host; the provider's
+  `username`/`password` to the host of an installer the configuration names (the resource's
+  `installer`, the one state records) or of the provider's `registry`; the machine's Docker
+  configuration (`~/.docker/config.json` and its credential helpers) reads any other host; the
+  provider's `registry_ca` is trusted besides the system's; plain HTTP is refused but on this
+  machine's loopback. The entry is checked, before its layer is read, as the [trust
+  guide](trust.md) says: against the provider's `public_keys` when given, and, for the new release
+  of an upgrade, against the keys the installer of the release running carries (its payload's
+  `keys/`; that installer is fetched first, by the digest the release records); a sigstore bundle
+  referring to the entry's digest (an OCI referrer, as cosign v3 writes it, read by the referrers
+  API or its tag fallback) signed by one of them over that digest
+  (`https://sigstore.dev/cosign/sign/v1`), with no transparency log. A referrer that cannot be
+  read is a failure to check, never "unsigned". A first install with no `public_keys` trusts the
+  digest alone (a plan warning says so). It is kept in the user's cache directory,
+  `<cache>/terraform-provider-stowage/installers/<index digest>/<os>-<arch>/<short_name>-stow`
+  (`~/.cache` on Linux; 0700 in 0700 directories, written through a temporary file renamed into
+  place) with its SHA-256 and its image's digest beside it, checked at each use (and checked
+  again against the run's keys: a program kept under none is checked when a trust applies) (a file that does not match is read
+  again); the cache keeps the 8 index digests last used and removes the others, and a part
+  file a fetch cut off left (`.installer-*.part`, unwritten for an hour) is removed at the next
+  fetch into its entry or prune; a cache that cannot be written writes the file into the run's
+  directory instead. The run's programs are in the cache too, and nothing else of the run:
+  `<cache>/terraform-provider-stowage/installers/runs/stowage-k8s-*` (0700, removed after the run;
+  one a day old, which a run cut off left, is removed when the next run starts; without a cache
+  directory, the system's temporary directory), and the run executes its own hard link to the
+  kept file there — else, on a file system that takes no link, a copy written to a temporary file
+  there and renamed into place — so another run's prune of the cache cannot remove it during the
+  run. A run the shell could not start as that program was busy (`Text file busy`, exit 126: a
+  child another run forks may hold a copy open for writing for an instant) is made again, up to 5
+  times over less than a second. The run's working directory gets `<name>.sh`, a script running
+  that program with its arguments; then `sh <name>.sh describe --json`
+  (its `name` compared; its shapes must include `kubernetes`).
 - **Create**: the desired installer's `k8s status --json`. No release (exit 3, its refusal's
   object on standard output saying `absent` — any other refusal is an error) installs: `sh
   <name>.sh k8s install --no-input --json [--set K=V]… [--image-registry <the provider's
   registry>] [--image-pull-login]`, with `--answers` (the secret inputs), `--given`
-  (`given_wo`), `--registry-ca` and `--values` (`kubernetes.values`) on standard input; then `k8s status --json`, read again every 10
+  (`given_wo`), `--registry-ca`, `--values` (`values`), `--registry-login-file`
+  (`registry_login_wo`, in `--image-pull-login`'s place) and `--kit` with `--kit-code-file`
+  (`kit_file`, `kit_code_wo`) on standard input; then `k8s status --json`, read again every 10
   seconds while it reports `installing` (helm's `pending-install`), within the create timeout. A
   release of another project is an error; one recording an installer the provider does not run
   (as at update) is refused, not taken over (`The release records another installer`: `k8s
@@ -49,8 +77,8 @@ operation first refuses a machine that is not linux/amd64 and names the programs
   upgrade --given`), then `inputs` and `secret_inputs_wo` the same way (below), which win as at an
   install; the provider's `registry` and `registry_ca` are not given (the release keeps what it
   recorded); with nothing to give, a release whose latest helm revision is failed, or any with
-  `kubernetes.values`, is applied again, `k8s upgrade --no-input --json` given no input (each of
-  these runs gets `--values` from `kubernetes.values` when set). A release whose values record no installer is taken over only by an
+  `values`, is applied again, `k8s upgrade --no-input --json` given no input (each of
+  these runs gets `--values` from `values` when set). A release whose values record no installer is taken over only by an
   installer of the release it runs (the same `version` and `revision`, else `The release runs
   another release`); one helm is working on (`installing`, or a latest revision `pending-…` or
   `uninstalling`) is refused (`helm is working on the release`: apply again once it is over; a
@@ -134,10 +162,16 @@ operation first refuses a machine that is not linux/amd64 and names the programs
      standard input: `project` and `inputs` — each input changed or added that the running release
      declares (every one without an upgrade), each taken out given `""`, and the secret inputs
      when `secret_inputs_wo_version` changed — which replace the values the release's Secret
-     records; `--registry-ca` too. With nothing to give but `kubernetes.values` changed (or
-     `image_pull_login` turned on), the release is applied again: `k8s upgrade --no-input --json`.
+     records; `--registry-ca` too. With nothing to give but `values` changed (or
+     `image_pull_login` turned on, or `registry_login_wo_version` changed), the release is applied
+     again: `k8s upgrade --no-input --json`. A changed `registry_login_wo_version` gives
+     `registry_login_wo` as `--registry-login-file` (on standard input) to that run, or to the
+     re-run and the upgrade of the same apply; beside a rollback it is refused (`a rollback goes
+     alone`: helm's rollback writes no Secret). A read (`k8s status --json --values`) taking
+     `pull_login` false takes `registry_login_wo_version` out of state, so the next plan gives
+     the login again.
      Every `k8s upgrade` the update runs (this one, the next step's) gets `--values` from
-     `kubernetes.values` when set; a rollback does not, and is followed, with `kubernetes.values`
+     `values` when set; a rollback does not, and is followed, with `values`
      set, by the running release's `k8s upgrade --no-input --json --values` (helm's rollback takes
      back the values of the release it reaches). When a release change follows, state is saved here, as on Docker,
      with the release's status read again after the reconfiguration.
@@ -147,7 +181,7 @@ operation first refuses a machine that is not linux/amd64 and names the programs
      taken over first). The registry is the one the release was installed from: `--image-registry`
      is never given again.
   5. `k8s status --json` by the installer that now runs fills the computed attributes.
-- **Import**: `tofu import stowage_install.x 'kubernetes:<namespace>/<release>'`. State records
+- **Import**: `tofu import stowage_kubernetes_install.x '<namespace>/<release>'`. State records
   the namespace and the release, `deletion_protection = true`; the first apply, with the
   configuration's cluster and installer, compares the configuration's inputs with those the
   release records (`k8s status --json --values` by the configuration's installer, Stowage 0.38.0

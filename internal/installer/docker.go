@@ -204,19 +204,7 @@ var StowScript = `set -eu
 ` + LoginScript + `cd -- "$1"
 __stowage_dir=./$2 __stowage_stow=./$2/$3-stow __stowage_files=$4 __stowage_withdir=$5
 shift 5
-[ -d "$__stowage_dir" ] || { echo "stowage-provider: no install directory" >&2; exit 100; }
-if ! { [ -f "$__stowage_stow" ] && [ -x "$__stowage_stow" ]; }; then
-  # Another short name since (a release that renamed its installer): the one *-stow kept.
-  __stowage_found=
-  for __stowage_f in "$__stowage_dir"/*-stow; do
-    [ -f "$__stowage_f" ] && [ -x "$__stowage_f" ] || continue
-    [ -z "$__stowage_found" ] || { echo "$__stowage_stow: no installer kept there, and $__stowage_dir holds more than one *-stow" >&2; exit 1; }
-    __stowage_found=$__stowage_f
-  done
-  [ -n "$__stowage_found" ] || { echo "$__stowage_stow: no installer kept there" >&2; exit 1; }
-  __stowage_stow=$__stowage_found
-fi
-[ -z "$__stowage_withdir" ] || set -- "$@" --dir "$__stowage_dir"
+` + keptLookup + `[ -z "$__stowage_withdir" ] || set -- "$@" --dir "$__stowage_dir"
 __stowage_old=$(umask)
 umask 077
 __stowage_d=$(mktemp -d)
@@ -234,6 +222,40 @@ umask "$__stowage_old"
 __stowage_rc=0
 "$__stowage_stow" "$@" || __stowage_rc=$?
 exit "$__stowage_rc"
+`
+
+// keptLookup finds the installer the install keeps, from $__stowage_dir (the install directory,
+// relative to the work directory) and $__stowage_stow (<dir>/<short>-stow): no directory exits
+// NotInstalled with NotInstalledMark; else $__stowage_stow is that installer, or the one *-stow
+// the directory keeps under another short name (a release that renamed its installer).
+const keptLookup = `[ -d "$__stowage_dir" ] || { echo "stowage-provider: no install directory" >&2; exit 100; }
+if ! { [ -f "$__stowage_stow" ] && [ -x "$__stowage_stow" ]; }; then
+  # Another short name since (a release that renamed its installer): the one *-stow kept.
+  __stowage_found=
+  for __stowage_f in "$__stowage_dir"/*-stow; do
+    [ -f "$__stowage_f" ] && [ -x "$__stowage_f" ] || continue
+    [ -z "$__stowage_found" ] || { echo "$__stowage_stow: no installer kept there, and $__stowage_dir holds more than one *-stow" >&2; exit 1; }
+    __stowage_found=$__stowage_f
+  done
+  [ -n "$__stowage_found" ] || { echo "$__stowage_stow: no installer kept there" >&2; exit 1; }
+  __stowage_stow=$__stowage_found
+fi
+`
+
+// KeptPayloadScript prints the payload of the installer the install keeps (keptLookup), its tar
+// alone: an installer ends with <tar> <the tar's length, 8 bytes big-endian> STOWAGE-PAYLOAD1.
+// An installer without that trailer, or a payload over 16 MiB (Stowage's bound), exits 1. Its
+// arguments: <work_dir> <name> <short>.
+const KeptPayloadScript = `set -eu
+cd -- "$1"
+__stowage_dir=./$2 __stowage_stow=./$2/$3-stow
+` + keptLookup + `[ "$(tail -c 16 "$__stowage_stow")" = STOWAGE-PAYLOAD1 ] || { echo "$__stowage_stow carries no release (no payload)" >&2; exit 1; }
+__stowage_n=0
+for __stowage_b in $(tail -c 24 "$__stowage_stow" | od -An -v -tu1 -N 8); do
+  __stowage_n=$((__stowage_n * 256 + __stowage_b))
+  [ "$__stowage_n" -le 16777216 ] || { echo "$__stowage_stow: its payload's length is over 16 MiB" >&2; exit 1; }
+done
+tail -c "$((__stowage_n + 24))" "$__stowage_stow" | head -c "$__stowage_n"
 `
 
 var (
@@ -421,13 +443,37 @@ type Install struct {
 	Address      string
 	Registry     string
 	RegistryCA   string // --registry-ca, on standard input
+	// AcmeCA, AcmeCARoot and RegistryLogin are Change's.
+	AcmeCA, AcmeCARoot, RegistryLogin string
+	// Kit is --kit, a handoff kit, and KitCode its code (--kit-code-file): files on standard input.
+	Kit, KitCode string
+}
+
+// change is in's settings a re-run takes too.
+func (in Install) change() Change {
+	return Change{Inputs: in.Inputs, SecretInputs: in.SecretInputs, TLS: in.TLS, Domains: in.Domains, Ports: in.Ports,
+		AcmeCA: in.AcmeCA, AcmeCARoot: in.AcmeCARoot, RegistryLogin: in.RegistryLogin}
+}
+
+// kitFiles adds the kit and its code to files, when a kit is given.
+func kitFiles(files map[string]string, kit, code string) error {
+	if kit == "" {
+		if code != "" {
+			return errors.New("a kit's code without its kit")
+		}
+		return nil
+	}
+	if code == "" {
+		return errors.New("a kit without its code: give kit_code_wo")
+	}
+	files["kit"], files["kit-code-file"] = kit, code
+	return nil
 }
 
 // InstallArgv is the install's command line and standard input: nothing secret is on the
 // command line.
 func (d Docker) InstallArgv(in Install) ([]string, []byte, error) {
-	c := Change{Inputs: in.Inputs, SecretInputs: in.SecretInputs, TLS: in.TLS, Domains: in.Domains, Ports: in.Ports}
-	args, files, err := changeArgs(c, "sh", "./"+d.Name+".sh", "--no-input", "--json", "--dir", "./"+d.Name)
+	args, files, err := changeArgs(in.change(), "sh", "./"+d.Name+".sh", "--no-input", "--json", "--dir", "./"+d.Name)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -441,6 +487,9 @@ func (d Docker) InstallArgv(in Install) ([]string, []byte, error) {
 		if v != "" {
 			files[name] = v
 		}
+	}
+	if err := kitFiles(files, in.Kit, in.KitCode); err != nil {
+		return nil, nil, err
 	}
 	if files, err = MirrorFiles(files, d.Mirror); err != nil {
 		return nil, nil, err
@@ -557,6 +606,22 @@ func (d Docker) KeptDescribe(ctx context.Context) (*Describe, error) {
 	return desc, err
 }
 
+// KeptPayload is the payload's tar of the installer the install keeps (<work_dir>/<name>/
+// <short>-stow, else the one *-stow there), read on the target (KeptPayloadScript).
+func (d Docker) KeptPayload(ctx context.Context) ([]byte, error) {
+	if !ValidShortName(d.Short) {
+		return nil, fmt.Errorf("short_name %q in state is not an installer's short name: import the install again (tofu state rm, then tofu import)", d.Short)
+	}
+	stdout, stderr, exit, err := d.Runner.Run(ctx, []string{"sh", "-c", KeptPayloadScript, "sh", d.WorkDir, d.Name, d.Short}, nil)
+	switch {
+	case err != nil:
+		return nil, fmt.Errorf("reading the installer the install keeps: %w", err)
+	case exit != 0:
+		return nil, &FailedError{Verb: "reading the installer the install keeps", Exit: exit, Stderr: tail(stderr)}
+	}
+	return stdout, nil
+}
+
 // Change is what a re-run or an upgrade is given. An input given "" is `--set KEY=`, the
 // installer's rule for an empty value deciding what it does.
 type Change struct {
@@ -565,11 +630,24 @@ type Change struct {
 	TLS          string            // --tls; "" keeps the recorded mode
 	Domains      map[string]string // --domains
 	Ports        map[string]string // --ports
+	// AcmeCA is --acme-ca: an ACME directory's URL, or AcmeNone for Let's Encrypt's again; ""
+	// keeps the recorded one.
+	AcmeCA string
+	// AcmeCARoot is --acme-ca-root: the root's PEM, a file on standard input, or AcmeNone to
+	// drop the one held; "" keeps it.
+	AcmeCARoot string
+	// RegistryLogin is --registry-login-file: the install's own registry login, a Docker config,
+	// a file on standard input; "" keeps the one held.
+	RegistryLogin string
 }
+
+// AcmeNone is --acme-ca's and --acme-ca-root's word for none: Let's Encrypt's directory, no root.
+const AcmeNone = "none"
 
 // Empty says whether the change gives nothing.
 func (c Change) Empty() bool {
-	return len(c.Inputs) == 0 && len(c.SecretInputs) == 0 && c.TLS == "" && len(c.Domains) == 0 && len(c.Ports) == 0
+	return len(c.Inputs) == 0 && len(c.SecretInputs) == 0 && c.TLS == "" && len(c.Domains) == 0 && len(c.Ports) == 0 &&
+		c.AcmeCA == "" && c.AcmeCARoot == "" && c.RegistryLogin == ""
 }
 
 // changeArgs is c as flags after the verb's own, and its files.
@@ -594,8 +672,26 @@ func changeArgs(c Change, verbArgs ...string) ([]string, map[string]string, erro
 	} else if v != "" {
 		args = append(args, "--ports", v)
 	}
+	if c.AcmeCA != "" {
+		if strings.HasPrefix(c.AcmeCA, "-") || strings.ContainsAny(c.AcmeCA, " \t\r\n") {
+			return nil, nil, fmt.Errorf("acme_ca %q: a URL, or none", c.AcmeCA)
+		}
+		args = append(args, "--acme-ca", c.AcmeCA)
+	}
+	if c.AcmeCARoot == AcmeNone {
+		args = append(args, "--acme-ca-root", AcmeNone)
+	}
 	files, err := withAnswers(c.SecretInputs)
-	return args, files, err
+	if err != nil {
+		return nil, nil, err
+	}
+	if c.AcmeCARoot != "" && c.AcmeCARoot != AcmeNone {
+		files["acme-ca-root"] = c.AcmeCARoot
+	}
+	if c.RegistryLogin != "" {
+		files["registry-login-file"] = c.RegistryLogin
+	}
+	return args, files, nil
 }
 
 // Rerun runs the kept installer again on the install with the change: the running release

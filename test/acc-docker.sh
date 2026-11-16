@@ -231,10 +231,11 @@ variable "pull_token" {
   sensitive = true
 }
 provider "stowage" {
-  username = "pull"
-  password = var.pull_token
+  username    = "pull"
+  password    = var.pull_token
+  public_keys = [file("$P/keys/release.pub")]
 }
-resource "stowage_install" "notes" {
+resource "stowage_docker_install" "notes" {
   installer = "$INST"
   inputs = {
     ADMIN_EMAIL = "$ADMIN"
@@ -247,14 +248,12 @@ resource "stowage_install" "notes" {
   plan_dry_run             = ${DRY:-false}
   deletion_protection      = ${PROTECT:-true}
   delete_data              = ${DATA:-false}
-  docker {
-    host             = "127.0.0.1"
-    port             = $SP
-    user             = "ops"
-    private_key_file = "$WORK/user_key"
-    known_hosts_line = "$KNOWN"
-    work_dir         = "/home/ops"
-  }
+  host                     = "127.0.0.1"
+  port                     = $SP
+  user                     = "ops"
+  private_key_file         = "$WORK/user_key"
+  known_hosts_line         = "$KNOWN"
+  work_dir                 = "/home/ops"
 }
 HCL
 }
@@ -282,7 +281,7 @@ plan_fails() {
 # state <jq filter>: true when the filter holds on the resource's state.
 state() {
 	tf show -json >"$WORK/show.json" 2>"$WORK/show.log" || { cat "$WORK/show.log"; fail "tofu show"; }
-	jq -e ".values.root_module.resources[] | select(.address == \"stowage_install.notes\") | .values | $1" "$WORK/show.json" >/dev/null ||
+	jq -e ".values.root_module.resources[] | select(.address == \"stowage_docker_install.notes\") | .values | $1" "$WORK/show.json" >/dev/null ||
 		{ jq '.values.root_module.resources[].values' "$WORK/show.json"; fail "the state does not satisfy: $1"; }
 }
 # env_is <KEY> <value>: the install's .env on the Docker host records that value.
@@ -367,8 +366,8 @@ INST=$I3 ADMIN=refused@notes.test NOTE=hello ROLLBACK=true config
 plan_nothing after-refused-rollback
 
 step "import: the state forgotten, the install imported by its kept installer, its first apply"
-tf state rm stowage_install.notes >"$WORK/state-rm.log" 2>&1 || { cat "$WORK/state-rm.log"; fail "tofu state rm"; }
-tf import -input=false stowage_install.notes 127.0.0.1:/home/ops/notes/notes-stow >"$WORK/import.log" 2>&1 || { cat "$WORK/import.log"; fail "tofu import"; }
+tf state rm stowage_docker_install.notes >"$WORK/state-rm.log" 2>&1 || { cat "$WORK/state-rm.log"; fail "tofu state rm"; }
+tf import -input=false stowage_docker_install.notes 127.0.0.1:/home/ops/notes/notes-stow >"$WORK/import.log" 2>&1 || { cat "$WORK/import.log"; fail "tofu import"; }
 state '.id == "/home/ops/notes" and .short_name == "notes" and .deletion_protection == true'
 apply after-import
 state ".version == \"3.0.0\" and .installer == \"$I3\" and .status == \"installed\" and .inputs.ADMIN_EMAIL == \"refused@notes.test\""

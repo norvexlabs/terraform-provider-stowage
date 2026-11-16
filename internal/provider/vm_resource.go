@@ -3,40 +3,64 @@ package provider
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
+	"net"
+	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
+	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"github.com/norvexlabs/terraform-provider-stowage/internal/installer"
 	"github.com/norvexlabs/terraform-provider-stowage/internal/target"
 )
 
+// interfaceType is an interfaces entry's.
+var interfaceType = types.ObjectType{AttrTypes: map[string]attr.Type{"mac": types.StringType, "mode": types.StringType, "address": types.StringType}}
+
 // vmAttributes are the vm block's: the SSH connection, the release, and what the provider learns.
 func vmAttributes() map[string]schema.Attribute {
-	vm := sshAttributes("The VM's address, reached over SSH by the system `ssh` binary (the VM's own resource's address output); required in this block.")
+	vm := sshAttributes("The VM's address, reached over SSH by the system `ssh` binary (the VM's own resource's address output).")
 	vm["known_hosts_line"] = schema.StringAttribute{
 		Optional: true,
 		MarkdownDescription: "The key the VM serves until the provider has read its own: `stowage_vm_seed`'s `known_hosts_line` (its one-time key) for a VM the provider installs, the VM's own key for an imported one. " +
 			"That key alone is accepted (`StrictHostKeyChecking=yes`), never one learnt on first contact. Required to install, and for an imported state's first apply; once `host_key_line` is known it may be left out.",
 	}
-	vm["version"] = schema.StringAttribute{Optional: true, MarkdownDescription: "The release the VM runs; required in this block. A change upgrades the VM (`sudo -n <short>-stow upgrade --version V --yes --json`, then its reboot followed), or rolls it back to `previous.version` with `allow_rollback`."}
+	vm["version"] = schema.StringAttribute{Optional: true, MarkdownDescription: "The release the VM runs. A change upgrades the VM (`sudo -n <short>-stow upgrade --version V --yes --json`, then its reboot followed), or rolls it back to `previous.version` with `allow_rollback`."}
 	vm["channel"] = schema.StringAttribute{Optional: true, MarkdownDescription: "The channel the VM follows, which its seed's `channel` set: a create, and an imported state's first apply, refuse one other than the VM's (state would record it). First-install only."}
-	vm["short_name"] = schema.StringAttribute{Optional: true, MarkdownDescription: "The installer's short name, `stowage_vm_seed`'s `short_name`: the VM runs `<short_name>-stow`; required in this block."}
+	vm["short_name"] = schema.StringAttribute{Optional: true, MarkdownDescription: "The installer's short name, `stowage_vm_seed`'s `short_name`: the VM runs `<short_name>-stow`."}
 	vm["host_key_line"] = schema.StringAttribute{
 		Computed:            true,
 		MarkdownDescription: "The VM's own SSH host key as a `known_hosts` line, read through the one-time key once its first install is done (`/etc/ssh/ssh_host_ed25519_key.pub`): every later connection accepts it.",
 		PlanModifiers:       []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
+	}
+	vm["platform"] = schema.StringAttribute{
+		Optional:            true,
+		MarkdownDescription: "Where the VM runs, `stowage_vm_seed`'s `platform`: a wait that runs out names that platform's console, and a destroy checks the registry still holds a disk set for it (a warning when it holds none: a VM destroyed is not made again from it).",
+	}
+	vm["interfaces"] = schema.MapNestedAttribute{
+		Optional: true,
+		MarkdownDescription: "NICs of the release's secondary roles (`host.interfaces`) the VM's platform attached after its seed, by role: `mac`, the MAC the platform gave the NIC, and its addressing, `mode` (`dhcp`, `static` or `none`, the installer's default) and `address` (with `static`, IPv4 with its prefix). " +
+			"A role added or changed runs `sudo -n <short>-stow network attach --role R --mac M [--mode] [--address]` on the VM over SSH, then reboots it (`<short>-stow reboot`) and waits for its boot's health verdict: the NIC is named from that boot. The platform's device comes first — the root adds it and restarts the VM (TrueNAS: `truenas_vm_power`'s `restart_triggers`), and this resource depends on that. A role taken out runs nothing: the VM keeps its record. A change of `interfaces` goes alone, without a change of `version`.",
+		NestedObject: schema.NestedAttributeObject{Attributes: map[string]schema.Attribute{
+			"mac":     schema.StringAttribute{Required: true, MarkdownDescription: "The NIC's MAC, as the platform gave it."},
+			"mode":    schema.StringAttribute{Optional: true, MarkdownDescription: "`dhcp`, `static` or `none` (the link up, no address); left out, `none`.", Validators: []validator.String{stringvalidator.OneOf("dhcp", "static", "none")}},
+			"address": schema.StringAttribute{Optional: true, MarkdownDescription: "With `mode = \"static\"`: the IPv4 address with its prefix, e.g. `192.0.2.20/24`."},
+		}},
 	}
 	vm["seed_boot_id"] = schema.StringAttribute{
 		Computed:            true,
@@ -48,7 +72,7 @@ func vmAttributes() map[string]schema.Attribute {
 
 // validateVM checks the vm block's arguments, and refuses what the VM target cannot give.
 // known_hosts_line may be left out here: once the provider read the VM's own key, state holds it
-// (vm.host_key_line); a create, and a first apply of an imported state, refuse its absence.
+// (host_key_line); a create, and a first apply of an imported state, refuse its absence.
 func validateVM(m *installModel, diags *diag.Diagnostics) {
 	v := m.VM
 	line := v.KnownHostsLine
@@ -57,11 +81,11 @@ func validateVM(m *installModel, diags *diag.Diagnostics) {
 	}
 	validateSSH(path.Root("vm"), v.Host, v.User, line, v.PrivateKeyFile, v.Port, false, diags)
 	if v.Version.IsNull() {
-		diags.AddAttributeError(path.Root("vm").AtName("version"), "vm.version is required", "Give the release the VM runs.")
+		diags.AddAttributeError(path.Root("vm").AtName("version"), "version is required", "Give the release the VM runs.")
 	}
 	switch {
 	case v.ShortName.IsNull():
-		diags.AddAttributeError(path.Root("vm").AtName("short_name"), "vm.short_name is required",
+		diags.AddAttributeError(path.Root("vm").AtName("short_name"), "short_name is required",
 			"Give the installer's short name, stowage_vm_seed's short_name: the VM runs <short_name>-stow.")
 	case known(v.ShortName) && !installer.ValidShortName(v.ShortName.ValueString()):
 		diags.AddAttributeError(path.Root("vm").AtName("short_name"), "not an installer's short name",
@@ -69,22 +93,23 @@ func validateVM(m *installModel, diags *diag.Diagnostics) {
 	}
 }
 
-// planVM is the plan's part of a VM: vm.known_hosts_line kept while the one-time key is served;
-// the VM's keys planned unknown where an update may change them; a change of vm.version back to
+// planVM is the plan's part of a VM: known_hosts_line kept while the one-time key is served;
+// the VM's keys planned unknown where an update may change them; a change of version back to
 // the previous release is a rollback, refused without allow_rollback and alone.
 func planVM(ctx context.Context, plan, state *installModel, resp *resource.ModifyPlanResponse) {
 	if plan.VM == nil || state.VM == nil {
 		return
 	}
 	if known(state.VM.SeedBootID) && plan.VM.KnownHostsLine.IsNull() {
-		resp.Diagnostics.AddAttributeError(path.Root("vm").AtName("known_hosts_line"), "vm.known_hosts_line is still needed",
-			"The VM still serves its one-time key (vm.seed_boot_id: its retirement failed, and no later boot was seen), which this line accepts: keep it until the VM reboots.")
+		resp.Diagnostics.AddAttributeError(path.Root("vm").AtName("known_hosts_line"), "known_hosts_line is still needed",
+			"The VM still serves its one-time key (seed_boot_id: its retirement failed, and no later boot was seen), which this line accepts: keep it until the VM reboots.")
 	}
 	// The keys an update may change besides the plan's own: the VM's own key when state has none
 	// (an update learns it, and may record seed_boot_id), and seed_boot_id while it is set (a
 	// later boot clears it). The plan holds state's values otherwise (UseStateForUnknown); the
-	// release the VM reports is ModifyPlan's to plan unknown.
-	if imported(state) || len(remoteChange(plan, state)) > 0 {
+	// release the VM reports is ModifyPlan's to plan unknown. A pending attach is such an update
+	// too: it learns the key, and its reboot retires seed_boot_id.
+	if imported(state) || len(remoteChange(plan, state)) > 0 || len(pendingRoles(ctx, resp.Private)) > 0 {
 		if state.VM.HostKeyLine.IsNull() {
 			resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("vm").AtName("host_key_line"), types.StringUnknown())...)
 			resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("vm").AtName("seed_boot_id"), types.StringUnknown())...)
@@ -92,6 +117,18 @@ func planVM(ctx context.Context, plan, state *installModel, resp *resource.Modif
 		if known(state.VM.SeedBootID) {
 			resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("vm").AtName("seed_boot_id"), types.StringUnknown())...)
 		}
+	}
+	attach := withPending(attachments(plan.VM.Interfaces, state.VM.Interfaces), plan.VM.Interfaces, pendingRoles(ctx, resp.Private))
+	if !plan.VM.Version.Equal(state.VM.Version) && !imported(state) && len(attach) > 0 {
+		interfacesWithVersion(&resp.Diagnostics)
+	}
+	if pending := pendingRoles(ctx, resp.Private); len(pending) > 0 {
+		resp.Diagnostics.AddAttributeWarning(path.Root("vm").AtName("interfaces"), "NICs not attached yet",
+			fmt.Sprintf("The create recorded interfaces %s, and attaching them failed: this apply attaches them (`network attach`), then reboots the VM.", strings.Join(pending, ", ")))
+	}
+	if imported(state) && len(attach) > 0 {
+		resp.Diagnostics.AddAttributeWarning(path.Root("vm").AtName("interfaces"), "The first apply reads the VM's NICs",
+			"The state was imported: the apply reads the NICs the VM names (`network --json`) and takes over each role it names by the MAC given, whatever its addressing (a role addressed otherwise than given is said in a warning naming the `network set --role` that aligns it; state records interfaces as configured). It attaches the others (`network attach`, with the addressing given) and reboots the VM to name them; when the VM's NICs cannot be read, it attaches them all and reboots. plan_dry_run reads them at plan.")
 	}
 	if !known(plan.VM.Version) {
 		return
@@ -105,9 +142,9 @@ func planVM(ctx context.Context, plan, state *installModel, resp *resource.Modif
 				// Not known yet: the apply reads it and refuses or rolls back alone.
 			case rollbackRefused(plan.AllowRollback):
 				resp.Diagnostics.AddAttributeError(path.Root("allow_rollback"), "a rollback needs allow_rollback",
-					fmt.Sprintf("vm.version is now %s, the release the VM's last upgrade replaced (previous.version): reaching it is `rollback`, which reboots the VM into its passive system, the previous release (every input keeps its value). Set allow_rollback = true to roll back, or set vm.version back to %s.", prev, state.VM.Version.ValueString()))
+					fmt.Sprintf("version is now %s, the release the VM's last upgrade replaced (previous.version): reaching it is `rollback`, which reboots the VM into its passive system, the previous release (every input keeps its value). Set allow_rollback = true to roll back, or set version back to %s.", prev, state.VM.Version.ValueString()))
 			default:
-				if changed := slices.DeleteFunc(remoteChange(plan, state), func(a string) bool { return a == "vm.version" }); len(changed) > 0 {
+				if changed := slices.DeleteFunc(remoteChange(plan, state), func(a string) bool { return a == "version" }); len(changed) > 0 {
 					vmRollbackAlone(&resp.Diagnostics, strings.Join(changed, ", "))
 				}
 			}
@@ -115,10 +152,16 @@ func planVM(ctx context.Context, plan, state *installModel, resp *resource.Modif
 	}
 }
 
+// interfacesWithVersion is the refusal of NICs attached with a release change.
+func interfacesWithVersion(diags *diag.Diagnostics) {
+	diags.AddAttributeError(path.Root("vm").AtName("interfaces"), "interfaces change with version",
+		"A NIC attached is named by the VM's next boot, which a release change's reboot is not followed for: apply the interfaces alone (version as the VM runs it), then the version.")
+}
+
 // vmRollbackAlone is the refusal of a VM's rollback with other changes.
 func vmRollbackAlone(diags *diag.Diagnostics, changed string) {
 	diags.AddAttributeError(path.Root("allow_rollback"), "a rollback goes alone",
-		fmt.Sprintf("vm.version goes back to previous.version, a rollback, which reboots the VM into its passive system: %s changed with it are not applied with it. Apply the rollback alone, then the change.", changed))
+		fmt.Sprintf("version goes back to previous.version, a rollback, which reboots the VM into its passive system: %s changed with it are not applied with it. Apply the rollback alone, then the change.", changed))
 }
 
 // previousVersion is the version state's previous names; "" when none.
@@ -137,6 +180,11 @@ func previousVersion(ctx context.Context, m *installModel) string {
 // configuration's line until then — and beside its own while the boot that read it may still
 // serve the one-time key (seed_boot_id).
 func (r *installResource) vm(m *installModel) (installer.VM, error) {
+	return r.vmWithin(m, 0)
+}
+
+// vmWithin is vm, its connection bounded to connect seconds (0: the default).
+func (r *installResource) vmWithin(m *installModel, connect int) (installer.VM, error) {
 	if r.data == nil {
 		return installer.VM{}, errors.New("the provider is not configured")
 	}
@@ -144,6 +192,7 @@ func (r *installResource) vm(m *installModel) (installer.VM, error) {
 	c := Connection{
 		Host: v.Host.ValueString(), Port: int(v.Port.ValueInt64()), User: v.User.ValueString(),
 		KeyFile: v.PrivateKeyFile.ValueString(), KnownHostsLine: v.KnownHostsLine.ValueString(),
+		ConnectTimeout: connect,
 	}
 	if known(v.HostKeyLine) {
 		c.KnownHostsLine = v.HostKeyLine.ValueString()
@@ -152,10 +201,10 @@ func (r *installResource) vm(m *installModel) (installer.VM, error) {
 		}
 	}
 	if c.Host == "" {
-		return installer.VM{}, errors.New("vm.host is not known")
+		return installer.VM{}, errors.New("host is not known")
 	}
 	if c.KnownHostsLine == "" {
-		return installer.VM{}, errors.New("vm.known_hosts_line is required to install: no host key to accept yet; give the VM's own key (ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub on its console), or stowage_vm_seed's known_hosts_line for a VM not installed yet")
+		return installer.VM{}, errors.New("known_hosts_line is required to install: no host key to accept yet; give the VM's own key (ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub on its console), or stowage_vm_seed's known_hosts_line for a VM not installed yet")
 	}
 	run, err := r.data.NewRunner(c)
 	if err != nil {
@@ -308,7 +357,7 @@ func (r *installResource) rebooted(ctx context.Context, v installer.VM, before *
 }
 
 // applyVMStatus puts the VM's status into m: on a read, the release the VM runs replaces
-// vm.version, so the next plan proposes the change back (a fallback shows its real release).
+// version, so the next plan proposes the change back (a fallback shows its real release).
 func applyVMStatus(m *installModel, st *installer.VMStatus, read bool) {
 	applyStatus(m, &st.Status, false)
 	applyHeld(m, &st.Status, false)
@@ -334,7 +383,7 @@ func retireSeed(m *installModel, st *installer.VMStatus) {
 }
 
 func vmID(m *installModel) string {
-	return "vm:" + m.VM.Host.ValueString() + "/" + m.VM.ShortName.ValueString() + "-stow"
+	return m.VM.Host.ValueString() + "/" + m.VM.ShortName.ValueString() + "-stow"
 }
 
 // vmFill sets what a VM's state holds whatever the status: the ID, the short name, the registry,
@@ -386,7 +435,7 @@ func (r *installResource) createVM(ctx context.Context, req resource.CreateReque
 	if missing {
 		var f *installer.FailedError
 		errors.As(err, &f)
-		detail := "The VM runs the installer its seed carries (/usr/sbin/<short>-stow): set vm.short_name to stowage_vm_seed's short_name."
+		detail := "The VM runs the installer its seed carries (/usr/sbin/<short>-stow): set short_name to stowage_vm_seed's short_name."
 		if f.Stderr != "" {
 			detail = "The VM's shell: " + f.Stderr + "\n\n" + detail
 		}
@@ -395,7 +444,7 @@ func (r *installResource) createVM(ctx context.Context, req resource.CreateReque
 	}
 	err = probeNote(err, v, probe)
 	if err != nil {
-		addInstallerError(&resp.Diagnostics, "Waiting for the VM's first boot", err)
+		addInstallerError(&resp.Diagnostics, "Waiting for the VM's first boot", consoleHint(err, m.VM.Platform))
 		return
 	}
 	if len(desc.Shapes) > 0 && !slices.Contains(desc.Shapes, "kairos") {
@@ -405,8 +454,8 @@ func (r *installResource) createVM(ctx context.Context, req resource.CreateReque
 	// A create installs the release the VM's OS carries, never upgrades: an upgrade that failed
 	// would leave a created object OpenTofu replaces at the next apply.
 	if desired := m.VM.Version.ValueString(); desired != desc.Release.Version {
-		resp.Diagnostics.AddAttributeError(path.Root("vm").AtName("version"), "vm.version is not the VM's release",
-			fmt.Sprintf("The VM's OS carries %s %s (its seed's version), and a create installs that release: set vm.version = %q (stowage_vm_seed's version), apply, then change vm.version to upgrade.", desc.Name, desc.Release.Version, desc.Release.Version))
+		resp.Diagnostics.AddAttributeError(path.Root("vm").AtName("version"), "version is not the VM's release",
+			fmt.Sprintf("The VM's OS carries %s %s (its seed's version), and a create installs that release: set version = %q (stowage_vm_seed's version), apply, then change version to upgrade.", desc.Name, desc.Release.Version, desc.Release.Version))
 		return
 	}
 	refuseSecretInputs(&resp.Diagnostics, stringMap(ctx, m.Inputs, &resp.Diagnostics), desc)
@@ -414,16 +463,28 @@ func (r *installResource) createVM(ctx context.Context, req resource.CreateReque
 		return
 	}
 	change := installer.Change{Inputs: stringMap(ctx, m.Inputs, &resp.Diagnostics), SecretInputs: secrets, TLS: m.TLS.ValueString(),
-		Domains: stringMap(ctx, m.Domains, &resp.Diagnostics), Ports: portMap(ctx, m.Ports, &resp.Diagnostics)}
+		Domains: stringMap(ctx, m.Domains, &resp.Diagnostics), Ports: portMap(ctx, m.Ports, &resp.Diagnostics),
+		AcmeCA: m.AcmeCA.ValueString(), AcmeCARoot: m.AcmeCARoot.ValueString()}
+	kit, code := r.kit(&m, &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	// The VM's own login first: its install reads the registry with it.
+	if r.wo.login != "" {
+		if err := v.RegistryLogin(ctx, r.wo.login); err != nil {
+			addInstallerError(&resp.Diagnostics, "Giving the VM its registry login", err)
+			return
+		}
+	}
 	// A secrets export goes to the first install a seed's --await-secrets left waiting for it; the
 	// installer refuses it on a VM whose first install ran.
-	if _, err := v.Install(ctx, installer.VMInstall{Change: change, Given: given.ValueString(), Secrets: exported.ValueString()}); err != nil {
+	if _, err := v.Install(ctx, installer.VMInstall{Change: change, Given: given.ValueString(), Secrets: exported.ValueString(), Kit: kit, KitCode: code}); err != nil {
 		addInstallerError(&resp.Diagnostics, "Installing "+desc.Name+" on the VM", err)
 		return
 	}
 	st, err := r.settleVM(ctx, v)
 	if err != nil {
-		addInstallerError(&resp.Diagnostics, "Reading the VM", err)
+		addInstallerError(&resp.Diagnostics, "Reading the VM", consoleHint(err, m.VM.Platform))
 		return
 	}
 	if st.InstallFailed != "" || st.Installed == nil {
@@ -435,7 +496,7 @@ func (r *installResource) createVM(ctx context.Context, req resource.CreateReque
 			fmt.Sprintf("%s. Apply again: the VM's install runs again and finishes it.", why))
 		return
 	}
-	if !vmChannelCheck(&resp.Diagnostics, m.VM.Channel, st.Channel, "The install is done: apply again once vm.channel is fixed, and the create goes on from it.") {
+	if !vmChannelCheck(&resp.Diagnostics, m.VM.Channel, st.Channel, "The install is done: apply again once channel is fixed, and the create goes on from it.") {
 		return
 	}
 	vmc := *m.VM
@@ -448,7 +509,266 @@ func (r *installResource) createVM(ctx context.Context, req resource.CreateReque
 	m.VM = &vmc
 	r.vmFill(&m, nil)
 	applyVMStatus(&m, st, false)
+	if attach := attachments(m.VM.Interfaces, types.MapNull(interfaceType)); len(attach) > 0 {
+		// The install is made: recorded as planned, its interfaces marked pending in private
+		// state until they are attached, so an attach that fails leaves a state consistent with
+		// the plan and the next plan an update attaching them again (ModifyPlan). Not an error:
+		// one would taint the install, whose replacement is a destroy.
+		resp.Diagnostics.Append(setPending(ctx, resp.Private, attach)...)
+		resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		keyed, kv, err := r.rekey(m, m.VM.HostKeyLine, m.VM.SeedBootID)
+		if err != nil {
+			resp.Diagnostics.AddWarning("The VM's NICs are not attached",
+				"Reaching the VM under its keys: "+err.Error()+". The install is recorded, its interfaces pending: the next plan shows an update that attaches them again.")
+			return
+		}
+		after, err := r.attach(ctx, kv, st, attach)
+		var sick *unhealthyAttach
+		if err != nil && !errors.As(err, &sick) {
+			resp.Diagnostics.AddWarning("The VM's NICs are not attached",
+				consoleHint(err, m.VM.Platform).Error()+". The install is recorded, its interfaces pending: the next plan shows an update that attaches them again.")
+			return
+		}
+		// Attached, whatever the verdict: nothing pending.
+		m = keyed
+		applyVMStatus(&m, after, false)
+		retireSeed(&m, after)
+		resp.Diagnostics.Append(setPending(ctx, resp.Private, nil)...)
+		if sick != nil {
+			// A warning, as this path's: an error would taint the install.
+			resp.Diagnostics.AddWarning("The VM came back unhealthy from attaching its NICs", consoleHint(sick, m.VM.Platform).Error()+".")
+		}
+	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
+}
+
+// pendingKey is the private state's key of the interfaces a create recorded and could not attach:
+// their roles, a JSON list.
+const pendingKey = "attach_pending"
+
+// privateData is the framework's private state of a resource, as each request carries it.
+type privateData interface {
+	GetKey(ctx context.Context, key string) ([]byte, diag.Diagnostics)
+	SetKey(ctx context.Context, key string, value []byte) diag.Diagnostics
+}
+
+// setPending records the roles of attach as pending in p; none removes the key.
+func setPending(ctx context.Context, p privateData, attach []installer.Interface) diag.Diagnostics {
+	if len(attach) == 0 {
+		return p.SetKey(ctx, pendingKey, nil)
+	}
+	roles := make([]string, 0, len(attach))
+	for _, i := range attach {
+		roles = append(roles, i.Role)
+	}
+	b, _ := json.Marshal(roles) // a list of strings always marshals
+	return p.SetKey(ctx, pendingKey, b)
+}
+
+// pendingRoles are the roles p holds pending; none without p.
+func pendingRoles(ctx context.Context, p privateData) []string {
+	if p == nil || reflect.ValueOf(p).IsNil() {
+		return nil
+	}
+	b, d := p.GetKey(ctx, pendingKey)
+	var roles []string
+	if d.HasError() || len(b) == 0 || json.Unmarshal(b, &roles) != nil {
+		return nil
+	}
+	return roles
+}
+
+// withPending is attach, with the interfaces of the pending roles plan still names, sorted by role.
+func withPending(attach []installer.Interface, plan types.Map, pending []string) []installer.Interface {
+	for _, role := range pending {
+		if slices.ContainsFunc(attach, func(i installer.Interface) bool { return i.Role == role }) {
+			continue
+		}
+		if i, ok := interfaceOf(plan, role); ok {
+			attach = append(attach, i)
+		}
+	}
+	slices.SortFunc(attach, func(a, b installer.Interface) int { return strings.Compare(a.Role, b.Role) })
+	return attach
+}
+
+// notAttached is plan's interfaces as they stand before attach runs: the roles attach names as
+// state has them (left out when state has none), every other role as planned.
+func notAttached(plan, state types.Map, attach []installer.Interface) types.Map {
+	if !known(plan) {
+		return state
+	}
+	was := map[string]attr.Value{}
+	if known(state) {
+		was = state.Elements()
+	}
+	out := map[string]attr.Value{}
+	for role, v := range plan.Elements() {
+		if !slices.ContainsFunc(attach, func(i installer.Interface) bool { return i.Role == role }) {
+			out[role] = v
+		} else if old, ok := was[role]; ok {
+			out[role] = old
+		}
+	}
+	return types.MapValueMust(interfaceType, out)
+}
+
+// newNICs is attach without the roles the VM names already (`network --json`) by the MAC given,
+// whatever their addressing: an imported VM's first apply attaches only what is new, and never
+// attaches again (nor reboots for) a NIC the VM has. A role named with other addressing than the
+// one given is said in a warning naming the `network set --role` that aligns it (realign); state
+// records the configuration. When the VM's NICs cannot be read, every one is attached (and the VM
+// reboots), said in a warning.
+func newNICs(ctx context.Context, v installer.VM, attach []installer.Interface, diags *diag.Diagnostics) []installer.Interface {
+	roles, err := v.NetworkRoles(ctx)
+	if err != nil {
+		diags.AddWarning("The VM's NICs could not be read",
+			fmt.Sprintf("%v: every interface is attached (`network attach`), and the VM reboots to name them.", err))
+		return attach
+	}
+	var left []installer.Interface
+	var fixes []string
+	for _, i := range attach {
+		r, ok := namedRole(roles, i)
+		if !ok {
+			left = append(left, i)
+		} else if fix := realign(r, i, v.Short); fix != "" {
+			fixes = append(fixes, fix)
+		}
+	}
+	if len(fixes) > 0 {
+		slices.Sort(fixes)
+		diags.AddAttributeWarning(path.Root("vm").AtName("interfaces"), "The VM addresses NICs otherwise than interfaces",
+			"The VM names these roles by the MAC given, with other addressing: they are taken over as they are (nothing is attached for them, and the VM does not reboot), and state records interfaces as configured. To align the VM with the configuration, run on it:\n"+strings.Join(fixes, "\n"))
+	}
+	return left
+}
+
+// namedRole is the role of roles that names i: its role, by i's MAC.
+func namedRole(roles []installer.NICRole, i installer.Interface) (installer.NICRole, bool) {
+	for _, r := range roles {
+		if r.Role == i.Role && r.MAC != "" && strings.EqualFold(r.MAC, i.MAC) {
+			return r, true
+		}
+	}
+	return installer.NICRole{}, false
+}
+
+// realign is "" when r, a role the VM names, has i's addressing, else the line saying how it
+// differs and the commands that align it (`network set --role`, then `network confirm` within its
+// window). An override (`network set --role`) has i's mode (left out: none) and, static, its
+// address; a role without one reports only its addresses: a static i's address among them, none
+// for mode none, any for dhcp (none yet: its lease is not there yet, which is no misalignment).
+func realign(r installer.NICRole, i installer.Interface, short string) string {
+	mode := cmp.Or(i.Mode, "none")
+	var same bool
+	var now string
+	if o := r.Override; o != nil {
+		same = o.Mode == mode && (mode != "static" || o.Address == i.Address)
+		now = "its override (`network set --role`) is " + strings.TrimSpace(o.Mode+" "+o.Address)
+	} else {
+		switch mode {
+		case "static":
+			same = slices.Contains(r.Addresses, i.Address)
+		case "none":
+			same = len(r.Addresses) == 0
+		default:
+			same = true
+		}
+		now = "it has no address"
+		if len(r.Addresses) > 0 {
+			now = "it has " + strings.Join(r.Addresses, ", ")
+		}
+	}
+	if same {
+		return ""
+	}
+	want := mode
+	set := fmt.Sprintf("sudo %s-stow network set --role %s --mode %s", short, i.Role, mode)
+	if mode == "static" {
+		want += " " + i.Address
+		set += " --address " + i.Address
+	}
+	return fmt.Sprintf("- %s: %s, interfaces gives %s: `%s`, then `sudo %s-stow network confirm` once the VM answers.", i.Role, now, want, set, short)
+}
+
+// diskLookup bounds a destroy's check of the registry's disk set, and diskConnect, in seconds,
+// its connection to the VM: a VM that does not answer by then (stopped, gone) is not checked.
+const (
+	diskLookup  = 2 * time.Minute
+	diskConnect = 10
+)
+
+// vmDiskWarning warns, at the plan of a destroy of the VM's install (its VM destroyed next, so
+// before the destroy is approved), when the registry holds no disk set a VM of its release boots
+// on its platform: such a VM is not made again until one is published. Asked of the VM's own
+// installer (DiskSet), over a connection bounded to diskConnect seconds; a VM that does not answer
+// within them is not checked, said in a warning, and a check that fails is said too. Nothing
+// without platform, nor without the VM's own key; it never stops the destroy.
+func (r *installResource) vmDiskWarning(ctx context.Context, m *installModel, diags *diag.Diagnostics) {
+	if !known(m.VM.Platform) || !known(m.VM.HostKeyLine) || r.data == nil {
+		return
+	}
+	v, err := r.vmWithin(m, diskConnect)
+	if err == nil {
+		ctx, cancel := context.WithTimeout(ctx, diskLookup)
+		defer cancel()
+		f := strings.Fields(m.VM.HostKeyLine.ValueString())
+		err = v.DiskSet(ctx, m.VM.Platform.ValueString(), m.Registry.ValueString(), strings.Join(f[min(1, len(f)):], " "))
+	}
+	var refused *installer.RefusedError
+	switch {
+	case err == nil:
+	case sshFailed(err):
+		diags.AddWarning("Whether this VM can be made again was not checked",
+			fmt.Sprintf("The VM did not answer over SSH within %d seconds (stopped, or gone): check the release has disks for %s before destroying the VM.", diskConnect, m.VM.Platform.ValueString()))
+	case errors.As(err, &refused):
+		diags.AddWarning("No disk set to make this VM again",
+			fmt.Sprintf("%s. Until the release publishes one (stowage ship --disks), a VM destroyed is not made again from its seed.", refused.Reason))
+	default:
+		diags.AddWarning("Whether this VM can be made again is not known",
+			fmt.Sprintf("Its registry's disk sets could not be read through the VM (%v): check the release has disks for %s before destroying the VM.", err, m.VM.Platform.ValueString()))
+	}
+}
+
+// attach runs `network attach` on the VM for each NIC (attach), then reboots it and follows the
+// reboot to the health gate's verdict, from before (the VM's status before): the NICs are named
+// from that boot. The status after it; a verdict other than healthy is an *unhealthyAttach, with
+// that status: the NICs are attached. A status without boot_id or events, whose reboot could not
+// be followed, refuses before any NIC is attached.
+func (r *installResource) attach(ctx context.Context, v installer.VM, before *installer.VMStatus, attach []installer.Interface) (*installer.VMStatus, error) {
+	if before.BootID == "" || before.Events == nil {
+		return nil, fmt.Errorf("the VM reports no boot_id or no event journal (%s), so the reboot that names the NICs could not be followed: nothing was attached. Read `sudo %s-stow status` on the VM",
+			cmp.Or(before.EventsError, "no events_error either"), v.Short)
+	}
+	for _, i := range attach {
+		if err := v.NetworkAttach(ctx, i); err != nil {
+			return nil, err
+		}
+	}
+	if err := v.Reboot(ctx); err != nil && !errors.Is(err, installer.ErrCut) {
+		return nil, err
+	}
+	st, verdict, err := r.rebooted(ctx, v, before, false)
+	if err != nil {
+		return nil, err
+	}
+	if verdict.final.Verdict != installer.VerdictHealthy {
+		return st, &unhealthyAttach{detail: verdictDetail("", "", verdict)}
+	}
+	return st, nil
+}
+
+// unhealthyAttach is attach's error when every NIC was attached and the VM came back from the
+// reboot naming them unhealthy: the NICs are attached, and state records them so.
+type unhealthyAttach struct{ detail string }
+
+func (e *unhealthyAttach) Error() string {
+	return "the VM came back unhealthy from the reboot that names its NICs: " + e.detail +
+		" The NICs are attached, and state records them: no apply attaches them again; fix what the health gate found"
 }
 
 // firstBoot waits until the VM answers over SSH (ssh failing while it boots) and its boot unit has
@@ -473,6 +793,9 @@ func (r *installResource) firstBoot(ctx context.Context, v installer.VM) (*insta
 			return missing, err // no installer of that name: no wait makes one
 		}
 		switch {
+		case st.Boot == "recovery" && st.ResetFailed != "":
+			// Kairos does not try its reset again: no later poll answers otherwise.
+			return true, fmt.Errorf("the VM's first boot gave up in Kairos's recovery system, which stays: %s", st.ResetFailed)
 		case st.Boot == "recovery":
 			return false, errors.New("the VM answers from its recovery system")
 		case st.RebootPending:
@@ -515,7 +838,7 @@ func (r *installResource) learnKey(ctx context.Context, m *installModel, v insta
 	}
 	if !known(own) {
 		return types.StringNull(), types.StringNull(), []string{"The VM's own host key was not read\n" + err.Error() +
-			". The connection keeps accepting vm.known_hosts_line alone, which the VM's next boot retires: give its own key there then (check it on the VM's console: ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub)."}
+			". The connection keeps accepting known_hosts_line alone, which the VM's next boot retires: give its own key there then (check it on the VM's console: ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub)."}
 	}
 	seed = types.StringValue(bootID)
 	if bootID == "" {
@@ -531,11 +854,11 @@ func notRetiredHint(err error) string {
 	var nr *installer.NotRetiredError
 	switch {
 	case errors.As(err, &nr):
-		return "host-key retired the one-time key's files, but sshd did not take its reload: fix it on the VM as the installer says above (or reboot the VM), then apply a change; until then the connection accepts the one-time key beside the VM's own (vm.seed_boot_id)."
+		return "host-key retired the one-time key's files, but sshd did not take its reload: fix it on the VM as the installer says above (or reboot the VM), then apply a change; until then the connection accepts the one-time key beside the VM's own (seed_boot_id)."
 	case errors.Is(err, errNotProved):
-		return "host-key retired the one-time key's files, but sshd does not serve the VM's own key alone yet; until then the connection accepts the one-time key beside the VM's own (vm.seed_boot_id), and the next update with a change tries again (no reboot needed)."
+		return "host-key retired the one-time key's files, but sshd does not serve the VM's own key alone yet; until then the connection accepts the one-time key beside the VM's own (seed_boot_id), and the next update with a change tries again (no reboot needed)."
 	}
-	return "The VM serves it until its next boot, which retires it; until then the connection accepts it beside the VM's own (vm.seed_boot_id)."
+	return "The VM serves it until its next boot, which retires it; until then the connection accepts it beside the VM's own (seed_boot_id)."
 }
 
 // errNotProved is a retirement whose verb ran but whose proof did not hold.
@@ -552,7 +875,7 @@ func (r *installResource) retryRetire(ctx context.Context, m *installModel, v in
 			return own, seed, "", err
 		}
 		return own, seed, "The VM's one-time host key is still not retired\n" + err.Error() + ". " + notRetiredHint(err) +
-			" vm.known_hosts_line stays needed until then.", nil
+			" known_hosts_line stays needed until then.", nil
 	}
 	// The same key: state's line stays as the plan holds it (its host field is never read, the
 	// connection naming the key by its alias).
@@ -560,7 +883,7 @@ func (r *installResource) retryRetire(ctx context.Context, m *installModel, v in
 }
 
 // errOtherKey is a VM whose own key is not the one state records.
-var errOtherKey = errors.New("the VM serves another key than state's vm.host_key_line")
+var errOtherKey = errors.New("the VM serves another key than state's host_key_line")
 
 // sameKey says whether two known_hosts lines hold the same key, whatever their host fields.
 func sameKey(a, b string) bool {
@@ -590,11 +913,11 @@ func (r *installResource) retire(ctx context.Context, m *installModel, v install
 	own := types.StringValue(host + " " + key)
 	if known(want) {
 		if _, perr := target.ParseKnownHostsLine(want.ValueString()); perr != nil {
-			return own, fmt.Errorf("state's vm.host_key_line: %w", perr)
+			return own, fmt.Errorf("state's host_key_line: %w", perr)
 		}
 	}
 	if known(want) && !sameKey(own.ValueString(), want.ValueString()) {
-		return own, fmt.Errorf("%w: host-key printed %s, and state records %s. The one-time key is retired or being retired: give vm.known_hosts_line %q (the key the VM's own verb printed, through the key state accepts), then `tofu state rm` this resource and `tofu import` it as vm:<host>/<short>-stow", errOtherKey, key, want.ValueString(), own.ValueString())
+		return own, fmt.Errorf("%w: host-key printed %s, and state records %s. The one-time key is retired or being retired: give known_hosts_line %q (the key the VM's own verb printed, through the key state accepts), then `tofu state rm` this resource and `tofu import` it as <host>/<short>-stow", errOtherKey, key, want.ValueString(), own.ValueString())
 	}
 	if nr != nil {
 		return own, err // its key known, the one-time key still served: no check of the own key alone
@@ -821,20 +1144,10 @@ func (r *installResource) readVM(ctx context.Context, m *installModel, resp *res
 		resp.Diagnostics.AddError("Cannot reach the VM", err.Error())
 		return
 	}
-	st, err := v.Status(ctx)
+	st, err := v.StatusOf(ctx, true)
 	if err != nil {
 		if sshFailed(err) {
-			keyWay := "A read accepts the VM's own key state holds (vm.host_key_line), and the seed's line beside it while vm.seed_boot_id is set. " +
-				"A VM made again from its seed is a new install: `tofu state rm` this resource, and the next apply installs it under the seed's key. " +
-				"A VM whose own key changed: check the new key on its console, give it in vm.known_hosts_line, " +
-				"then `tofu state rm` this resource and `tofu import` it again (`" + vmID(m) + "`)."
-			if !known(m.VM.HostKeyLine) {
-				// No own key recorded: the connection accepts state's vm.known_hosts_line alone
-				// (installResource.vm), which an apply that does not read saves.
-				keyWay = "A read accepts the key in state's vm.known_hosts_line alone (the VM's own key is not recorded yet): " +
-					"check the new key on the VM's console, give it in vm.known_hosts_line, then `tofu apply -refresh=false`, which saves a change of the connection alone without running anything on the VM."
-			}
-			unreachable(&resp.Diagnostics, "VM", "vm", m.VM.Host.ValueString(), keyWay, err)
+			unreachable(&resp.Diagnostics, "VM", m.VM.Host.ValueString(), vmKeyWay(m), err)
 			return
 		}
 		addInstallerError(&resp.Diagnostics, "Reading the VM", renamed(ctx, v, err))
@@ -846,6 +1159,7 @@ func (r *installResource) readVM(ctx context.Context, m *installModel, resp *res
 	}
 	applyVMStatus(m, st, true)
 	retireSeed(m, st)
+	readBack(m, st.Values)
 	resp.Diagnostics.Append(dropUnrecorded(ctx, m, &st.Status)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, m)...)
 }
@@ -865,12 +1179,22 @@ func (r *installResource) updateVM(ctx context.Context, req resource.UpdateReque
 		resp.Diagnostics.Append(resp.State.Set(ctx, m)...)
 		return !resp.Diagnostics.HasError()
 	}
-	p := r.vmPrepare(ctx, plan, state, secrets, &resp.Diagnostics)
+	p := r.vmPrepare(ctx, plan, state, secrets, false, &resp.Diagnostics)
 	if p == nil {
 		return
 	}
 	conn, v, st, step, u := p.conn, p.v, p.st, p.step, p.u
 	now, later := p.now, p.later // what the running release's re-run, and the new release's, are given
+	// The NICs this update attaches: an imported state's, those the VM does not name yet.
+	attach := withPending(attachments(plan.VM.Interfaces, state.VM.Interfaces), plan.VM.Interfaces, pendingRoles(ctx, req.Private))
+	if imported(state) && len(attach) > 0 {
+		attach = newNICs(ctx, v, attach, &resp.Diagnostics)
+	}
+	if step != stay && len(attach) > 0 {
+		// An imported state's release change is told here (its version is null at plan).
+		interfacesWithVersion(&resp.Diagnostics)
+		return
+	}
 	var err error
 	desired := plan.VM.Version.ValueString()
 	// The keys, before anything else changes on the VM: its own, when state has none yet (it
@@ -913,13 +1237,21 @@ func (r *installResource) updateVM(ctx context.Context, req resource.UpdateReque
 	}
 	if step != stay && !known(own) {
 		resp.Diagnostics.AddError("The VM's own host key is not known",
-			"It could not be read (the warning says why). The release change's reboot would retire the key this connection accepts, and could not be followed: nothing was run. Give vm.known_hosts_line the VM's own key (ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub on its console), then apply again.")
+			"It could not be read (the warning says why). The release change's reboot would retire the key this connection accepts, and could not be followed: nothing was run. Give known_hosts_line the VM's own key (ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub on its console), then apply again.")
 		return
 	}
 	// was is state as the VM stands before the release change: after the re-run, the plan's
 	// inputs it took, the release unchanged.
 	was := *state
 	was.VM = withKeys(planConn(state.VM, plan.VM), own, seed)
+	if login := r.login(plan, state, &resp.Diagnostics); resp.Diagnostics.HasError() {
+		return
+	} else if login != "" {
+		if err := v.RegistryLogin(ctx, login); err != nil {
+			addInstallerError(&resp.Diagnostics, "Giving the VM its registry login", err)
+			return
+		}
+	}
 	if !now.Empty() {
 		if _, err := v.Install(ctx, installer.VMInstall{Change: now}); err != nil {
 			addInstallerError(&resp.Diagnostics, "Reconfiguring the VM", err)
@@ -949,10 +1281,38 @@ func (r *installResource) updateVM(ctx context.Context, req resource.UpdateReque
 			addInstallerError(&resp.Diagnostics, "Reading the VM", err)
 			return
 		}
+		var sick *unhealthyAttach // the NICs attached, the VM's boot unhealthy
+		if len(attach) == 0 {
+			resp.Diagnostics.Append(setPending(ctx, resp.Private, nil)...)
+		} else {
+			// The re-run's state first: an attach that fails leaves the roles it attaches as
+			// state had them (and the pending ones pending), so the next plan attaches them again;
+			// the others — an imported VM's roles taken over — as planned, never attached again.
+			done := final
+			vmd := *final.VM
+			vmd.Interfaces = notAttached(plan.VM.Interfaces, state.VM.Interfaces, attach)
+			done.VM = &vmd
+			r.vmFill(&done, state)
+			applyVMStatus(&done, after, false)
+			retireSeed(&done, after)
+			if !save(&done) {
+				return
+			}
+			attached, err := r.attach(ctx, v, after, attach)
+			if err != nil && !errors.As(err, &sick) {
+				addInstallerError(&resp.Diagnostics, "Attaching the VM's NICs", consoleHint(err, plan.VM.Platform))
+				return
+			}
+			// Attached, whatever the verdict: recorded as planned, nothing pending.
+			after = attached
+			resp.Diagnostics.Append(setPending(ctx, resp.Private, nil)...)
+		}
 		r.vmFill(&final, state)
 		applyVMStatus(&final, after, false)
 		retireSeed(&final, after)
-		save(&final)
+		if save(&final) && sick != nil {
+			addInstallerError(&resp.Diagnostics, "Attaching the VM's NICs", consoleHint(sick, plan.VM.Platform))
+		}
 		return
 	}
 	// learnKey retired nothing in this update (state had no key, and a seed came back): release()
@@ -975,9 +1335,56 @@ type vmPrep struct {
 	running    *installer.Describe // the VM's installer, describe --json
 }
 
+// answers reads the VM's status (with its values when imported) until it answers over SSH: the
+// platform restarted the VM to give it a NIC (the root's power resource, which this one depends
+// on), and its SSH answers once it booted; an imported VM's too (every role configured is new to
+// state). A refused login or another host key stops the wait at once (sshRefused): no later try
+// answers otherwise. atPlan: plan_dry_run's read, bounded by planDryRunTimeout, which the timeout's
+// message names; else the resource's timeouts block's.
+func (r *installResource) answers(ctx context.Context, v installer.VM, imported, atPlan bool) (*installer.VMStatus, error) {
+	what, bound := "the VM did not answer over SSH after its restart", resourceTimeout
+	if atPlan {
+		what, bound = "the VM did not answer over SSH", fmt.Sprintf("plan_dry_run's bound (%d minutes)", int(planDryRunTimeout.Minutes()))
+	}
+	var st *installer.VMStatus
+	err := r.wait(ctx, what, bound, func() (bool, error) {
+		s, err := v.StatusOf(ctx, imported)
+		if err != nil {
+			return !sshFailed(err) || sshRefused(err), err
+		}
+		st = s
+		return true, nil
+	})
+	return st, err
+}
+
+// sshRefused says whether err is ssh's own failure on a refused login or another host key served:
+// what unreachable tells apart, and no wait mends.
+func sshRefused(err error) bool {
+	if err == nil || !sshFailed(err) {
+		return false
+	}
+	msg := err.Error()
+	return sshLoginRefused.MatchString(msg) || hostKeyFailed(msg)
+}
+
+// vmKeyWay is unreachable's way on for a VM that serves another host key than m, a state, accepts.
+func vmKeyWay(m *installModel) string {
+	if !known(m.VM.HostKeyLine) {
+		// No own key recorded: the connection accepts state's known_hosts_line alone
+		// (installResource.vm), which an apply that does not read saves.
+		return "A read accepts the key in state's known_hosts_line alone (the VM's own key is not recorded yet): " +
+			"check the new key on the VM's console, give it in known_hosts_line, then `tofu apply -refresh=false`, which saves a change of the connection alone without running anything on the VM."
+	}
+	return "A read accepts the VM's own key state holds (host_key_line), and the seed's line beside it while seed_boot_id is set. " +
+		"A VM made again from its seed is a new install: `tofu state rm` this resource, and the next apply installs it under the seed's key. " +
+		"A VM whose own key changed: check the new key on its console, give it in known_hosts_line, " +
+		"then `tofu state rm` this resource and `tofu import` it again (`" + vmID(m) + "`)."
+}
+
 // vmPrepare reads the VM and decides the update's step as the apply does, with every refusal it
-// makes before it runs anything: nil on one (said in diags).
-func (r *installResource) vmPrepare(ctx context.Context, plan, state *installModel, secrets map[string]string, diags *diag.Diagnostics) *vmPrep {
+// makes before it runs anything: nil on one (said in diags). atPlan: plan_dry_run's.
+func (r *installResource) vmPrepare(ctx context.Context, plan, state *installModel, secrets map[string]string, atPlan bool, diags *diag.Diagnostics) *vmPrep {
 	// The connection is the plan's, with the keys state learnt.
 	conn := *plan
 	vmc := *plan.VM
@@ -988,7 +1395,17 @@ func (r *installResource) vmPrepare(ctx context.Context, plan, state *installMod
 		diags.AddError("Cannot reach the VM", err.Error())
 		return nil
 	}
-	st, err := v.StatusOf(ctx, imported(state))
+	var st *installer.VMStatus
+	if len(attachments(plan.VM.Interfaces, state.VM.Interfaces)) > 0 {
+		st, err = r.answers(ctx, v, imported(state), atPlan)
+		if sshRefused(err) {
+			unreachable(diags, "VM", plan.VM.Host.ValueString(), vmKeyWay(state), err)
+			return nil
+		}
+		err = consoleHint(err, plan.VM.Platform)
+	} else {
+		st, err = v.StatusOf(ctx, imported(state))
+	}
 	if err != nil {
 		addInstallerError(diags, "Reading the VM", renamed(ctx, v, err))
 		return nil
@@ -1004,7 +1421,7 @@ func (r *installResource) vmPrepare(ctx context.Context, plan, state *installMod
 	}
 	step := vmStep(plan, state, st, diags)
 	if step == rollback && imported(state) {
-		importedRollback(diags, path.Root("vm").AtName("version"), "vm.version", st.Installed.Version+", the release it runs", "previous.version")
+		importedRollback(diags, path.Root("vm").AtName("version"), "version", st.Installed.Version+", the release it runs", "previous.version")
 	}
 	if diags.HasError() {
 		return nil
@@ -1023,7 +1440,7 @@ func (r *installResource) vmPrepare(ctx context.Context, plan, state *installMod
 		vmRollbackAlone(diags, "inputs, secret inputs, tls, domains or ports")
 		return nil
 	}
-	// An imported state records the configuration's vm.channel, first-install only from then on:
+	// An imported state records the configuration's channel, first-install only from then on:
 	// it must be the channel the VM follows.
 	if imported(state) && !vmChannelCheck(diags, plan.VM.Channel, st.Channel, "Nothing was run.") {
 		return nil
@@ -1053,7 +1470,7 @@ func vmStep(plan, state *installModel, st *installer.VMStatus, diags *diag.Diagn
 	case st.Previous != nil && st.Previous.Version == desired:
 		if rollbackRefused(plan.AllowRollback) {
 			diags.AddAttributeError(path.Root("allow_rollback"), "a rollback needs allow_rollback",
-				fmt.Sprintf("vm.version is %s, the release the VM's last upgrade replaced: reaching it is `rollback`, which reboots the VM into the previous release (every input keeps its value). Set allow_rollback = true to roll back.", desired))
+				fmt.Sprintf("version is %s, the release the VM's last upgrade replaced: reaching it is `rollback`, which reboots the VM into the previous release (every input keeps its value). Set allow_rollback = true to roll back.", desired))
 			return stay
 		}
 		return rollback
@@ -1077,17 +1494,17 @@ func withKeys(v vmModel, own, seed types.String) *vmModel {
 	return &v
 }
 
-// shortNameFixed refuses a vm.short_name other than state's: state names the installer the VM's
+// shortNameFixed refuses a short_name other than state's: state names the installer the VM's
 // seed (or the import ID) gave, and the provider runs no other.
 func shortNameFixed(diags *diag.Diagnostics, was, now string) {
-	firstInstallOnlyFix(diags, path.Root("vm").AtName("short_name"), "vm.short_name", was, now,
+	firstInstallOnlyFix(diags, path.Root("vm").AtName("short_name"), "short_name", was, now,
 		fmt.Sprintf("Set it back to %q. %s", was, renameFix))
 }
 
 // renameFix is what to do when the VM runs another installer than state names.
 const renameFix = "When the VM runs another installer (a release that renamed it, an import under a wrong name; `ls /usr/sbin/*-stow` on the VM names it): " +
-	"give vm.known_hosts_line the VM's own key — state's vm.host_key_line (when vm.seed_boot_id is set too, the VM still serves its one-time key: reboot the VM first, which retires it), " +
-	"else the key checked on the VM's console (ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub) —, then `tofu state rm` this resource and `tofu import` it as vm:<host>/<short>-stow."
+	"give known_hosts_line the VM's own key — state's host_key_line (when seed_boot_id is set too, the VM still serves its one-time key: reboot the VM first, which retires it), " +
+	"else the key checked on the VM's console (ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub) —, then `tofu state rm` this resource and `tofu import` it as <host>/<short>-stow."
 
 // missingCtl says, for err, a failed run of v's installer, whether the VM's shell finds no such
 // installer (HasCtl: whatever the shell, its language or the exit it gave a missing command —
@@ -1119,17 +1536,17 @@ func renamed(ctx context.Context, v installer.VM, err error) error {
 	return probeNote(err, v, probe)
 }
 
-// vmChannelCheck says whether the configured vm.channel is the VM's (or left out); else it is an
+// vmChannelCheck says whether the configured channel is the VM's (or left out); else it is an
 // error ending with after, naming the channel to set.
 func vmChannelCheck(diags *diag.Diagnostics, configured types.String, vmChannel, after string) bool {
 	if !known(configured) || configured.ValueString() == vmChannel {
 		return true
 	}
-	detail := fmt.Sprintf("The VM follows the channel %q (its seed's); vm.channel says %q, which state would record, first-install only from then on. Set vm.channel to %q, or leave it out. %s", vmChannel, configured.ValueString(), vmChannel, after)
+	detail := fmt.Sprintf("The VM follows the channel %q (its seed's); channel says %q, which state would record, first-install only from then on. Set channel to %q, or leave it out. %s", vmChannel, configured.ValueString(), vmChannel, after)
 	if vmChannel == "" {
-		detail = fmt.Sprintf("The VM's status reports no channel; vm.channel says %q, which state would record. Leave vm.channel out. %s", configured.ValueString(), after)
+		detail = fmt.Sprintf("The VM's status reports no channel; channel says %q, which state would record. Leave channel out. %s", configured.ValueString(), after)
 	}
-	diags.AddAttributeError(path.Root("vm").AtName("channel"), "vm.channel is not the VM's", detail)
+	diags.AddAttributeError(path.Root("vm").AtName("channel"), "channel is not the VM's", detail)
 	return false
 }
 
@@ -1188,6 +1605,7 @@ func vmSplit(ctx context.Context, u *update, running *installer.Describe, upgrad
 	if known(plan.TLS) && !plan.TLS.Equal(state.TLS) {
 		now.TLS = plan.TLS.ValueString()
 	}
+	now.AcmeCA, now.AcmeCARoot = acmeChange(plan, state)
 	for _, c := range []struct {
 		plan, state types.Map
 		now, later  map[string]string
@@ -1215,20 +1633,24 @@ func vmSplit(ctx context.Context, u *update, running *installer.Describe, upgrad
 	return now, later
 }
 
-// importVM reads an import ID `vm:<host>/<short>-stow`: the VM and the installer it runs. The
-// configuration gives the connection — vm.known_hosts_line the VM's own key — at the first apply.
+// hostName is a host name an import ID may give: letters, digits, dots and hyphens.
+var hostName = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$`)
+
+// importVM reads an import ID `<host>/<short>-stow`: the VM and the installer it runs. The
+// configuration gives the connection — known_hosts_line the VM's own key — at the first apply.
 func (r *installResource) importVM(ctx context.Context, id string, resp *resource.ImportStateResponse) {
 	host, file, ok := strings.Cut(id, "/")
 	short, isStow := strings.CutSuffix(file, "-stow")
-	if !ok || !isStow || !installer.ValidShortName(short) || target.ValidateHostUser(host, "u") != nil {
-		resp.Diagnostics.AddError("Import ID", fmt.Sprintf("%q: want vm:<host>/<short>-stow, the VM's address and the installer it runs (`ls /usr/sbin/*-stow` on it)", "vm:"+id))
+	if !ok || !isStow || !installer.ValidShortName(short) || target.ValidateHostUser(host, "u") != nil || net.ParseIP(host) == nil && !hostName.MatchString(host) {
+		resp.Diagnostics.AddError("Import ID", fmt.Sprintf("%q: want <host>/<short>-stow, the VM's address and the installer it runs (`ls /usr/sbin/*-stow` on it)", id))
 		return
 	}
 	null := types.StringNull()
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("vm"), &vmModel{
 		Host: types.StringValue(host), Port: types.Int64Null(), User: null, PrivateKeyFile: null, KnownHostsLine: null,
-		Version: null, Channel: null, ShortName: types.StringValue(short), HostKeyLine: null, SeedBootID: null})...)
-	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), "vm:"+id)...)
+		Version: null, Channel: null, ShortName: types.StringValue(short), HostKeyLine: null, SeedBootID: null,
+		Platform: null, Interfaces: types.MapNull(interfaceType)})...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), id)...)
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("short_name"), short)...)
 	for a, v := range map[string]bool{"deletion_protection": true, "delete_data": false, "allow_rollback": false} {
 		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root(a), v)...)

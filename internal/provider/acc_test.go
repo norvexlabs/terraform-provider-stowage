@@ -26,15 +26,13 @@ func TestAccDockerLocal(t *testing.T) {
 		},
 		Steps: []resource.TestStep{{
 			Config: fmt.Sprintf(`
-resource "stowage_install" "this" {
+resource "stowage_docker_install" "this" {
   installer           = %q
   deletion_protection = false
   delete_data         = true
-  docker {
-    work_dir = %q
-  }
+  work_dir            = %q
 }`, ref, dir),
-			Check: resource.TestCheckResourceAttr("stowage_install.this", "status", "installed"),
+			Check: resource.TestCheckResourceAttr("stowage_docker_install.this", "status", "installed"),
 		}},
 	})
 }

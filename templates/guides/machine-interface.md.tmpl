@@ -54,5 +54,23 @@ description: |-
   update or destroy, naming the hand upgrade that moves it on (its kept `<short>-stow upgrade
   --version V`; on Kubernetes the release's own `k8s upgrade --version V`, on a VM `sudo
   <short>-stow upgrade --version V`), after which the provider drives it.
+- **Stowage 0.40.0 or later**: `status --json --values` (a refresh reads it) adds `pull_login`
+  and `pull_login_error` (whether the install holds its own registry login), and in the ACME modes
+  `acme_ca` and `acme_ca_root` (`sha256:<hex>`) with `acme_ca_root_error`; `vm seed --json` adds
+  `size`, `firewall` and `await_given`, and a VM's status `reset_failed`; the installer image is
+  an index of one entry per platform, which `stowage_vm_seed` and the Kubernetes runs read for
+  the machine's own. An installer before 0.40.0 tells none of them: the values are not read back,
+  `size` and `firewall` are null, and its one linux/amd64 image is taken on linux/amd64 alone.
+- The verbs without `--json` the provider runs on a VM (`registry-login FILE`, `network attach`,
+  `reboot`) are read by their exit alone: 0 done, 3 refused (the diagnostic's summary the last
+  line of their standard error), any other failed.
+- An imported VM's first apply reads `sudo -n <short>-stow network --json` (its `roles`: each
+  role, the MAC of the NIC named so, its addresses, its `override`'s `mode` and `address`; any
+  exit but 0 is "not read").
+- `status --json`'s `installed.installer` (the installer image by the digest the release's signed
+  manifest gives) is where an upgrade reads the keys of the release installed: that installer's
+  payload ([trust](trust.md)); when its registry cannot give it, on Docker, the payload of the
+  installer the install keeps (`<dir>/<short>-stow`): its last 24 bytes are the payload's length
+  (8 bytes, big-endian) and `STOWAGE-PAYLOAD1`, the tar before them holds `keys/`.
 
 Stowage documents the interface itself in its README (`describe --json`, `status --json`, `--json` on the verbs).

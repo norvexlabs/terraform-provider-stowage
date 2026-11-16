@@ -46,6 +46,8 @@ type vmFake struct {
 	// entry: a boot whose unit has not taken the install to the OS's release yet.
 	unjudged *reply
 	judged   bool
+	// connErr, when set, refuses a connection it returns an error for.
+	connErr func(Connection) error
 }
 
 var bootIDField = regexp.MustCompile(`"boot_id":"([^"]*)"`)
@@ -72,8 +74,12 @@ type vmConn struct {
 
 func vmOp(argv []string) string {
 	switch {
+	case len(argv) > 9 && argv[0] == "sh" && argv[2] == installer.RunScript && argv[9] == "vm":
+		return "vm-seed"
 	case len(argv) > 2 && argv[0] == "sh" && argv[2] == installer.RunScript:
 		return "install"
+	case len(argv) > 9 && argv[0] == "sh" && argv[2] == installer.PositionalScript:
+		return argv[9]
 	case len(argv) > 2 && argv[0] == "sh" && argv[2] == installer.CtlScript:
 		return "probe"
 	case len(argv) == 3 && argv[1] == "describe":
@@ -86,6 +92,8 @@ func vmOp(argv []string) string {
 		return "boot"
 	case len(argv) == 5 && argv[0] == "sudo" && argv[3] == "host-key" && argv[4] == "--json":
 		return "retire"
+	case len(argv) == 5 && argv[0] == "sudo" && argv[3] == "network" && argv[4] == "--json":
+		return "network-read"
 	case len(argv) > 3 && argv[0] == "sudo" && contains(argv, "--dry-run"):
 		return "dry-" + argv[3]
 	case len(argv) > 3 && argv[0] == "sudo":
@@ -141,6 +149,11 @@ func (f *vmFake) factory(c Connection) (target.Runner, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.conns = append(f.conns, c)
+	if f.connErr != nil {
+		if err := f.connErr(c); err != nil {
+			return nil, err
+		}
+	}
 	return vmConn{f: f, c: c}, nil
 }
 
@@ -261,8 +274,7 @@ func newVMHarnessPoll(t *testing.T, poll time.Duration) (*harness, *vmFake) {
 	if err != nil || len(s.Diagnostics) > 0 {
 		t.Fatalf("schema: %v %v", err, s.Diagnostics)
 	}
-	h := &harness{t: t, srv: srv, schema: s.ResourceSchemas["stowage_install"]}
-	h.typ = h.schema.ValueType().(tftypes.Object)
+	h := &harness{t: t, srv: srv, typ: modelType(), outers: outersOf(t, s)}
 	h.ptyp = s.Provider.ValueType().(tftypes.Object)
 	cfg := h.dv(h.ptyp, fill(h.ptyp, nil))
 	if resp, err := srv.ConfigureProvider(ctx, &tfprotov6.ConfigureProviderRequest{Config: &cfg}); err != nil || len(resp.Diagnostics) > 0 {
@@ -326,7 +338,7 @@ func TestVMCreate(t *testing.T) {
 		t.Errorf("install argv %q", in.argv)
 	}
 	a := h.attrs(state)
-	if asString(t, a["version"]) != "1.1.0" || asString(t, a["status"]) != "installed" || asString(t, a["id"]) != "vm:192.0.2.7/notes-stow" || asString(t, a["short_name"]) != "notes" {
+	if vmAttr(t, h, state, "version") != "1.1.0" || asString(t, a["status"]) != "installed" || asString(t, a["id"]) != "192.0.2.7/notes-stow" || vmAttr(t, h, state, "short_name") != "notes" {
 		t.Errorf("state %v", a)
 	}
 	if got := vmAttr(t, h, state, "host_key_line"); got != ownLine {
@@ -358,12 +370,12 @@ func TestVMCreate(t *testing.T) {
 	}
 	f.set("status", reply{exit: 255, stderr: "@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@\nHost key verification failed."})
 	if got := errorsOf(h.read(state).Diagnostics); !strings.Contains(got, "The VM 192.0.2.7 serves another host key") ||
-		!strings.Contains(got, "`vm:192.0.2.7/notes-stow`") || !strings.Contains(got, "VM made again from its seed") || !strings.Contains(got, "vm.known_hosts_line") {
+		!strings.Contains(got, "`192.0.2.7/notes-stow`") || !strings.Contains(got, "VM made again from its seed") || !strings.Contains(got, "known_hosts_line") {
 		t.Errorf("a VM serving another key: %q", got)
 	}
 	f.set("status", reply{exit: 255, stderr: "ops@192.0.2.7: Permission denied (publickey)."})
 	if got := errorsOf(h.read(state).Diagnostics); !strings.Contains(got, "ssh's login to the VM 192.0.2.7 was refused") ||
-		!strings.Contains(got, "vm.user or vm.private_key_file") || !strings.Contains(got, "tofu apply -refresh=false") ||
+		!strings.Contains(got, "user or private_key_file") || !strings.Contains(got, "tofu apply -refresh=false") ||
 		strings.Contains(got, "docker.") || strings.Contains(got, "made again") {
 		t.Errorf("a VM refusing the login: %q", got)
 	}
@@ -390,7 +402,7 @@ func TestVMCreate(t *testing.T) {
 	}
 	// Another key on the VM at its new address: the import named is the address a read uses.
 	f.set("status", reply{exit: 255, stderr: "Host key verification failed."})
-	if got := errorsOf(h.read(a2.NewState).Diagnostics); !strings.Contains(got, "`vm:192.0.2.9/notes-stow`") {
+	if got := errorsOf(h.read(a2.NewState).Diagnostics); !strings.Contains(got, "`192.0.2.9/notes-stow`") {
 		t.Errorf("another key after a new address: %q", got)
 	}
 	f.set("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", "")})
@@ -431,7 +443,7 @@ func TestVMRetireFails(t *testing.T) {
 	// state holds is the one a read needs, so a changed own key is a new import.
 	f.set("status", reply{exit: 255, stderr: "Host key verification failed."})
 	if got := errorsOf(h.read(state).Diagnostics); !strings.Contains(got, "serves another host key") || !strings.Contains(got, "the seed's line beside it") ||
-		!strings.Contains(got, "`tofu import` it again (`vm:192.0.2.7/notes-stow`)") || strings.Contains(got, "tofu apply -refresh=false`, which saves") {
+		!strings.Contains(got, "`tofu import` it again (`192.0.2.7/notes-stow`)") || strings.Contains(got, "tofu apply -refresh=false`, which saves") {
 		t.Errorf("another key before the retirement: %q", got)
 	}
 	f.set("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", "")})
@@ -478,7 +490,7 @@ func TestVMCreateRefused(t *testing.T) {
 		},
 		"a version other than the disk's": {
 			cfg:  func(h *harness) tftypes.Value { return h.vmConfig("1.2.0", nil) },
-			want: `set vm.version = "1.1.0"`, ran: "install",
+			want: `set version = "1.1.0"`, ran: "install",
 		},
 		"a secret input in inputs": {
 			cfg: func(h *harness) tftypes.Value {
@@ -491,7 +503,7 @@ func TestVMCreateRefused(t *testing.T) {
 				return fill(h.typ, map[string]tftypes.Value{"vm": h.block("vm", map[string]tftypes.Value{
 					"host": str("192.0.2.7"), "user": str("ops"), "version": str("1.1.0"), "short_name": str("notes")})})
 			},
-			want: "vm.known_hosts_line is required to install", ran: "describe",
+			want: "known_hosts_line is required to install", ran: "describe",
 		},
 		"still on the recovery system": {
 			setup: func(f *vmFake) {
@@ -536,13 +548,13 @@ func TestVMFirstBootSwitchesOS(t *testing.T) {
 	f.then("describe", reply{stdout: describeOf("1.0.0", "")})
 	f.then("boot", reply{exit: 255, stderr: "Connection closed by remote host"})
 	state := h.create(h.vmConfig("1.1.0", nil))
-	if asString(t, h.attrs(state)["version"]) != "1.1.0" || len(f.callsOf("install")) != 1 {
+	if vmAttr(t, h, state, "version") != "1.1.0" || len(f.callsOf("install")) != 1 {
 		t.Errorf("state %v ops %q", h.attrs(state), f.ops())
 	}
 	// An OS that changes between the boot unit and the read is read again.
 	h3, f3 := newVMHarness(t)
 	f3.then("describe", reply{stdout: describeOf("1.0.0", "")}, reply{stdout: vmDescribe})
-	if s := h3.create(h3.vmConfig("1.1.0", nil)); asString(t, h3.attrs(s)["version"]) != "1.1.0" || f3.ops()[3] != "describe" || f3.ops()[4] != "describe" {
+	if s := h3.create(h3.vmConfig("1.1.0", nil)); vmAttr(t, h3, s, "version") != "1.1.0" || f3.ops()[3] != "describe" || f3.ops()[4] != "describe" {
 		t.Errorf("state %v ops %q", h3.attrs(s), f3.ops())
 	}
 }
@@ -573,7 +585,7 @@ func TestVMUpgradeAddsInputs(t *testing.T) {
 	if i := slices.Index(f.ops(), "upgrade"); i < 0 || i > slices.Index(f.ops(), "install") {
 		t.Errorf("the re-run is not after the upgrade: %q", f.ops())
 	}
-	if asString(t, h.attrs(a.NewState)["version"]) != "1.2.0" || vmAttr(t, h, a.NewState, "version") != "1.2.0" {
+	if vmAttr(t, h, a.NewState, "version") != "1.2.0" {
 		t.Errorf("state %v", h.attrs(a.NewState))
 	}
 
@@ -618,7 +630,7 @@ func TestVMUpgradeFallsBack(t *testing.T) {
 		t.Errorf("a fallback: %s", got)
 	}
 	if v := vmAttr(t, h, a.NewState, "version"); v != "1.1.0" {
-		t.Errorf("state's vm.version after a fallback: %s", v)
+		t.Errorf("state's version after a fallback: %s", v)
 	}
 	if p := h.plan(a.NewState, config); errorsOf(p.Diagnostics) != "" || vmAttr(t, h, p.PlannedState, "version") != "1.2.0" {
 		t.Errorf("the next plan does not propose the upgrade again: %s", errorsOf(p.Diagnostics))
@@ -777,11 +789,11 @@ func TestVMRollback(t *testing.T) {
 	if got := errorsOf(a.Diagnostics); got != "" {
 		t.Fatal(got)
 	}
-	if len(f.callsOf("rollback")) != 1 || len(f.callsOf("upgrade")) != 0 || asString(t, h.attrs(a.NewState)["version"]) != "1.1.0" {
+	if len(f.callsOf("rollback")) != 1 || len(f.callsOf("upgrade")) != 0 || vmAttr(t, h, a.NewState, "version") != "1.1.0" {
 		t.Errorf("ops %q, state %v", f.ops(), h.attrs(a.NewState))
 	}
 	both := h.vmConfig("1.1.0", map[string]tftypes.Value{"allow_rollback": boolean(true), "inputs": strMap(map[string]string{"ADMIN_EMAIL": "c@d"})})
-	if got := errorsOf(h.plan(state, both).Diagnostics); !strings.Contains(got, "a rollback goes alone") || !strings.Contains(got, "vm.version goes back to previous.version") {
+	if got := errorsOf(h.plan(state, both).Diagnostics); !strings.Contains(got, "a rollback goes alone") || !strings.Contains(got, "version goes back to previous.version") {
 		t.Errorf("a rollback with an input change: %s", got)
 	}
 }
@@ -835,7 +847,7 @@ func TestVMRollbackWaitsForTheBoot(t *testing.T) {
 		t.Errorf("a refused rollback boot: %s", got)
 	}
 	if v := vmAttr(t, h2, a.NewState, "version"); v != "1.2.0" {
-		t.Errorf("state's vm.version after a refused rollback boot: %s", v)
+		t.Errorf("state's version after a refused rollback boot: %s", v)
 	}
 
 	// The boot took the install back, then the gate found it unhealthy: the error says the
@@ -894,7 +906,7 @@ func TestVMValidation(t *testing.T) {
 		want string
 	}{
 		"no short_name": {fill(h.typ, map[string]tftypes.Value{"vm": h.block("vm", map[string]tftypes.Value{
-			"host": str("192.0.2.7"), "user": str("ops"), "known_hosts_line": str(seedLine), "version": str("1.1.0")})}), "vm.short_name is required"},
+			"host": str("192.0.2.7"), "user": str("ops"), "known_hosts_line": str(seedLine), "version": str("1.1.0")})}), "short_name is required"},
 		"a bad short_name": {fill(h.typ, map[string]tftypes.Value{"vm": h.vmBlock("1.1.0", map[string]tftypes.Value{"short_name": str("a/b")})}), "not an installer's short name"},
 		"a bad line":       {fill(h.typ, map[string]tftypes.Value{"vm": h.vmBlock("1.1.0", map[string]tftypes.Value{"known_hosts_line": str("@revoked x ssh-ed25519 " + edKey)})}), "does not parse"},
 	} {
@@ -912,20 +924,17 @@ func TestVMImport(t *testing.T) {
 	h, f := newVMHarness(t)
 	for id, want := range map[string]string{
 		"vm:192.0.2.7/notes-stow": "",
-		"vm:192.0.2.7/notes":      "want vm:<host>/<short>-stow",
-		"vm:-o/notes-stow":        "want vm:<host>/<short>-stow",
+		"vm:192.0.2.7/notes":      "want <host>/<short>-stow",
+		"vm:-o/notes-stow":        "want <host>/<short>-stow",
 	} {
-		resp, err := h.srv.ImportResourceState(context.Background(), &tfprotov6.ImportResourceStateRequest{TypeName: "stowage_install", ID: id})
-		if err != nil {
-			t.Fatal(err)
-		}
+		resp := h.importState(id)
 		if got := errorsOf(resp.Diagnostics); (want == "") != (got == "") || !strings.Contains(got, want) {
 			t.Errorf("%s: %s", id, got)
 		}
 	}
 	// An imported VM's first apply: the configuration's own key, its inputs given to the re-run.
 	f.retired = true
-	resp, _ := h.srv.ImportResourceState(context.Background(), &tfprotov6.ImportResourceStateRequest{TypeName: "stowage_install", ID: "vm:192.0.2.7/notes-stow"})
+	resp := h.importState("vm:192.0.2.7/notes-stow")
 	state := resp.ImportedResources[0].State
 	if r := h.read(state); errorsOf(r.Diagnostics) != "" || len(f.ops()) != 0 {
 		t.Fatalf("an imported state is read before its first apply: %s %q", errorsOf(r.Diagnostics), f.ops())
@@ -933,7 +942,7 @@ func TestVMImport(t *testing.T) {
 	bare := fill(h.typ, map[string]tftypes.Value{"vm": h.block("vm", map[string]tftypes.Value{
 		"host": str("192.0.2.7"), "user": str("ops"), "version": str("1.1.0"), "short_name": str("notes")}),
 		"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@b"})})
-	if got := errorsOf(h.update(state, bare).Diagnostics); !strings.Contains(got, "vm.known_hosts_line is required to install") {
+	if got := errorsOf(h.update(state, bare).Diagnostics); !strings.Contains(got, "known_hosts_line is required to install") {
 		t.Errorf("an imported state's apply without a key: %s", got)
 	}
 	cfg := fill(h.typ, map[string]tftypes.Value{"vm": h.vmBlock("1.1.0", map[string]tftypes.Value{"known_hosts_line": str(ownLine)}),
@@ -945,7 +954,7 @@ func TestVMImport(t *testing.T) {
 	if in := f.callsOf("install"); len(in) != 1 || !slices.Contains(in[0].argv, "ADMIN_EMAIL=a@b") {
 		t.Errorf("ops %q", f.ops())
 	}
-	if asString(t, h.attrs(a.NewState)["version"]) != "1.1.0" {
+	if vmAttr(t, h, a.NewState, "version") != "1.1.0" {
 		t.Errorf("state %v", h.attrs(a.NewState))
 	}
 }
@@ -958,13 +967,13 @@ func TestVMFirstBootWaits(t *testing.T) {
 	// The old OS answers twice, its boot unit cut by the reboot into the new one.
 	f.then("describe", reply{stdout: describeOf("1.0.0", "")}, reply{stdout: describeOf("1.0.0", "")})
 	f.then("boot", reply{exit: 255, stderr: "Connection closed by remote host"})
-	if s := h.create(h.vmConfig("1.1.0", nil)); asString(t, h.attrs(s)["version"]) != "1.1.0" {
+	if s := h.create(h.vmConfig("1.1.0", nil)); vmAttr(t, h, s, "version") != "1.1.0" {
 		t.Errorf("state %v", h.attrs(s))
 	}
 	h2, f2 := newVMHarness(t)
 	f2.then("describe", reply{stdout: describeOf("1.0.0", "")}, reply{stdout: describeOf("1.0.0", "")})
 	f2.then("status", reply{stdout: vmStatusJSON("1.0.0", "boot-1", `,"reboot_pending":true`)})
-	if s := h2.create(h2.vmConfig("1.1.0", nil)); asString(t, h2.attrs(s)["version"]) != "1.1.0" {
+	if s := h2.create(h2.vmConfig("1.1.0", nil)); vmAttr(t, h2, s, "version") != "1.1.0" {
 		t.Errorf("state %v ops %q", h2.attrs(s), f2.ops())
 	}
 	// A second describe failing for another reason than ssh is an error at once.
@@ -1005,7 +1014,7 @@ func TestVMRetireNotHeld(t *testing.T) {
 	noLine := fill(h.typ, map[string]tftypes.Value{"vm": h.block("vm", map[string]tftypes.Value{
 		"host": str("192.0.2.7"), "user": str("ops"), "version": str("1.1.0"), "short_name": str("notes")}),
 		"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@b"})})
-	if got := errorsOf(h.plan(a.NewState, noLine).Diagnostics); !strings.Contains(got, "vm.known_hosts_line is still needed") {
+	if got := errorsOf(h.plan(a.NewState, noLine).Diagnostics); !strings.Contains(got, "known_hosts_line is still needed") {
 		t.Errorf("dropping known_hosts_line: %s", got)
 	}
 	// A release change on a VM reporting no boot id is refused before it runs.
@@ -1030,10 +1039,10 @@ func TestVMUpgradeReadsTheOwnKey(t *testing.T) {
 		t.Fatalf("%s %s", d, vmAttr(t, h, a.NewState, "host_key_line"))
 	}
 	state := a.NewState
-	// Another host key while no own key is recorded: a read accepts state's vm.known_hosts_line
+	// Another host key while no own key is recorded: a read accepts state's known_hosts_line
 	// alone, which an apply that does not read saves; no import.
 	f.set("status", reply{exit: 255, stderr: "Host key verification failed."})
-	if got := errorsOf(h.read(state).Diagnostics); !strings.Contains(got, "state's vm.known_hosts_line alone") ||
+	if got := errorsOf(h.read(state).Diagnostics); !strings.Contains(got, "state's known_hosts_line alone") ||
 		!strings.Contains(got, "tofu apply -refresh=false`, which saves") || strings.Contains(got, "tofu import") {
 		t.Errorf("another key with no own key recorded: %q", got)
 	}
@@ -1054,7 +1063,7 @@ func TestVMUpgradeReadsTheOwnKey(t *testing.T) {
 	if d := errorsOf(up.Diagnostics); d != "" {
 		t.Fatal(d)
 	}
-	if vmAttr(t, h, up.NewState, "host_key_line") != ownLine || asString(t, h.attrs(up.NewState)["version"]) != "1.2.0" {
+	if vmAttr(t, h, up.NewState, "host_key_line") != ownLine || vmAttr(t, h, up.NewState, "version") != "1.2.0" {
 		t.Errorf("state %v", h.attrs(up.NewState))
 	}
 	// An upgrade that falls back keeps the key it read: the reads after the reboot need it.
@@ -1154,14 +1163,14 @@ func TestVMUpgradeNothing(t *testing.T) {
 	}
 }
 
-// TestVMShortNameChange: vm.short_name is first-install only: the VM's installer is its seed's.
+// TestVMShortNameChange: short_name is first-install only: the VM's installer is its seed's.
 func TestVMShortNameChange(t *testing.T) {
 	t.Parallel()
 	h, f := newVMHarness(t)
 	state := h.create(h.vmConfig("1.1.0", nil))
 	other := fill(h.typ, map[string]tftypes.Value{"vm": h.vmBlock("1.1.0", map[string]tftypes.Value{"short_name": str("nt")}),
 		"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@b"})})
-	if got := errorsOf(h.plan(state, other).Diagnostics); !strings.Contains(got, "vm.short_name is first-install only") {
+	if got := errorsOf(h.plan(state, other).Diagnostics); !strings.Contains(got, "short_name is first-install only") {
 		t.Errorf("got %s", got)
 	}
 	// Unknown at plan time (a replaced seed's): refused at apply, before anything runs.
@@ -1175,25 +1184,25 @@ func TestVMShortNameChange(t *testing.T) {
 	newShort := fill(h.typ, map[string]tftypes.Value{"vm": h.vmBlock("1.2.0", map[string]tftypes.Value{"short_name": str("nt")}),
 		"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@b"})})
 	a := h.apply(state, p.PlannedState, newShort)
-	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "vm.short_name is first-install only") || len(f.ops()) != 0 {
+	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "short_name is first-install only") || len(f.ops()) != 0 {
 		t.Errorf("at apply: %s ops %q", got, f.ops())
 	}
 	// An imported state's short name is its import ID's.
-	resp, _ := h.srv.ImportResourceState(context.Background(), &tfprotov6.ImportResourceStateRequest{TypeName: "stowage_install", ID: "vm:192.0.2.7/notes-stow"})
-	if got := errorsOf(h.plan(resp.ImportedResources[0].State, other).Diagnostics); !strings.Contains(got, "vm.short_name is first-install only") || !strings.Contains(got, "give vm.known_hosts_line the VM's own key") || !strings.Contains(got, "reboot the VM first") {
+	resp := h.importState("vm:192.0.2.7/notes-stow")
+	if got := errorsOf(h.plan(resp.ImportedResources[0].State, other).Diagnostics); !strings.Contains(got, "short_name is first-install only") || !strings.Contains(got, "give known_hosts_line the VM's own key") || !strings.Contains(got, "reboot the VM first") {
 		t.Errorf("an imported state: %s", got)
 	}
-	// The import route it names: a vm.channel in the configuration is no refusal there.
+	// The import route it names: a channel in the configuration is no refusal there.
 	withChannel := fill(h.typ, map[string]tftypes.Value{"vm": h.vmBlock("1.1.0", map[string]tftypes.Value{"channel": str("stable"), "known_hosts_line": str(ownLine)})})
 	if got := errorsOf(h.plan(resp.ImportedResources[0].State, withChannel).Diagnostics); got != "" {
-		t.Errorf("an imported state with vm.channel: %s", got)
+		t.Errorf("an imported state with channel: %s", got)
 	}
 	// Its first apply compares it with the channel the VM follows, before anything runs.
 	f.reset()
 	f.retired = true
 	beta := fill(h.typ, map[string]tftypes.Value{"vm": h.vmBlock("1.1.0", map[string]tftypes.Value{"channel": str("beta"), "known_hosts_line": str(ownLine)})})
 	imp := resp.ImportedResources[0].State
-	if got := errorsOf(h.apply(imp, h.plan(imp, beta).PlannedState, beta).Diagnostics); !strings.Contains(got, "vm.channel is not the VM's") || slices.Contains(f.ops(), "install") || slices.Contains(f.ops(), "hostkey") || slices.Contains(f.ops(), "retire") {
+	if got := errorsOf(h.apply(imp, h.plan(imp, beta).PlannedState, beta).Diagnostics); !strings.Contains(got, "channel is not the VM's") || slices.Contains(f.ops(), "install") || slices.Contains(f.ops(), "hostkey") || slices.Contains(f.ops(), "retire") {
 		t.Errorf("an imported state's wrong channel: %s %q", got, f.ops())
 	}
 	if a := h.apply(imp, h.plan(imp, withChannel).PlannedState, withChannel); errorsOf(a.Diagnostics) != "" {
@@ -1276,7 +1285,7 @@ func TestImportFirstApplyRecordsTheRegistryCA(t *testing.T) {
 			t.Fatalf("configure: %v %s", err, diagText(resp.Diagnostics))
 		}
 		f.retired = true
-		resp, _ := h.srv.ImportResourceState(context.Background(), &tfprotov6.ImportResourceStateRequest{TypeName: "stowage_install", ID: "vm:192.0.2.7/notes-stow"})
+		resp := h.importState("vm:192.0.2.7/notes-stow")
 		check(t, h, h.update(resp.ImportedResources[0].State, h.vmConfig("1.1.0", map[string]tftypes.Value{"vm": h.vmBlock("1.1.0", map[string]tftypes.Value{"known_hosts_line": str(ownLine)})})))
 	})
 }
@@ -1375,7 +1384,7 @@ func TestVMImportedSavesItsConnection(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			h, f := newVMHarness(t)
-			resp, _ := h.srv.ImportResourceState(context.Background(), &tfprotov6.ImportResourceStateRequest{TypeName: "stowage_install", ID: "vm:192.0.2.7/notes-stow"})
+			resp := h.importState("vm:192.0.2.7/notes-stow")
 			state := resp.ImportedResources[0].State
 			setup(f)
 			cfg := fill(h.typ, map[string]tftypes.Value{"vm": h.vmBlock("1.2.0", map[string]tftypes.Value{"port": num(2222)})})
@@ -1441,7 +1450,7 @@ func TestVMRetireRetry(t *testing.T) {
 }
 
 // TestVMNoUpgradeWithoutPlan: a VM that runs another release than state says (a refresh skipped)
-// is not upgraded by an apply whose plan does not change vm.version.
+// is not upgraded by an apply whose plan does not change version.
 func TestVMNoUpgradeWithoutPlan(t *testing.T) {
 	t.Parallel()
 	h, f := newVMHarness(t)
@@ -1452,8 +1461,12 @@ func TestVMNoUpgradeWithoutPlan(t *testing.T) {
 	f.set("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", "")}) // fell back since
 	f.set("describe", reply{stdout: vmDescribe})
 	a := h.update(state, h.vmConfig("1.2.0", map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "c@d"})}))
-	if d := errorsOf(a.Diagnostics); d != "" || slices.Contains(f.ops(), "upgrade") || asString(t, h.attrs(a.NewState)["version"]) != "1.1.0" {
-		t.Errorf("%s ops %q version %s", d, f.ops(), asString(t, h.attrs(a.NewState)["version"]))
+	if d := errorsOf(a.Diagnostics); d != "" || slices.Contains(f.ops(), "upgrade") {
+		t.Errorf("%s ops %q", d, f.ops())
+	}
+	// The next refresh shows the release it runs, which the next plan changes back.
+	if r := h.read(a.NewState); vmAttr(t, h, r.NewState, "version") != "1.1.0" {
+		t.Errorf("read: version %s", vmAttr(t, h, r.NewState, "version"))
 	}
 }
 
@@ -1674,11 +1687,11 @@ func TestApplyBreaches(t *testing.T) {
 	}
 	// The proposal OpenTofu makes: a computed attribute config leaves null takes prior's.
 	cfg := h.vmConfig("1.1.0", nil)
-	prop := h.proposedNew(h.value(state), cfg)
-	var pa, va map[string]tftypes.Value
+	o := h.outers["vm"]
+	prop := h.proposedNew(o.schema, h.out("vm", h.value(state)), h.out("vm", cfg))
+	var pa map[string]tftypes.Value
 	_ = prop.As(&pa)
-	_ = pa["vm"].As(&va)
-	if !pa["id"].Equal(str("vm:192.0.2.7/notes-stow")) || !va["host_key_line"].Equal(str(ownLine)) || !pa["inputs"].Equal(strMap(map[string]string{"ADMIN_EMAIL": "a@b"})) {
+	if !pa["id"].Equal(str("192.0.2.7/notes-stow")) || !pa["host_key_line"].Equal(str(ownLine)) || !pa["inputs"].Equal(strMap(map[string]string{"ADMIN_EMAIL": "a@b"})) {
 		t.Errorf("proposed %v", prop)
 	}
 }
@@ -1710,31 +1723,31 @@ func TestApplyRevalidates(t *testing.T) {
 	}
 }
 
-// TestVMCreateChannel: a create whose vm.channel is not the VM's is refused before the key is
+// TestVMCreateChannel: a create whose channel is not the VM's is refused before the key is
 // learnt, saving no state; a VM reporting no channel asks to leave it out.
 func TestVMCreateChannel(t *testing.T) {
 	t.Parallel()
 	h, f := newVMHarness(t)
 	cfg := fill(h.typ, map[string]tftypes.Value{"vm": h.vmBlock("1.1.0", map[string]tftypes.Value{"channel": str("beta")})})
 	a := h.apply(nil, h.plan(nil, cfg).PlannedState, cfg)
-	if got := errorsOf(a.Diagnostics); !strings.Contains(got, `Set vm.channel to "stable"`) || slices.Contains(f.ops(), "hostkey") || h.attrs(a.NewState) != nil {
+	if got := errorsOf(a.Diagnostics); !strings.Contains(got, `Set channel to "stable"`) || slices.Contains(f.ops(), "hostkey") || h.attrs(a.NewState) != nil {
 		t.Errorf("%s ops %q", got, f.ops())
 	}
 	ok := fill(h.typ, map[string]tftypes.Value{"vm": h.vmBlock("1.1.0", map[string]tftypes.Value{"channel": str("stable")})})
-	if s := h.create(ok); asString(t, h.attrs(s)["channel"]) != "stable" {
+	if s := h.create(ok); vmAttr(t, h, s, "channel") != "stable" {
 		t.Errorf("state %v", h.attrs(s))
 	}
 	h2, f2 := newVMHarness(t)
 	f2.set("status", reply{stdout: strings.Replace(vmStatusJSON("1.1.0", "boot-1", ""), `"channel":"stable",`, "", 1)})
 	a = h2.apply(nil, h2.plan(nil, cfg).PlannedState, cfg)
-	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "reports no channel") || !strings.Contains(got, "Leave vm.channel out") || slices.Contains(f2.ops(), "hostkey") || h2.attrs(a.NewState) != nil {
+	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "reports no channel") || !strings.Contains(got, "Leave channel out") || slices.Contains(f2.ops(), "hostkey") || h2.attrs(a.NewState) != nil {
 		t.Errorf("no channel: %s ops %q", got, f2.ops())
 	}
 	// The same on an imported state's first apply, before anything runs.
 	h3, f3 := newVMHarness(t)
 	f3.retired = true
 	f3.set("status", reply{stdout: strings.Replace(vmStatusJSON("1.1.0", "boot-1", ""), `"channel":"stable",`, "", 1)})
-	resp, _ := h3.srv.ImportResourceState(context.Background(), &tfprotov6.ImportResourceStateRequest{TypeName: "stowage_install", ID: "vm:192.0.2.7/notes-stow"})
+	resp := h3.importState("vm:192.0.2.7/notes-stow")
 	imp := resp.ImportedResources[0].State
 	icfg := fill(h3.typ, map[string]tftypes.Value{"vm": h3.vmBlock("1.1.0", map[string]tftypes.Value{"channel": str("beta"), "known_hosts_line": str(ownLine)})})
 	if got := errorsOf(h3.apply(imp, h3.plan(imp, icfg).PlannedState, icfg).Diagnostics); !strings.Contains(got, "reports no channel") || slices.Contains(f3.ops(), "hostkey") || slices.Contains(f3.ops(), "install") {
@@ -1782,7 +1795,7 @@ func TestVMRenamedInstaller(t *testing.T) {
 	// An import under a wrong name: its first apply's read says so, before any key or install.
 	h2, f2 := newVMHarness(t)
 	f2.retired = true
-	resp, _ := h2.srv.ImportResourceState(context.Background(), &tfprotov6.ImportResourceStateRequest{TypeName: "stowage_install", ID: "vm:192.0.2.7/notse-stow"})
+	resp := h2.importState("vm:192.0.2.7/notse-stow")
 	f2.set("status", reply{exit: 127, stderr: "sh: notse-stow: not found"})
 	f2.set("probe", reply{exit: 1})
 	cfg := fill(h2.typ, map[string]tftypes.Value{"vm": h2.vmBlock("1.1.0", map[string]tftypes.Value{"short_name": str("notse"), "known_hosts_line": str(ownLine)})})
@@ -1843,7 +1856,7 @@ func TestMergeComputed(t *testing.T) {
 }
 
 // TestVMFirstBootMissingCtl: a status that fails in the first-boot wait because the installer is
-// missing stops the wait at once, as the vm.short_name error.
+// missing stops the wait at once, as the short_name error.
 func TestVMFirstBootMissingCtl(t *testing.T) {
 	t.Parallel()
 	h, f := newVMHarness(t)
@@ -1908,7 +1921,7 @@ func TestVMRetireProofCut(t *testing.T) {
 	}
 }
 
-// A retry of the retirement compares the VM's key with state's by the key alone (a vm.host
+// A retry of the retirement compares the VM's key with state's by the key alone (a host
 // changed in place is the same key); a VM serving another key is an error that stops the update,
 // as neither key state accepts is served any more.
 func TestVMRetireRetryComparesTheKey(t *testing.T) {
@@ -1979,7 +1992,7 @@ func TestVMUpgradeNothingStopsOnAnotherKey(t *testing.T) {
 	f.set("upgrade", reply{stdout: `{"format":1,"result":"nothing","release":{"version":"1.2.0","revision":1}}`})
 	f.set("retire", reply{stdout: `{"format":1,"public_key":"ssh-ed25519 ` + edKey + `","known_hosts_line":"notes ssh-ed25519 ` + edKey + `","retired":true,"fingerprint":"SHA256:x"}`})
 	up := h.update(a.NewState, h.vmConfig("1.2.0", nil))
-	if got := errorsOf(up.Diagnostics); !strings.Contains(got, "The VM's own host key changed") || !strings.Contains(got, "vm:<host>/<short>-stow") || len(f.callsOf("install")) != 0 {
+	if got := errorsOf(up.Diagnostics); !strings.Contains(got, "The VM's own host key changed") || !strings.Contains(got, "as <host>/<short>-stow") || len(f.callsOf("install")) != 0 {
 		t.Fatalf("got %q, calls %q", got, f.ops())
 	}
 }
@@ -1997,7 +2010,7 @@ func TestSameKeyAndAMalformedStateLine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.retire(context.Background(), &m, v, "192.0.2.7", types.StringValue("not a line")); err == nil || !strings.Contains(err.Error(), "state's vm.host_key_line") || errors.Is(err, errOtherKey) {
+	if _, err := r.retire(context.Background(), &m, v, "192.0.2.7", types.StringValue("not a line")); err == nil || !strings.Contains(err.Error(), "state's host_key_line") || errors.Is(err, errOtherKey) {
 		t.Fatalf("%v", err)
 	}
 }
@@ -2063,7 +2076,7 @@ func TestVMImportedTakeOverComparesTheRecordedValues(t *testing.T) {
 		h, f := newVMHarness(t)
 		f.retired = true
 		f.set("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", `,"values":{"inputs":{"ADMIN_EMAIL":"a@b"},"tls":"none"}`)})
-		resp, _ := h.srv.ImportResourceState(context.Background(), &tfprotov6.ImportResourceStateRequest{TypeName: "stowage_install", ID: "vm:192.0.2.7/notes-stow"})
+		resp := h.importState("vm:192.0.2.7/notes-stow")
 		cfg := fill(h.typ, map[string]tftypes.Value{"vm": h.vmBlock("1.1.0", map[string]tftypes.Value{"known_hosts_line": str(ownLine)}),
 			"inputs": strMap(map[string]string{"ADMIN_EMAIL": c.email})})
 		a := h.update(resp.ImportedResources[0].State, cfg)
@@ -2089,7 +2102,7 @@ func TestVMImportedRollbackIsRefused(t *testing.T) {
 	h, f := newVMHarness(t)
 	f.retired = true
 	f.set("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", `,"previous":{"version":"1.0.0","revision":1},"values":{"inputs":{"ADMIN_EMAIL":"a@b"},"tls":"none"}`)})
-	resp, _ := h.srv.ImportResourceState(context.Background(), &tfprotov6.ImportResourceStateRequest{TypeName: "stowage_install", ID: "vm:192.0.2.7/notes-stow"})
+	resp := h.importState("vm:192.0.2.7/notes-stow")
 	cfg := fill(h.typ, map[string]tftypes.Value{"vm": h.vmBlock("1.0.0", map[string]tftypes.Value{"known_hosts_line": str(ownLine)}), "allow_rollback": boolean(true),
 		"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@b"})})
 	if got := errorsOf(h.update(resp.ImportedResources[0].State, cfg).Diagnostics); !strings.Contains(got, "a rollback of an imported install") || len(f.callsOf("rollback")) != 0 {
@@ -2103,7 +2116,7 @@ func TestVMImportedPlanReportsTheTakeOver(t *testing.T) {
 	h, f := newVMHarness(t)
 	f.retired = true
 	f.set("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", `,"values":{"inputs":{"ADMIN_EMAIL":"a@b"},"tls":"none"}`)})
-	resp, _ := h.srv.ImportResourceState(context.Background(), &tfprotov6.ImportResourceStateRequest{TypeName: "stowage_install", ID: "vm:192.0.2.7/notes-stow"})
+	resp := h.importState("vm:192.0.2.7/notes-stow")
 	cfg := fill(h.typ, map[string]tftypes.Value{"vm": h.vmBlock("1.1.0", map[string]tftypes.Value{"known_hosts_line": str(ownLine)}), "plan_dry_run": boolean(true),
 		"inputs": strMap(map[string]string{"ADMIN_EMAIL": "c@d"})})
 	p := h.plan(resp.ImportedResources[0].State, cfg)

@@ -1,12 +1,13 @@
 # Quick start: a Stowage product on a Kubernetes cluster. The installer runs on this machine
-# (linux/amd64, with docker, helm >= 3.14 and kubectl), against the cluster the provider's
+# (its installer image's entry for this machine's platform, read from the registry: no Docker;
+# helm >= 3.14 and kubectl on PATH), against the cluster the provider's
 # kubernetes block reaches. `make install-local` in the provider's checkout first, then `tofu init`.
 terraform {
   required_version = ">= 1.11.0"
   required_providers {
     stowage = {
       source  = "norvexlabs/stowage"
-      version = "~> 0.1"
+      version = "~> 0.3"
     }
   }
 }
@@ -18,15 +19,12 @@ provider "stowage" {
   }
 }
 
-resource "stowage_install" "app" {
+resource "stowage_kubernetes_install" "app" {
   installer = var.installer
   inputs    = { ADMIN_EMAIL = var.admin_email }
-
-  kubernetes {
-    namespace = "app"
-  }
+  namespace = "app"
 }
 
 output "status" {
-  value = stowage_install.app.status
+  value = stowage_kubernetes_install.app.status
 }

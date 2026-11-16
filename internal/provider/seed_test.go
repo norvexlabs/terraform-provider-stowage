@@ -296,3 +296,50 @@ func TestSeedNICs(t *testing.T) {
 		t.Errorf("a role twice: %q", d)
 	}
 }
+
+// The seed keeps its installer for this machine (ctl_path, outside the run's directory), the size
+// and firewall its release takes; a refresh writes ctl_path again when it is gone.
+func TestSeedCtlPathSizeFirewall(t *testing.T) {
+	t.Parallel()
+	s := newSeedHarness(t, nil)
+	full := strings.Replace(seedJSON, `"await_secrets":true}`, `"await_secrets":true,"await_given":["SMTP_PASSWORD"],"size":{"cpus":{"min":1,"recommended":2},"memory_mib":{"min":1024,"recommended":4096},"app_gib":{"min":4,"recommended":20}},`+
+		`"firewall":{"ssh_sources":["0.0.0.0/0"],"open_ports":[{"protocol":"tcp","port":443,"sources":["0.0.0.0/0","::/0"]}]}}`, 1)
+	s.fake.set("install", reply{stdout: full})
+	a := s.create(s.config(nil))
+	if d := errorsOf(a.Diagnostics); d != "" {
+		t.Fatal(d)
+	}
+	at := s.attrs(a.NewState)
+	ctl := asString(t, at["ctl_path"])
+	if ctl != s.fake.programs+"/notes-stow" {
+		t.Fatalf("ctl_path %q", ctl)
+	}
+	var size, cpus map[string]tftypes.Value
+	_ = at["size"].As(&size)
+	_ = size["cpus"].As(&cpus)
+	var fw map[string]tftypes.Value
+	_ = at["firewall"].As(&fw)
+	var ports []tftypes.Value
+	_ = fw["open_ports"].As(&ports)
+	var given []tftypes.Value
+	_ = at["await_given"].As(&given)
+	if !cpus["recommended"].Equal(num(2)) || len(ports) != 1 || len(given) != 1 {
+		t.Fatalf("size %v firewall %v await_given %v", size, fw, given)
+	}
+	// Gone from the cache: a read fetches it again (the fake answers at the same path).
+	s.fake.reset()
+	r, err := s.srv.ReadResource(context.Background(), &tfprotov6.ReadResourceRequest{TypeName: "stowage_vm_seed", CurrentState: a.NewState})
+	if err != nil || errorsOf(r.Diagnostics) != "" || !slices.Equal(s.fake.ops(), []string{"fetch"}) || asString(t, s.attrs(r.NewState)["ctl_path"]) != ctl {
+		t.Fatalf("read %v %s %q", err, diagText(r.Diagnostics), s.fake.ops())
+	}
+	writeTestFile(t, ctl, "exe")
+	s.fake.reset()
+	if _, err := s.srv.ReadResource(context.Background(), &tfprotov6.ReadResourceRequest{TypeName: "stowage_vm_seed", CurrentState: a.NewState}); err != nil || len(s.fake.calls) != 0 {
+		t.Fatalf("a program there is fetched again: %q", s.fake.ops())
+	}
+	// A size that is no size is refused as the machine interface's breach.
+	s.fake.set("install", reply{stdout: strings.Replace(full, `"cpus":{"min":1,"recommended":2}`, `"cpus":{"min":3,"recommended":2}`, 1)})
+	if got := errorsOf(s.create(s.config(nil)).Diagnostics); !strings.Contains(got, "size.cpus") {
+		t.Fatalf("a bad size: %q", got)
+	}
+}

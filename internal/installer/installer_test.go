@@ -669,3 +669,66 @@ func TestResolveScriptHomeGuards(t *testing.T) {
 		t.Fatalf("cleaned: %q %v", got, err)
 	}
 }
+
+// KeptPayloadScript runs for real under sh: it prints the kept installer's payload tar alone, the
+// one *-stow under another short name included, and refuses a file without a payload's trailer,
+// a length over 16 MiB (one at 16 MiB passes the bound) and a missing install directory.
+func TestKeptPayloadUnderSh(t *testing.T) {
+	t.Parallel()
+	needSh(t)
+	work := t.TempDir()
+	d := Docker{Runner: envRunner{t.TempDir()}, WorkDir: work, Name: "notes", Short: "nt"}
+	ctx := context.Background()
+	if _, err := d.KeptPayload(ctx); err == nil || !strings.Contains(err.Error(), "no install directory") {
+		t.Fatalf("no directory: %v", err)
+	}
+	var tb bytes.Buffer
+	tw := tar.NewWriter(&tb)
+	_ = tw.WriteHeader(&tar.Header{Name: "keys/release.pub", Mode: 0o644, Size: 3, Typeflag: tar.TypeReg})
+	_, _ = tw.Write([]byte("KEY"))
+	_ = tw.Close()
+	payload := tb.Bytes()
+	installerFile := func(length uint64, magic string) []byte {
+		b := append([]byte("\x7fELF the program's bytes\n"), payload...)
+		n := make([]byte, 8)
+		for i := range 8 {
+			n[7-i] = byte(length >> (8 * i))
+		}
+		return append(append(b, n...), magic...)
+	}
+	write := func(name string, b []byte) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Join(work, "notes"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(work, "notes", name), b, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("nt-stow", installerFile(uint64(len(payload)), "STOWAGE-PAYLOAD1"))
+	if got, err := d.KeptPayload(ctx); err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("payload: %d bytes, %v", len(got), err)
+	}
+	if err := os.Rename(filepath.Join(work, "notes", "nt-stow"), filepath.Join(work, "notes", "renamed-stow")); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := d.KeptPayload(ctx); err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("under another short name: %d bytes, %v", len(got), err)
+	}
+	write("renamed-stow", installerFile(uint64(len(payload)), "STOWAGE-PAYLOAD2"))
+	if _, err := d.KeptPayload(ctx); err == nil || !strings.Contains(err.Error(), "carries no release (no payload)") {
+		t.Fatalf("no trailer: %v", err)
+	}
+	write("renamed-stow", installerFile(16<<20+1, "STOWAGE-PAYLOAD1"))
+	if _, err := d.KeptPayload(ctx); err == nil || !strings.Contains(err.Error(), "over 16 MiB") {
+		t.Fatalf("over the bound: %v", err)
+	}
+	write("renamed-stow", installerFile(16<<20, "STOWAGE-PAYLOAD1"))
+	if _, err := d.KeptPayload(ctx); err != nil {
+		t.Fatalf("at the bound: %v", err)
+	}
+	write("renamed-stow", installerFile(1<<63+5, "STOWAGE-PAYLOAD1"))
+	if _, err := d.KeptPayload(ctx); err == nil || !strings.Contains(err.Error(), "over 16 MiB") {
+		t.Fatalf("a length past the shell's arithmetic: %v", err)
+	}
+}

@@ -25,6 +25,8 @@ Docker is the only requirement.
 | `make acc-k8s` | the Kubernetes target through tofu on a kind cluster, against a real Stowage, in a container; prints PASS |
 | `make acc-vm` | the VM target and `stowage_vm_seed` on a real TrueNAS VM (`STOWAGE_VM_ENV=<file>`), in the same container; prints PASS |
 | `make acc-vm-names` | the names of the variables STOWAGE_VM_ENV gives that container (never a value); runs nothing |
+| `make acc-libvirt` | `examples/guides/libvirt-vm`'s domain against libvirtd and QEMU in a container (`test/libvirtd`), in the runner; prints PASS |
+| `make examples-test` | `tofu validate` and `tofu test` (every run at `command = plan`, mocked providers) of each root of `examples/guides/` (a cloud's `image/` root too) and `examples/quickstart/` (`test/examples.sh`: a copy of each root, this build from a filesystem mirror as norvexlabs/stowage 0.3.0, the other providers from the registry at their pins; network access); prints PASS |
 
 **`make acc-docker`** (`STOWAGE_REPO=<a Stowage checkout ≥ 0.38.0, its ./bin/stowage built>`, default `~/stowage`)
 runs `test/acc-docker.sh`, the Docker target's acceptance test against a real installer through
@@ -57,9 +59,10 @@ as 1.0.0, 2.0.0 and 3.0.0, and walks create (the secret input in the release's S
 of the root), a plan with no change, a changed input, the upgrades to 2.0.0 and 3.0.0, a plan with
 no change, 1.0.0's installer refused by the installer (state kept), the rollback to 2.0.0 (refused
 first without `allow_rollback`), the state forgotten and the release imported
-(`kubernetes:<namespace>/<release>`) with its first apply and a plan with no change, a destroy
+(`<namespace>/<release>`) with its first apply and a plan with no change, a destroy
 refused by `deletion_protection` (the release kept) and destroy, checking the cluster at each step
-and that no run leaves its private directory. It needs Docker, network access and a linux/amd64
+and that no run leaves its private directory. tofu runs with a `docker` on its `PATH` that fails:
+the provider reads the installer from the registry and runs it natively. It needs Docker, network access and a linux/amd64
 host; `PROVIDER_BIN` runs another provider binary.
 
 `make acc-vm` (`STOWAGE_VM_ENV=<file>`, the file Stowage's VM suites read, given at run time and
@@ -71,16 +74,17 @@ changes by name alone (`docker run -e NAME`, each value taken from its environme
 command line, in a file or printed); `make acc-vm-names` prints those names and runs nothing. The
 directory of the SSH key it names (`DEV_VM_SSH_KEY`, its `.pub` beside it) is mounted read-only
 at its own path; in the runner, `STOWAGE_VM_ENV_RESOLVED=1` tells `test/acc-vm.sh` to take the
-environment as it is. It ships
-`examples/minimal` with its kairos shape and a secret input, carries it to a TLS mirror, and walks
-`examples/resources/stowage_vm_seed`'s root: the seed (its disk written by `disk_dir`, its ISO by
-xorriso), Stowage's TrueNAS module, the first install over SSH under the one-time key, the VM's own
-key and the one-time key's retirement, a plan with no change, a re-run, an upgrade and its reboot,
-the rollback (refused first without `allow_rollback`), the install forgotten and imported
-(`vm:<host>/<short>-stow`) with its first apply under the VM's own key and a plan with no change,
-a destroy of the install refused by `deletion_protection`, and the destroy; it prints `PASS` (it
-did against Stowage 0.35.0 before the import and the refused destroy were added; those two are not
-run yet, [TODO.md](TODO.md)). The host
+environment as it is. It ships `examples/minimal` with its kairos shape and a secret input, carries
+it to a TLS mirror that asks for a sign-in, and applies `examples/guides/truenas-vm` (a copy, its
+variables in `terraform.tfvars.json`, the VM's registry login and the provider's mirror login
+added), tofu's `PATH` holding a `docker` that fails: the seed (the installer read from the registry
+for this machine, `ctl_path`; its disk written by `disk_dir`, its ISO by xorriso), `truenas/truenas`
+making the VM with Stowage's `vm truenas` steps, the first install over SSH under the one-time key
+with its registry login and secret input, the VM's own key and the one-time key's retirement, a
+plan with no change, a re-run, an upgrade and its reboot, the rollback (refused first without
+`allow_rollback`), the install forgotten and imported (`<host>/<short>-stow`) with its first apply
+under the VM's own key and a plan with no change, a destroy of the install refused by
+`deletion_protection`, and the destroy (the stop step first); it prints `PASS`. The host
 needs Docker, network access to TrueNAS and a linux/amd64 machine; every other tool is the
 runner's.
 
@@ -158,16 +162,18 @@ echo "verified" || echo "NOT VERIFIED: the step that failed said why, above" >&2
 | Path | |
 |---|---|
 | `main.go` | the plugin server |
-| `internal/provider` | provider configuration, `stowage_install` (Docker, Kubernetes, VM) and `stowage_vm_seed` |
+| `internal/provider` | provider configuration; the install model (`install_*.go`, `vm_resource.go`, `k8s_resource.go`) and its three resource types, views of it (`split.go`); `stowage_vm_seed`; the data sources |
+| `internal/fetch` | an installer image read from its registry for a platform, checked against the key sets a caller trusts (sigstore bundles) before its layer is streamed to a file, and the keys a release carries, with no Docker |
 | `internal/installer` | the machine interface's documents, exit mapping, the targets' scripts |
 | `internal/testutil` | the tests' shared helpers |
 | `internal/target` | `Runner`: this machine, or the system `ssh` with a pinned host key |
-| `examples/` | provider and resource examples (read by tfplugindocs) |
+| `examples/` | provider and resource examples (read by tfplugindocs); `examples/guides/` a complete root per platform, the Docker and Kubernetes roots (`make examples-test`) |
 | `.goreleaser.yml`, `terraform-registry-manifest.json` | the release's zips, checksums, signature and registry manifest |
 | `.github/workflows/` | `ci.yml` (check and build), `release.yml` (a pushed tag's release) |
 | `.githooks/` | the commit identity, push and private-words guards (`make hooks`) |
 | `test/hooks.sh` | the hooks' test |
-| `test/acc-docker.sh`, `test/acc-k8s.sh`, `test/acc-vm.sh` | the targets' acceptance tests (`make acc-docker`, `acc-k8s`, `acc-vm`); `test/acc.Dockerfile` their runner, `test/acc-vm-run.sh` acc-vm's launcher |
+| `test/acc-docker.sh`, `test/acc-k8s.sh`, `test/acc-vm.sh`, `test/acc-libvirt.sh` | the acceptance tests (`make acc-docker`, `acc-k8s`, `acc-vm`, `acc-libvirt`); `test/acc.Dockerfile` their runner, `test/acc-vm-run.sh` acc-vm's launcher, `test/libvirtd/` the libvirtd container acc-libvirt applies against |
+| `test/examples.sh` | the example roots' `tofu validate` and `tofu test` (`make examples-test`) |
 | `test/tofu.sh`, `test/schema.sh` | the pinned OpenTofu; the provider's schema by it (`make docs`) |
 | `keys/` | the release key's public half |
 | `docs/` | the reference documentation `make docs` generates; `docs/img/` the logo, mark, icons and the repository's social preview |

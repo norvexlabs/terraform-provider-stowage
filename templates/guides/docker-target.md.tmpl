@@ -2,7 +2,7 @@
 page_title: "The Docker target - stowage"
 subcategory: "Guides"
 description: |-
-  What each operation of stowage_install runs on a Docker host, and how SSH reaches it.
+  What each operation of stowage_docker_install runs on a Docker host, and how SSH reaches it.
 ---
 
 # The Docker target
@@ -17,7 +17,12 @@ environment sets it is refused, a key of `given_wo`'s `inputs` included (`<KEY> 
 environment`). The scripts' own variables are named `__stowage_*`, so an exported variable of
 another name reaches the installer unchanged. Over ssh no environment is carried.
 
-- **Create**: `docker run --rm <installer> > <work_dir>/<name>.sh` (written through a temporary
+- **Create**: with the provider's `public_keys`, the installer is first checked on the machine
+  running OpenTofu ([trust](trust.md)): every platform's image of its index signed by one of them,
+  and its release carrying keys of its own, read from the registry with no layer stored; one that
+  is not is an error before the target fetches anything (`Checking the installer's signature`).
+  Without them, the digest alone is trusted (a plan warning says so). Then
+  `docker run --rm <installer> > <work_dir>/<name>.sh` (written through a temporary
   file, so a failed fetch leaves no half script), the bootstrap script's `describe --json` (its
   `format` checked, its `name` compared, its shapes must include `docker` when it lists any, its
   `short_name` recorded); with `work_dir` left out, the home resolved (`$HOME`, or `cd` there and `pwd -L`, as the `work_dir` row says; a
@@ -27,16 +32,22 @@ another name reaches the installer unchanged. Over ssh no environment is carried
   an install of the project already
   there (a create that failed or timed out after the install began, or an install a destroy
   kept with its data) is a warning (`An install is already there`), and the install below runs
-  without `--secrets` and without those of `--address`, `--registry` and `--registry-ca` that
-  `describe` lists in `first_install_only`, which the installer's re-run refuses: the install
+  without `--secrets`, without `--kit` and `--kit-code-file` once an install exists (with them
+  while nothing is installed yet: a first install left unfinished, which the re-run finishes,
+  and which the installer's re-run takes `--kit` for; the warning names the kit only when
+  `kit_file` is given), and without those of `--address`,
+  `--registry` and `--registry-ca` that `describe` lists in `first_install_only`, which the
+  installer's re-run refuses: the install
   keeps the ones it recorded, which must be the configuration's — an `address` given, the
   provider's `registry` or `registry_ca` (by digest) other than the ones its `status --json`
   reports is an error before anything runs (`The install there was made otherwise`, naming each);
   another release's install there is the installer's to refuse
   (its re-run runs the release it carries alone, exit 3). Then
   `sh <name>.sh --no-input --json --dir ./<name> [--set K=V]… [--tls] [--domains] [--ports]
-  [--address] [--registry]`, with `--answers`, `--given`, `--secrets` and `--registry-ca` files
-  sent on standard input as a tar into a private (0700) temporary directory removed afterwards;
+  [--address] [--registry] [--acme-ca URL]`, with `--answers`, `--given`, `--secrets`,
+  `--registry-ca`, `--acme-ca-root` (`acme_ca_root`), `--registry-login-file`
+  (`registry_login_wo`) and `--kit` with `--kit-code-file` (`kit_file`, `kit_code_wo`) files sent on
+  standard input as a tar into a private (0700) temporary directory removed afterwards;
   then `status --json`, read again every 10 seconds while it reports `installing` (the first
   install not finished) until it no longer does, within the create timeout. A failed or refused
   create, an `install_failed` and a timeout save no state: applying again runs the installer
@@ -47,7 +58,11 @@ another name reaches the installer unchanged. Over ssh no environment is carried
   one `*-stow` executable there; none or two is an error. A `short_name` in state that is not one
   path element is an error naming the re-import. It runs with `--dir ./<name>` after its arguments
   (not `describe`), and with files on standard input as the install does.
-- **Read**: the kept installer's `status --json`. A missing install directory removes the
+- **Read**: the kept installer's `status --json --values` (the values read back: a login the
+  install no longer holds — `pull_login` false — takes `registry_login_wo_version` out of state,
+  and in the `acme` and `dns-cloudflare` modes `acme_ca` and `acme_ca_root`, its digest, are read,
+  so the next plan gives what changed again; an installer before Stowage 0.38.0 is read without
+  `--values`). A missing install directory removes the
   resource from state (the script exits 100 with `stowage-provider: no install directory` as
   the last line of stderr, after an SSH banner, and nothing on stdout; any other exit 100 is a
   failure), and so does the installer's refusal saying `absent`. What the first install recorded
@@ -68,9 +83,9 @@ another name reaches the installer unchanged. Over ssh no environment is carried
   failures` past its MaxAuthTries or `…:14: No supported authentication methods available`, `from
   <host>: 2: …` before OpenSSH 7.3) — `ssh's login to the Docker host <host> was
   refused` (a fix outside the configuration — the agent's keys, ssh_config's IdentityFile
-  entries, the keys the host accepts or its MaxAuthTries: plan again; a fix of `docker.user` or `docker.private_key_file`: `tofu apply -refresh=false`, which
+  entries, the keys the host accepts or its MaxAuthTries: plan again; a fix of `user` or `private_key_file`: `tofu apply -refresh=false`, which
   saves a change of the connection alone without running anything on the target, then plan); `Host key verification failed` or a changed identification — `The Docker host <host>
-  serves another host key` (the new key, checked on its console, in `docker.known_hosts_line`, then
+  serves another host key` (the new key, checked on its console, in `known_hosts_line`, then
   `tofu apply -refresh=false` the same way); anything else, a program's own `Permission denied
   (os error 13)` included — `Cannot reach the Docker host <host> to read the install` (plan again once it
   answers). Each detail ends on the ways common to all: only once the host is known to be gone,
@@ -89,16 +104,42 @@ another name reaches the installer unchanged. Over ssh no environment is carried
      anything runs (`The install was made otherwise`) — an imported state's first apply, or a
      setting the plan could not tell.
   2. The release to reach: none when `installed.installer` is the desired `installer`; `rollback`
-     when it is `previous.installer` (with `allow_rollback`); else the new installer is fetched
+     when it is `previous.installer` (with `allow_rollback`); else the new installer is checked
+     ([trust](trust.md)) against the keys of the release installed — those its installer
+     carries, the image `status --json` records as `installed.installer` (else state's
+     `installer`), read from the registry on the machine running OpenTofu (kept in the provider's
+     cache by its digest, `keys.json`); when the registry cannot give them, those of the
+     installer the install keeps on the target, `<dir>/<short>-stow`'s payload (`keys/`), read
+     over the connection (`tail -c` of the file's trailer and payload; a warning, `The keys of the
+     release installed were read on the target`). Neither readable, without the provider's
+     `public_keys`, is an error naming both and the fixes (that registry reachable, the kept
+     installer put back, or `public_keys` set), before anything is fetched or run on the target —
+     the plan's dry run makes no plan directory either (`The keys of the release installed cannot
+     be read`); with `public_keys`, a warning of the same summary, and the new installer is checked
+     against `public_keys` alone — and the provider's `public_keys` when given: every
+     platform's image of its index signed by one key of each, its release carrying keys; an
+     installer that is not is an error before the target fetches it (`Checking the installer's
+     signature`). A release installed that carries no key, read from either source, asks
+     nothing, said in a warning (`The release installed carries no key`: the upgrade is checked by
+     the provider's `public_keys` alone, or by its digest alone without them). When neither the
+     install nor state names the installer installed, an upgrade is refused (`The keys of the
+     release installed cannot be told`, naming the kept installer's `upgrade --version V`, which
+     checks it): without `public_keys` before anything is fetched or run on the target (nothing
+     would check the new installer, so not even the same release is taken over); with them, the
+     new one is read under `public_keys` alone, the same release taken over. Then it is fetched
      (`<name>.sh` written again, as at create) and described — another project, or no `docker`
      shape, is an error — and when it carries the release installed (the same `version` and
      `revision`) there is nothing to upgrade — an error when the install records another digest of
      its installer (`installer is another digest of the release installed`, naming the one to set:
      Read would put it back at every refresh) — else its `upgrade` runs (the installer refuses an
-     older release: exit 3, the diagnostic).
+     older release: exit 3, the diagnostic). What the read of the keys says otherwise (its
+     warnings, and the refusal of keys that cannot be told) comes after that: the same release
+     stays, or its other digest is refused, first.
   3. The **re-run** of the running release, when there is anything to give it: `<short>-stow
-     --no-input --json [--set K=V]… [--tls] [--domains] [--ports] --dir ./<name>`, the secret
-     inputs as `--answers` on standard input. It takes each input of `inputs` changed or added
+     --no-input --json [--set K=V]… [--tls] [--domains] [--ports] [--acme-ca URL|none]
+     [--acme-ca-root none] --dir ./<name>`, the secret inputs as `--answers`, a changed
+     `acme_ca_root` as `--acme-ca-root` and, when `registry_login_wo_version` changed,
+     `registry_login_wo` as `--registry-login-file`, on standard input. It takes each input of `inputs` changed or added
      that the running release declares (every one without an upgrade), each input taken out that
      the running release declares (`--set KEY=`; with an upgrade, only one the new release still
      declares: the upgrade drops the others), the secret
@@ -118,7 +159,7 @@ another name reaches the installer unchanged. Over ssh no environment is carried
      so the next plan shows the release change alone.
   5. `status --json` fills the computed attributes; one that cannot be read keeps state's, with
      the error.
-- **Import**: `tofu import stowage_install.x '[<host>:]<work_dir>/<name>/<short>-stow'`, the
+- **Import**: `tofu import stowage_docker_install.x '[<host>:]<work_dir>/<name>/<short>-stow'`, the
   installer the install keeps (`ls <work_dir>/<name>/*-stow`), `<work_dir>` an absolute, clean
   path, or left out (`<name>/<short>-stow`, or `./<name>/…`) for the SSH user's home (another
   relative one is refused); a host is what comes before the
@@ -136,7 +177,7 @@ another name reaches the installer unchanged. Over ssh no environment is carried
 
 The system `ssh` runs with `BatchMode=yes`, `StrictHostKeyChecking=yes`, a private 0600
 `known_hosts` file (in a 0700 temporary directory, removed after the run) holding the given key
-(on a VM, the keys it may serve: see `vm.seed_boot_id`) under `HostKeyAlias=stowage-target`, `GlobalKnownHostsFile=/dev/null`, `KnownHostsCommand=none`,
+(on a VM, the keys it may serve: see `seed_boot_id`) under `HostKeyAlias=stowage-target`, `GlobalKnownHostsFile=/dev/null`, `KnownHostsCommand=none`,
 `CheckHostIP=no`, `UpdateHostKeys=no`, `VerifyHostKeyDNS=no` (no SSHFP record trusted),
 `ControlMaster=no` and `ControlPath=none` (no connection another ssh opened is reused),
 `ConnectTimeout=30`, and with a key file `IdentitiesOnly=yes`. The user's `~/.ssh/config` still

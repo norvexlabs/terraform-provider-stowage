@@ -30,7 +30,7 @@ var K8sScript = runScript(true, true)
 
 // ToolsScript says which of the programs a Kubernetes run needs on the machine running OpenTofu
 // are missing from PATH: one line each on standard output, exit 0 either way.
-const ToolsScript = `for t in docker helm kubectl; do command -v "$t" >/dev/null 2>&1 || echo "$t"; done`
+const ToolsScript = `for t in helm kubectl; do command -v "$t" >/dev/null 2>&1 || echo "$t"; done`
 
 // HelmEnv are the environment variables helm reads its cluster and namespace from, over the
 // kubeconfig: unset for every Kubernetes run, so helm and kubectl reach the same cluster.
@@ -78,18 +78,26 @@ type K8s struct {
 	// Values, when set, is a chart values file (YAML) every run applying the chart gives helm
 	// after the installer's own (`--values`): install, upgrade and its re-run, never a rollback.
 	Values string
+	// RegistryLogin, when set, is the release's own registry login (a Docker config) the runs
+	// applying the chart give (`--registry-login-file`): its pull Secret written from it.
+	RegistryLogin string
 }
 
 // chart is files with the chart values file Values, when set: a run applying the chart.
 func (k K8s) chart(files map[string]string) map[string]string {
-	if k.Values == "" {
+	if k.Values == "" && k.RegistryLogin == "" {
 		return files
 	}
 	out := maps.Clone(files)
 	if out == nil {
 		out = map[string]string{}
 	}
-	out["values"] = k.Values
+	if k.Values != "" {
+		out["values"] = k.Values
+	}
+	if k.RegistryLogin != "" {
+		out["registry-login-file"] = k.RegistryLogin
+	}
 	return out
 }
 
@@ -165,10 +173,10 @@ func GivenKeys(given string) []string {
 func (k K8s) Missing(ctx context.Context) ([]string, error) {
 	stdout, stderr, exit, err := k.Runner.Run(ctx, []string{"sh", "-c", ToolsScript}, nil)
 	if err != nil {
-		return nil, fmt.Errorf("looking for docker, helm and kubectl: %w", err)
+		return nil, fmt.Errorf("looking for helm and kubectl: %w", err)
 	}
 	if exit != 0 {
-		return nil, &FailedError{Verb: "looking for docker, helm and kubectl", Exit: exit, Stderr: tail(stderr)}
+		return nil, &FailedError{Verb: "looking for helm and kubectl", Exit: exit, Stderr: tail(stderr)}
 	}
 	return slices.Sorted(slices.Values(strings.Fields(string(stdout)))), nil
 }
@@ -204,9 +212,10 @@ func (k K8s) runLogin(ctx context.Context, login *Login, files map[string]string
 }
 
 // pull is the install's or upgrade's `--image-pull-login` and the login it runs with, when
-// PullLogin asks for it.
+// PullLogin asks for it (never with RegistryLogin, the release's own login, which the installer
+// takes in its place).
 func (k K8s) pull(args []string) ([]string, *Login) {
-	if k.PullLogin == nil {
+	if k.PullLogin == nil || k.RegistryLogin != "" {
 		return args, nil
 	}
 	return append(args, "--image-pull-login"), k.PullLogin
@@ -271,7 +280,7 @@ func (k K8s) StatusOf(ctx context.Context, values bool) (*Status, error) {
 // k8sChange is c as an install's or an upgrade's flags: inputs by --set, secret inputs by an
 // answers file. The front's settings are Docker's and the VM's: Kubernetes takes none.
 func k8sChange(c Change) ([]string, map[string]string, error) {
-	if c.TLS != "" || len(c.Domains) > 0 || len(c.Ports) > 0 {
+	if c.TLS != "" || len(c.Domains) > 0 || len(c.Ports) > 0 || c.AcmeCA != "" || c.AcmeCARoot != "" {
 		return nil, nil, errors.New("tls, domains and ports are the front's, which Kubernetes does not run: the chart's ingress owns them")
 	}
 	return changeArgs(c)
@@ -282,8 +291,17 @@ func (k K8s) Install(ctx context.Context, in Install) (*Result, error) {
 	if in.Address != "" || in.Secrets != "" {
 		return nil, errors.New("address and secrets_wo are not Kubernetes's: the release keeps its secrets in the cluster")
 	}
+	if in.AcmeCA != "" || in.AcmeCARoot != "" {
+		return nil, errors.New("acme_ca and acme_ca_root are the front's, which Kubernetes does not run")
+	}
+	if in.RegistryLogin != "" && in.RegistryLogin != k.RegistryLogin {
+		return nil, errors.New("a Kubernetes run gives the release's login as K8s.RegistryLogin, every run applying the chart")
+	}
 	args, files, err := k8sChange(Change{Inputs: in.Inputs, SecretInputs: in.SecretInputs, TLS: in.TLS, Domains: in.Domains, Ports: in.Ports})
 	if err != nil {
+		return nil, err
+	}
+	if err := kitFiles(files, in.Kit, in.KitCode); err != nil {
 		return nil, err
 	}
 	args = append(k.verb("install", "--no-input", "--json"), args...)
@@ -307,8 +325,8 @@ func (k K8s) Install(ctx context.Context, in Install) (*Result, error) {
 // `--given` (`k8s upgrade --given`, by the installer of that release), which replace the values
 // the release's Secret records and adds those it does not. An input given "" is given empty.
 func (k K8s) Reconfigure(ctx context.Context, c Change, registryCA string) (*Result, error) {
-	if c.TLS != "" || len(c.Domains) > 0 || len(c.Ports) > 0 {
-		return nil, errors.New("tls, domains and ports are the front's, which Kubernetes does not run")
+	if c.TLS != "" || len(c.Domains) > 0 || len(c.Ports) > 0 || c.AcmeCA != "" || c.AcmeCARoot != "" {
+		return nil, errors.New("tls, domains, ports and the ACME CA are the front's, which Kubernetes does not run")
 	}
 	inputs := maps.Clone(c.Inputs)
 	if inputs == nil {

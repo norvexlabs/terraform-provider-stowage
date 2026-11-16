@@ -5,14 +5,14 @@ terraform {
   required_providers {
     stowage = {
       source  = "norvexlabs/stowage"
-      version = "~> 0.1"
+      version = "~> 0.3"
     }
   }
 }
 
 provider "stowage" {}
 
-resource "stowage_install" "app" {
+resource "stowage_docker_install" "app" {
   # The installer by digest, as `stowage ship` prints it.
   installer = var.installer
 
@@ -21,14 +21,12 @@ resource "stowage_install" "app" {
   secret_inputs_wo         = { SMTP_PASSWORD = var.smtp_password }
   secret_inputs_wo_version = 1
 
-  docker {
-    host             = var.host
-    user             = var.user
-    known_hosts_line = var.known_hosts_line # ssh-keyscan -t ed25519 <host>, checked against the host's fingerprint
-    work_dir         = "/srv"
-  }
+  host             = var.host
+  user             = var.user
+  known_hosts_line = var.known_hosts_line # ssh-keyscan -t ed25519 <host>, checked against the host's fingerprint
+  work_dir         = "/srv"
 }
 
 output "version" {
-  value = stowage_install.app.version
+  value = stowage_docker_install.app.version
 }

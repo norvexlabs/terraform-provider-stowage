@@ -1,0 +1,37 @@
+---
+page_title: "{{.Name}} {{.Type}} - {{.ProviderName}}"
+subcategory: ""
+description: |-
+{{ .Description | plainmarkdown | trimspace | prefixlines "  " }}
+---
+
+# {{.Name}} ({{.Type}})
+
+{{ .Description | trimspace }}
+
+## Example Usage
+
+{{ tffile .ExampleFile }}
+
+{{ .SchemaMarkdown | trimspace }}
+
+## Details
+
+Reads a Kairos VM's `<short_name>-stow status --json --values` over SSH, as the SSH user, without
+managing it. Nothing on the VM changes. The read is bounded by 5 minutes. Another project's
+install (`Another project's install`) is an error.
+
+| Argument | | |
+|---|---|---|
+| `name`, `short_name` | required | The project's name (compared with the status's) and the installer's short name, one path element each. |
+| `host` | required | The VM's address, reached by the system `ssh`. |
+| `port`, `user`, `private_key_file`, `known_hosts_line` | optional | As `stowage_vm_install`'s; `user` and `known_hosts_line` (the VM's own key) required with `host`. |
+
+| Attribute | |
+|---|---|
+| `id` | `<host>/<short_name>-stow`. |
+| `installed`, `previous` | `{version, revision, installer}` (`installer` null on a VM); null before the first install, and when the install keeps no release for `rollback`. |
+| `channel`, `status` | As the resource's. |
+| `inputs` | The input keys the install records, sorted, never a value; null when the installer does not tell. |
+| `registry`, `registry_ca_digest`, `address` | What the first install recorded; null when the status gives none. |
+| `pull_login` | Whether the install holds its own registry login (`status --json --values` `pull_login`); null from an installer that does not tell (before Stowage 0.40.0). |

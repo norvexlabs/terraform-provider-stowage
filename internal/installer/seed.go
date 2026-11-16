@@ -39,6 +39,44 @@ type Seed struct {
 	// Interfaces are the NICs the VM is made with, sorted by role (Stowage 0.38.0 or later; nil
 	// from an earlier installer, which names none).
 	Interfaces *[]SeedInterface `json:"interfaces"`
+	// AwaitGiven are the secret inputs the answers file holds, which the first install waits for
+	// over SSH (never a value).
+	AwaitGiven []string `json:"await_given"`
+	// RegistryLogin is the host the VM's own login is for (--registry-login-file), never the
+	// login.
+	RegistryLogin string `json:"registry_login"`
+	// Size is the VM's size the release takes (Stowage 0.40.0 or later; nil before).
+	Size *SeedSize `json:"size"`
+	// Firewall is what a platform's firewall in front of the VM lets through (Stowage 0.40.0 or
+	// later; nil before).
+	Firewall *SeedFirewall `json:"firewall"`
+}
+
+// SeedSize is the VM's size the release takes: its CPUs, its memory in MiB and the app's space in
+// GiB, each at least Min, by default Recommended.
+type SeedSize struct {
+	CPUs      SeedBound `json:"cpus"`
+	MemoryMiB SeedBound `json:"memory_mib"`
+	AppGiB    SeedBound `json:"app_gib"`
+}
+
+// SeedBound is a size's least and its default.
+type SeedBound struct {
+	Min         int64 `json:"min"`
+	Recommended int64 `json:"recommended"`
+}
+
+// SeedFirewall is what the VM's own firewall opens: SSH from SSHSources, and each of OpenPorts.
+type SeedFirewall struct {
+	SSHSources []string   `json:"ssh_sources"`
+	OpenPorts  []SeedPort `json:"open_ports"`
+}
+
+// SeedPort is a port the VM opens besides SSH, from its sources.
+type SeedPort struct {
+	Protocol string   `json:"protocol"`
+	Port     int64    `json:"port"`
+	Sources  []string `json:"sources"`
 }
 
 // SeedInterface is a NIC a seed's VM is made with: its role, the MAC its cloud-config names it by
@@ -111,7 +149,22 @@ func ParseSeed(b []byte) (*Seed, error) {
 			roles[i.Role] = true
 		}
 	}
+	if z := s.Size; z != nil {
+		for n, b := range map[string]SeedBound{"cpus": z.CPUs, "memory_mib": z.MemoryMiB, "app_gib": z.AppGiB} {
+			if b.Min < 1 || b.Recommended < b.Min {
+				return nil, fmt.Errorf("%s: size.%s: min %d and recommended %d are not a size", doc, n, b.Min, b.Recommended)
+			}
+		}
+	}
+	if f := s.Firewall; f != nil {
+		for _, p := range f.OpenPorts {
+			if (p.Protocol != "tcp" && p.Protocol != "udp") || p.Port < 1 || p.Port > 65535 {
+				return nil, fmt.Errorf("%s: firewall.open_ports: %s/%d is not a port", doc, p.Protocol, p.Port)
+			}
+		}
+	}
 	s.Waiting = sortedUnique(s.Waiting)
+	s.AwaitGiven = sortedUnique(s.AwaitGiven)
 	return &s, nil
 }
 

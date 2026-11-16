@@ -32,21 +32,16 @@ func TestSchemaValidation(t *testing.T) {
 		}
 		return h.block("docker", base)
 	}
-	vmBlock := h.block("vm", map[string]tftypes.Value{"host": str("vm.example"), "user": str("ops"), "known_hosts_line": str(hostLine), "version": str("1.2.0")})
 	for name, c := range map[string]struct {
 		config tftypes.Value
 		want   string
 	}{
-		"two targets":       {h.dockerConfig(map[string]tftypes.Value{"vm": vmBlock}), "Invalid Attribute Combination"},
-		"no target":         {fill(h.typ, map[string]tftypes.Value{"installer": str(image)}), "Exactly one of these attributes must be configured"},
-		"installer by tag":  {h.dockerConfig(map[string]tftypes.Value{"installer": str("registry.example.com/notes/notes-installer:1.2.0")}), "installer is not pinned by digest"},
-		"short digest":      {h.dockerConfig(map[string]tftypes.Value{"installer": str("registry.example.com/notes/notes-installer@sha256:abc")}), "installer is not pinned by digest"},
-		"no installer":      {h.dockerConfig(map[string]tftypes.Value{"installer": tftypes.NewValue(tftypes.String, nil)}), "installer is required"},
-		"vm with installer": {fill(h.typ, map[string]tftypes.Value{"installer": str(image), "vm": vmBlock}), "installer is not the VM's release"},
+		"installer by tag": {h.dockerConfig(map[string]tftypes.Value{"installer": str("registry.example.com/notes/notes-installer:1.2.0")}), "installer is not pinned by digest"},
+		"short digest":     {h.dockerConfig(map[string]tftypes.Value{"installer": str("registry.example.com/notes/notes-installer@sha256:abc")}), "installer is not pinned by digest"},
+		"no installer":     {h.dockerConfig(map[string]tftypes.Value{"installer": tftypes.NewValue(tftypes.String, nil)}), "installer is required"},
 		"vm without version": {fill(h.typ, map[string]tftypes.Value{"vm": h.block("vm", map[string]tftypes.Value{
-			"host": str("vm.example"), "user": str("ops"), "known_hosts_line": str(hostLine)})}), "vm.version is required"},
-		"vm with delete_data":   {fill(h.typ, map[string]tftypes.Value{"delete_data": boolean(true), "vm": vmBlock}), "delete_data is not the VM's"},
-		"k8s without namespace": {fill(h.typ, map[string]tftypes.Value{"installer": str(image), "kubernetes": h.block("kubernetes", nil)}), "kubernetes.namespace is required"},
+			"host": str("vm.example"), "user": str("ops"), "known_hosts_line": str(hostLine), "short_name": str("notes")})}), "version is required"},
+		"k8s without namespace": {fill(h.typ, map[string]tftypes.Value{"installer": str(image), "kubernetes": h.block("kubernetes", nil)}), "namespace is required"},
 		"host, no known_hosts":  {h.dockerConfig(map[string]tftypes.Value{"docker": ssh(map[string]tftypes.Value{"known_hosts_line": tftypes.NewValue(tftypes.String, nil)})}), "known_hosts_line is required with host"},
 		"bad known_hosts":       {h.dockerConfig(map[string]tftypes.Value{"docker": ssh(map[string]tftypes.Value{"known_hosts_line": str("@cert-authority * ssh-ed25519 " + edKey)})}), "known_hosts_line does not parse"},
 		"host, no user":         {h.dockerConfig(map[string]tftypes.Value{"docker": ssh(map[string]tftypes.Value{"user": tftypes.NewValue(tftypes.String, nil)})}), "user is required with host"},
@@ -227,8 +222,9 @@ func TestRefusalIsADiagnostic(t *testing.T) {
 	p := h.plan(nil, config)
 	a := h.apply(nil, p.PlannedState, config)
 	// The summary is the reason, the detail the fix: shown, never run.
-	if len(a.Diagnostics) != 1 || a.Diagnostics[0].Summary != "ADMIN_EMAIL is required" ||
-		!strings.HasPrefix(a.Diagnostics[0].Detail, "give --set ADMIN_EMAIL=…\n\nInstalling notes was refused by the installer (install, exit 3)") {
+	errs := slices.DeleteFunc(slices.Clone(a.Diagnostics), func(d *tfprotov6.Diagnostic) bool { return d.Severity != tfprotov6.DiagnosticSeverityError })
+	if len(errs) != 1 || errs[0].Summary != "ADMIN_EMAIL is required" ||
+		!strings.HasPrefix(errs[0].Detail, "give --set ADMIN_EMAIL=…\n\nInstalling notes was refused by the installer (install, exit 3)") {
 		t.Fatalf("got %q", errorsOf(a.Diagnostics))
 	}
 	if ops := h.fake.ops(); ops[len(ops)-1] != "install" {
@@ -344,15 +340,15 @@ func TestReadFollowsTheTarget(t *testing.T) {
 	// no connection (a program's EACCES is not a refused login).
 	login, key, none := "ssh's login to the Docker host app.example was refused", "The Docker host app.example serves another host key", "Cannot reach the Docker host app.example"
 	for stderr, c := range map[string]struct{ want, not []string }{
-		"ops@app.example: Permission denied (publickey).": {[]string{login, "docker.user or docker.private_key_file", "tofu apply -refresh=false"}, []string{key, none, "known_hosts_line"}},
-		"Host key verification failed.":                   {[]string{key, "docker.known_hosts_line", "tofu apply -refresh=false"}, []string{login, none, "docker.user"}},
+		"ops@app.example: Permission denied (publickey).": {[]string{login, "user or private_key_file", "tofu apply -refresh=false"}, []string{key, none, "known_hosts_line"}},
+		"Host key verification failed.":                   {[]string{key, "known_hosts_line", "tofu apply -refresh=false"}, []string{login, none, "user"}},
 		"Load key \"/keys/ops\": Permission denied\nops@app.example: Permission denied (publickey,password).": {[]string{login, "Load key"}, []string{key, none}},
 		"Received disconnect from 192.0.2.5 port 22:2: Too many authentication failures":                      {[]string{login}, []string{key, none}},
 		"Received disconnect from 192.0.2.5 port 22:14: No supported authentication methods available":        {[]string{login}, []string{key, none}},
 		"ops@app.example: Permission denied ().":                                                              {[]string{login}, []string{key, none}},
 		"Received disconnect from 192.0.2.5: 2: Too many authentication failures for ops":                     {[]string{login}, []string{key, none}},
 		"registry login: Too many authentication failures":                                                    {[]string{none}, []string{login, key}},
-		"open /srv/notes/.env: Permission denied (os error 13)":                                               {[]string{none}, []string{login, key, "docker.user", "known_hosts_line"}},
+		"open /srv/notes/.env: Permission denied (os error 13)":                                               {[]string{none}, []string{login, key, "user", "known_hosts_line"}},
 	} {
 		h.fake.replies["status"] = reply{exit: 255, stderr: stderr}
 		r := h.read(state)
@@ -397,14 +393,12 @@ func TestFirstInstallOnlyIsAPlanError(t *testing.T) {
 		config tftypes.Value
 		want   string
 	}{
-		"work_dir": {h.dockerConfig(map[string]tftypes.Value{"address": str("127.0.0.2"), "docker": moved}), "docker.work_dir is first-install only"},
+		"work_dir": {h.dockerConfig(map[string]tftypes.Value{"address": str("127.0.0.2"), "docker": moved}), "work_dir is first-install only"},
 		"address":  {h.dockerConfig(map[string]tftypes.Value{"address": str("127.0.0.3")}), "address is first-install only"},
 		"work_dir taken out": {h.dockerConfig(map[string]tftypes.Value{"address": str("127.0.0.2"),
 			"docker": h.block("docker", map[string]tftypes.Value{"host": str("app.example"), "user": str("ops"), "known_hosts_line": str(hostLine)})}),
-			`docker.work_dir was "/srv" at the install and is now "."`},
+			`work_dir was "/srv" at the install and is now "."`},
 		"project": {h.dockerConfig(map[string]tftypes.Value{"address": str("127.0.0.2"), "installer": str("registry.example.com/x/atlas-installer@" + digest)}), "the installer's project is first-install only"},
-		"target": {fill(h.typ, map[string]tftypes.Value{"address": str("127.0.0.2"), "installer": str(image),
-			"kubernetes": h.block("kubernetes", map[string]tftypes.Value{"namespace": str("notes")})}), "the target is first-install only"},
 	} {
 		if got := errorsOf(h.plan(state, c.config).Diagnostics); !strings.Contains(got, c.want) {
 			t.Errorf("%s: got %q, want %q", name, got, c.want)

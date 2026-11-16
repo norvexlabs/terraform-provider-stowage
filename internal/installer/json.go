@@ -202,6 +202,16 @@ type Values struct {
 	TLS     string            `json:"tls"`
 	Domains map[string]string `json:"domains"`
 	Ports   map[string]int64  `json:"ports"`
+	// AcmeCA is the ACME directory --acme-ca gave ("" for Let's Encrypt's); AcmeCARoot the
+	// root --acme-ca-root gave, `sha256:<hex>` ("" for none), AcmeCARootError why the root held
+	// cannot be read.
+	AcmeCA          string `json:"acme_ca"`
+	AcmeCARoot      string `json:"acme_ca_root"`
+	AcmeCARootError string `json:"acme_ca_root_error"`
+	// PullLogin is whether the install holds a pull login (Stowage >= 0.40.0; nil from an earlier
+	// installer, which does not tell), PullLoginError why the login held cannot be read.
+	PullLogin      *bool  `json:"pull_login"`
+	PullLoginError string `json:"pull_login_error"`
 }
 
 // noValuesFlag says whether a status run refused --values as unknown: an installer made before

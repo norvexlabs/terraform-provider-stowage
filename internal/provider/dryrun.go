@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -72,7 +73,7 @@ func (r *installResource) k8sPlanDryRun(ctx context.Context, plan, state *instal
 	if imported(state) {
 		var given []string
 		if !plan.Kubernetes.Values.IsNull() {
-			given = []string{"kubernetes.values"}
+			given = []string{"values"}
 		}
 		adoptionReport(diags, p.u, p.rerun, p.up, releaseChangeOf(p.step != stay || plan.Installer.ValueString() != p.runningRef), p.running, p.next == nil && p.step == stay, given...)
 	}
@@ -110,16 +111,32 @@ func (r *installResource) vmPlanDryRun(ctx context.Context, plan, state *install
 	}
 	ctx, cancel := context.WithTimeout(ctx, planDryRunTimeout)
 	defer cancel()
-	p := r.vmPrepare(ctx, plan, state, stringMap(ctx, secretsWO, diags), diags)
+	p := r.vmPrepare(ctx, plan, state, stringMap(ctx, secretsWO, diags), true, diags)
 	if p == nil {
 		return
 	}
 	if imported(state) {
 		adoptionReport(diags, p.u, p.now, p.later, releaseChangeOf(p.step != stay), p.running, false)
+		if attach := attachments(plan.VM.Interfaces, state.VM.Interfaces); len(attach) > 0 {
+			var roles []string
+			for _, i := range newNICs(ctx, p.v, attach, diags) {
+				roles = append(roles, i.Role)
+			}
+			switch {
+			case p.step != stay && len(roles) > 0:
+				interfacesWithVersion(diags)
+				return
+			case len(roles) == 0:
+				diags.AddWarning("The VM names every interface given", "The apply takes them over: nothing is attached, and the VM does not reboot.")
+			default:
+				diags.AddWarning("The apply attaches NICs and reboots the VM",
+					fmt.Sprintf("The VM names no NIC by the MAC given for %s: the apply attaches them (`network attach`), then reboots the VM to name them.", strings.Join(roles, ", ")))
+			}
+		}
 	}
 	if p.step != stay && !known(state.VM.HostKeyLine) {
 		diags.AddWarning("The VM's own host key is not known yet",
-			"State has none: the apply reads it before the release change, and refuses the change when it cannot (`The VM's own host key is not known`). The dry run below runs under the key vm.known_hosts_line accepts.")
+			"State has none: the apply reads it before the release change, and refuses the change when it cannot (`The VM's own host key is not known`). The dry run below runs under the key known_hosts_line accepts.")
 	}
 	switch {
 	case p.step == stay:

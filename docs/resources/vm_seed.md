@@ -2,97 +2,45 @@
 page_title: "stowage_vm_seed Resource - stowage"
 subcategory: ""
 description: |-
-  A new Kairos VM's first-boot material, vm seed --json of the release an installer carries, run on the machine running OpenTofu (docker run --rm <installer> > <name>.sh, then sh <name>.sh vm seed --json …; a linux/amd64 machine with Docker). Generated once: its one-time SSH host key would change at every plan otherwise, so every change of an argument replaces it. Feed user_data and disk to the resource that creates the VM (a hypervisor's or a cloud's own provider), and known_hosts_line to stowage_install's vm block. user_data and host_key_private hold the one-time host key's private key: they are in state, which should be encrypted.
+  A new Kairos VM's first-boot material, vm seed --json of the release an installer carries, run on the machine running OpenTofu: the installer image's entry for that machine's platform (linux/amd64, linux/arm64, darwin/amd64 or darwin/arm64), read from the registry and checked against the release's keys, kept in the provider's cache (ctl_path), with no Docker. Generated once: its one-time SSH host key would change at every plan otherwise, so every change of an argument replaces it. Feed user_data and disk to the resource that creates the VM (a hypervisor's or a cloud's own provider), and known_hosts_line, short_name and version to stowage_vm_install. user_data and host_key_private hold the one-time host key's private key: they are in state, which should be encrypted.
 ---
 
 # stowage_vm_seed (Resource)
 
-A new Kairos VM's first-boot material, `vm seed --json` of the release an installer carries, run on the machine running OpenTofu (`docker run --rm <installer> > <name>.sh`, then `sh <name>.sh vm seed --json …`; a linux/amd64 machine with Docker). Generated once: its one-time SSH host key would change at every plan otherwise, so every change of an argument replaces it. Feed `user_data` and `disk` to the resource that creates the VM (a hypervisor's or a cloud's own provider), and `known_hosts_line` to `stowage_install`'s `vm` block. `user_data` and `host_key_private` hold the one-time host key's private key: they are in state, which should be encrypted.
+A new Kairos VM's first-boot material, `vm seed --json` of the release an installer carries, run on the machine running OpenTofu: the installer image's entry for that machine's platform (linux/amd64, linux/arm64, darwin/amd64 or darwin/arm64), read from the registry and checked against the release's keys, kept in the provider's cache (`ctl_path`), with no Docker. Generated once: its one-time SSH host key would change at every plan otherwise, so every change of an argument replaces it. Feed `user_data` and `disk` to the resource that creates the VM (a hypervisor's or a cloud's own provider), and `known_hosts_line`, `short_name` and `version` to `stowage_vm_install`. `user_data` and `host_key_private` hold the one-time host key's private key: they are in state, which should be encrypted.
 
 ## Example Usage
 
 ```terraform
-# A Kairos VM on TrueNAS, made from a stowage_vm_seed, then installed and kept by stowage_install.
-#
-# The VM itself is Stowage's TrueNAS module (the one `vm create` applies), from a Stowage release:
-# its steps upload the disk and the seed through TrueNAS's API, run by `<short>-stow vm truenas`,
-# which STOWAGE_CTL names (`docker run --rm <installer> > notes.sh && chmod +x notes.sh`, then
-# `export STOWAGE_CTL=$PWD/notes.sh`), with TRUENAS_URL and TRUENAS_API_KEY in the environment.
-
+# A Kairos VM's first-boot material: the VM is made from it by its platform's own provider (a whole
+# root per platform: the platform guides, examples/guides/<platform>-vm).
 resource "stowage_vm_seed" "notes" {
   installer      = var.installer
   platform       = "truenas"
   hostname       = "notes"
   user           = "ops"
   ssh_public_key = file(pathexpand("~/.ssh/id_ed25519.pub"))
-  # A static address: TrueNAS does not report the VM's.
-  network = "static"
-  address = "192.0.2.10/24"
-  gateway = "192.0.2.1"
-  dns     = ["192.0.2.1"]
-  tls     = "internal"
-  inputs  = { ADMIN_EMAIL = "ops@example.com" }
-  # The disk written here as a file (disk_file), for the module to upload.
+  tls            = "internal"
+  inputs         = { ADMIN_EMAIL = "ops@example.com" }
+  # The disk written here as a file (disk_file), for a hypervisor resource that imports it.
   disk_dir = pathexpand("~/.cache/notes/disks")
 }
 
-# The NoCloud seed ISO of its user-data and meta-data.
-data "external" "seed" {
-  program = ["${path.module}/seed-iso.sh"]
-  query = {
-    user_data = stowage_vm_seed.notes.user_data
-    meta_data = stowage_vm_seed.notes.meta_data
-    hostname  = "notes"
-    dir       = pathexpand("~/.cache/notes/seeds")
-  }
+output "disk" {
+  value = stowage_vm_seed.notes.disk_file # path, format, sha256, disk_gib
 }
 
-module "vm" {
-  source = "git::https://github.com/norvexlabs/stowage.git//internal/install/tofu/truenas?ref=v0.35.0"
-
-  name           = "notes"
-  pool           = "tank"
-  parent_dataset = "vms"
-  nic_attach     = "br0"
-  cpus           = 2
-  memory_mib     = 4096
-  # The app's space the release recommends, and what Kairos takes of the disk.
-  disk_gib     = stowage_vm_seed.notes.disk_file.disk_gib
-  image        = stowage_vm_seed.notes.disk_file.path
-  image_sha256 = stowage_vm_seed.notes.disk_file.sha256
-  seed         = data.external.seed.result.path
-  seed_sha256  = data.external.seed.result.sha256
+output "size" {
+  value = stowage_vm_seed.notes.size # cpus, memory_mib, app_gib: {min, recommended}
 }
 
-resource "stowage_install" "notes" {
-  secret_inputs_wo         = { API_KEY = var.api_key } # given over SSH once the VM answers
-  secret_inputs_wo_version = 1
-  inputs                   = { ADMIN_EMAIL = "ops@example.com" }
-  tls                      = "internal"
-
-  vm {
-    host             = "192.0.2.10"
-    user             = "ops"
-    private_key_file = pathexpand("~/.ssh/id_ed25519")
-    known_hosts_line = stowage_vm_seed.notes.known_hosts_line # the one-time key, until the VM's own is read
-    short_name       = stowage_vm_seed.notes.short_name
-    version          = stowage_vm_seed.notes.version # a later release upgrades the VM
-  }
-
-  # deletion_protection = false   # a destroy then forgets the install; module.vm removes the VM
-
-  depends_on = [module.vm]
+output "ctl" {
+  value = stowage_vm_seed.notes.ctl_path # the release's installer for this machine
 }
 
 variable "installer" {
   type        = string
   description = "The installer by digest, as `stowage ship` prints it."
-}
-
-variable "api_key" {
-  type      = string
-  sensitive = true
-  ephemeral = true
 }
 ```
 
@@ -109,7 +57,7 @@ variable "api_key" {
 - `add_hosts` (Map of String) Host records, name → IP (`--add-host NAME=IP`).
 - `address` (String) With `network = "static"`: the address with its prefix, e.g. `192.0.2.10/24` (`--address`).
 - `address6` (String) With `ipv6`: a static IPv6 address with its prefix (`--address6`).
-- `await_secrets` (Boolean) The VM's first install waits for a decrypted `secrets export` (`--await-secrets`): a machine made again, given by `stowage_install`'s `secrets_wo` over SSH once the VM answers. Refused with `tls = "byo"` by the installer (the first install waits for one of them).
+- `await_secrets` (Boolean) The VM's first install waits for a decrypted `secrets export` (`--await-secrets`): a machine made again, given by `stowage_vm_install`'s `secrets_wo` over SSH once the VM answers. Refused with `tls = "byo"` by the installer (the first install waits for one of them).
 - `channel` (String) The channel the VM's first install follows (`--channel`); left out, the release's.
 - `device` (String) `metal`: the disk the OS installs on (`--device`), wiped.
 - `disk_dir` (String) An existing directory on the machine running OpenTofu the `platform`'s disk is written into, decompressed (`--disk-dir`): `disk_file` names it, for a hypervisor resource that imports a local file. The file is the caller's: destroying the seed leaves it, and a file of that name already holding the disk is kept.
@@ -120,7 +68,7 @@ variable "api_key" {
 - `hostname` (String) The VM's host name (`--hostname`); left out, the project's name.
 - `http_port` (Number) The VM's HTTP port in a TLS mode (`--http-port`).
 - `https_port` (Number) The VM's HTTPS port in a TLS mode (`--https-port`).
-- `inputs` (Map of String) Non-secret inputs (`--set KEY=VALUE`), in the cloud-config and in state. A secret input is refused by the installer: give it to `stowage_install`'s `secret_inputs_wo`, which goes over SSH once the VM answers.
+- `inputs` (Map of String) Non-secret inputs (`--set KEY=VALUE`), in the cloud-config and in state. A secret input is refused by the installer: give it to `stowage_vm_install`'s `secret_inputs_wo`, which goes over SSH once the VM answers.
 - `interfaces` (Map of String) NICs the release names, role → spec (`--interface ROLE=SPEC`).
 - `ipv6` (Boolean) Turn IPv6 on (`--ipv6`).
 - `network` (String) `dhcp` (the default) or `static` (`--network`).
@@ -128,28 +76,32 @@ variable "api_key" {
 - `ssh_public_key` (String) The administrator's SSH public key (`--ssh-key`, given as a file), e.g. `file("~/.ssh/id_ed25519.pub")`; left out, the installer's default key of the machine running OpenTofu.
 - `timeouts` (Block, Optional) (see [below for nested schema](#nestedblock--timeouts))
 - `timezone` (String) The VM's IANA time zone (`--timezone`); left out, UTC.
-- `tls` (String) The front's TLS mode (`--tls`): `acme`, `dns-cloudflare`, `internal` or `byo`. With `byo` the VM's first install waits for the certificate, its key and CA, given over SSH by `stowage_install`'s `given_wo` (its `tls` section); the seed carries none (`await_tls`).
+- `tls` (String) The front's TLS mode (`--tls`): `acme`, `dns-cloudflare`, `internal` or `byo`. With `byo` the VM's first install waits for the certificate, its key and CA, given over SSH by `stowage_vm_install`'s `given_wo` (its `tls` section); the seed carries none (`await_tls`).
 - `tune_profile` (String) The VM's tuning profile (`--tune-profile`): `default` or `network`.
 - `user` (String) The VM's administrator, who logs in over SSH (`--user`); left out, the installer's default.
 
 ### Read-Only
 
 - `app_gib` (Number) The app's space the release recommends, which each disk's `disk_gib` adds to `os_gib`.
+- `await_given` (List of String) The secret inputs the release's answers would hold, sorted (never a value), which the first install waits for too: `stowage_vm_install`'s `given_wo` gives them over SSH. Empty when none.
 - `await_tls` (Boolean) The VM's first install waits for a `byo` certificate given over SSH (`tls = "byo"`).
+- `ctl_path` (String) The installer for the machine running OpenTofu, `<short_name>-stow` with the release's payload, kept in the provider's cache (the user's cache directory's `terraform-provider-stowage/installers/<index digest>/<os>-<arch>/`): the program a root's steps run (`vm truenas import-image|seed|stop`, `vm host-key`, `vm kit …`). A refresh fetches it again when it is gone (a cache cleared, another machine), at the same path when this machine's cache is the one it names.
 - `disk` (Map of Object) Per platform the registry holds a disk for, the disk it boots: `format`, `image` (by digest), `os_gib` (what Kairos takes of the VM's disk), `disk_gib` (the VM's disk size to create: `os_gib` plus `app_gib`) and, on a cloud the release publishes to, `cloud_image`, the name `ship --disks` registered its image under there (null otherwise; the ship registered it only when it had that cloud's settings: check it exists). (see [below for nested schema](#nestedatt--disk))
 - `disk_file` (Object) With `disk_dir`: the `platform`'s disk as a file — `path` (absolute), `format`, `sha256` of its bytes and `disk_gib`; null otherwise. (see [below for nested schema](#nestedatt--disk_file))
 - `fingerprint` (String) The one-time host key's SHA256 fingerprint, as ssh prints it.
+- `firewall` (Object) What a platform's firewall in front of the VM (a cloud's security group) lets through, as the VM's own firewall opens it: `ssh_sources` (CIDRs) and `open_ports`, each `{protocol, port, sources}` (the front's HTTP and HTTPS ports, each L4 route's port and its allowed sources). Null from an installer made before Stowage 0.40.0. (see [below for nested schema](#nestedatt--firewall))
 - `host_key_private` (String, Sensitive) The one-time host key's OpenSSH private key, which the VM serves until its install and the reboot after it.
 - `id` (String) The one-time host key's fingerprint.
-- `known_hosts_line` (String) The one-time host key as a `known_hosts` line, under the name `vm-seed-host-key`: give it to `stowage_install`'s `vm.known_hosts_line`.
+- `known_hosts_line` (String) The one-time host key as a `known_hosts` line, under the name `vm-seed-host-key`: give it to `stowage_vm_install`'s `known_hosts_line`.
 - `meta_data` (String) The NoCloud `meta-data` beside `user_data` (`instance-id`, `local-hostname`), for a hypervisor that builds its own seed ISO.
 - `name` (String) The project's name (`describe`'s).
-- `nics` (Map of Object) The NICs the VM is made with, by role (the release's `host.interfaces`, as `interfaces` gives them): `mac`, the MAC its cloud-config names it by — given (`mac=`), else generated for a hypervisor's VM of more than one NIC; null for a VM of one NIC, named from the NIC it has, and on a cloud, which gives its NICs their MACs —, `attach`, the network it attaches to (`attach=`; null: the primary's), and `primary`. Give each NIC of the VM's resource its `mac`: a NIC of another MAC is not named, and the VM's network does not come up as the release expects. Empty when the release declares no NIC; null from an installer made before Stowage 0.38.0, which names none (with a warning: give each NIC's `mac=` in `interfaces`). (see [below for nested schema](#nestedatt--nics))
+- `nics` (Map of Object) The NICs the VM is made with, by role (the release's `host.interfaces`, as `interfaces` gives them): `mac`, the MAC its cloud-config names it by — given (`mac=`), else, on a hypervisor with several roles, generated at random (locally administered), each seed its own (state keeps it); null for a release's one role given no MAC (the VM names it by its original name and pins that name to the NIC's MAC at its first boot: give that NIC the platform's MAC, or one of the root's), and on a cloud, which gives its NICs their MACs —, `attach`, the network it attaches to (`attach=`; null: the primary's), and `primary`. Give each NIC of the VM's resource its `mac`: a NIC of another MAC is not named, and the VM's network does not come up as the release expects. Empty when the release declares no NIC: the VM's one NIC keeps the kernel's name, its MAC the platform's or the root's; null from an installer made before Stowage 0.38.0, which names none (with a warning: give each NIC's `mac=` in `interfaces`). (see [below for nested schema](#nestedatt--nics))
 - `revision` (Number) That release's package revision.
-- `short_name` (String) The installer's short name: the VM runs `<short_name>-stow`. Give it to `stowage_install`'s `vm.short_name`.
+- `short_name` (String) The installer's short name: the VM runs `<short_name>-stow`. Give it to `stowage_vm_install`'s `short_name`.
+- `size` (Object) The VM's size the release takes: `cpus`, `memory_mib` and `app_gib` (the app's space, which each disk's `disk_gib` adds to `os_gib`), each `{min, recommended}`. A root refuses a VM under `min` and warns under `recommended`. Null from an installer made before Stowage 0.40.0. (see [below for nested schema](#nestedatt--size))
 - `user_data` (String, Sensitive) The cloud-config for `platform`: a NoCloud seed's `user-data`, or a cloud's user data. It holds no secret input, but the one-time host key's private key.
 - `version` (String) The release the seed's disk boots first.
-- `waiting` (List of String) The required secret inputs nothing gives, sorted: the VM's first install waits for them, which `stowage_install`'s `secret_inputs_wo` gives over SSH.
+- `waiting` (List of String) The required secret inputs nothing gives, sorted: the VM's first install waits for them, which `stowage_vm_install`'s `secret_inputs_wo` gives over SSH.
 
 <a id="nestedblock--timeouts"></a>
 ### Nested Schema for `timeouts`
@@ -182,6 +134,25 @@ Read-Only:
 - `sha256` (String)
 
 
+<a id="nestedatt--firewall"></a>
+### Nested Schema for `firewall`
+
+Read-Only:
+
+- `open_ports` (List of Object) (see [below for nested schema](#nestedobjatt--firewall--open_ports))
+- `ssh_sources` (List of String)
+
+<a id="nestedobjatt--firewall--open_ports"></a>
+### Nested Schema for `firewall.open_ports`
+
+Read-Only:
+
+- `port` (Number)
+- `protocol` (String)
+- `sources` (List of String)
+
+
+
 <a id="nestedatt--nics"></a>
 ### Nested Schema for `nics`
 
@@ -191,6 +162,42 @@ Read-Only:
 - `mac` (String)
 - `primary` (Boolean)
 
+
+<a id="nestedatt--size"></a>
+### Nested Schema for `size`
+
+Read-Only:
+
+- `app_gib` (Object) (see [below for nested schema](#nestedobjatt--size--app_gib))
+- `cpus` (Object) (see [below for nested schema](#nestedobjatt--size--cpus))
+- `memory_mib` (Object) (see [below for nested schema](#nestedobjatt--size--memory_mib))
+
+<a id="nestedobjatt--size--app_gib"></a>
+### Nested Schema for `size.app_gib`
+
+Read-Only:
+
+- `min` (Number)
+- `recommended` (Number)
+
+
+<a id="nestedobjatt--size--cpus"></a>
+### Nested Schema for `size.cpus`
+
+Read-Only:
+
+- `min` (Number)
+- `recommended` (Number)
+
+
+<a id="nestedobjatt--size--memory_mib"></a>
+### Nested Schema for `size.memory_mib`
+
+Read-Only:
+
+- `min` (Number)
+- `recommended` (Number)
+
 ## Details
 
 A new Kairos VM's first-boot material: `vm seed --json` of the release an installer carries, run
@@ -198,14 +205,33 @@ once on the machine running OpenTofu. Its one-time SSH host key would change at 
 data source, so it is a managed resource **generated once**: every argument forces a new seed
 (and so a new VM, whose resource reads `user_data`). Read and destroy run nothing.
 
-**Create**: `docker run --rm <installer> > <name>.sh` in a private temporary directory removed
-afterwards (logged in with the provider's `username`/`password` as on a Docker target), its
-`describe --json` (`name` compared with the image's, shapes must include `kairos` when it lists
-any), then `sh <name>.sh vm seed --json --platform=<platform> [--flag=value]… [--set K=V]…
+**Create**: the installer image's entry for the platform of the machine running OpenTofu
+(`linux/amd64`, `linux/arm64`, `darwin/amd64` or `darwin/arm64`) is read from its registry, with
+no Docker: the index by its digest, the entry's one layer, its one file `<short_name>-stow` (an
+image of one platform, as a Stowage before 0.40.0 published, is taken for that platform alone; an
+index without an entry for this machine is refused, naming the platforms it has). The mirror's own
+login goes to the provider `registry`'s host; the provider's `username`/`password` to the host of
+`installer` or of the provider's `registry`; the machine's Docker configuration
+(`~/.docker/config.json`, its credential helpers) reads any other; the provider's `registry_ca` is
+trusted besides the system's; plain HTTP only on this machine's loopback. A seed is a first
+install: with the provider's `public_keys`, the entry must be signed by one of them, before its
+layer is read, and its release must carry keys of its own; without them, its digest alone is
+trusted, and the plan says so (`The installer is trusted by its digest alone`): see
+[trust](../guides/trust.md). The file is streamed into the provider's cache (0700, in 0700
+directories), the user's cache directory's
+`terraform-provider-stowage/installers/<index digest>/<os>-<arch>/`, beside its checksum and its
+image's digest, checked against that checksum at each use, and against the trust of the run that
+takes it (eight index digests kept, the last used): that path is `ctl_path`. Then,
+in a private directory removed afterwards (the cache's `runs/stowage-seed-*`, which holds only
+`<name>.sh` and its program: a hard link to the kept one, else a copy written to a temporary file
+there and renamed into place; the system's temporary directory without a cache; a run the shell
+could not start as that program was busy, `Text file busy` with exit 126, is made again, up to 5
+times over less than a second), its `describe --json` (`name` compared with
+the image's, shapes must include `kairos` when it lists any), then `<short_name>-stow vm seed --json --platform=<platform> [--flag=value]… [--set K=V]…
 [--registry=<provider registry>] [--await-secrets] [--disk-dir=<dir>]`, the SSH key and the
 provider's `registry_ca` as `--ssh-key` and `--registry-ca` files on standard input. The
 provider's `username` is the installer registry's pull account: the seed reads its disks with
-it, in a Docker configuration of its own written as the fetch's is, when it reads them from that
+it, in a Docker configuration of its own written for the run (removed afterwards), when it reads them from that
 registry's host (no provider `registry`, or one on that host); a provider `registry` on another
 host (a mirror) is read with the machine's own Docker login (`~/.docker`, or `DOCKER_CONFIG`), the
 pull account never sent there, as a mirror refuses another registry's credentials. The installer
@@ -216,7 +242,7 @@ registry cannot be read. Exit 3 without that object breaks the machine interface
 
 | Argument | | |
 |---|---|---|
-| `installer` | required | The installer by digest, as `stowage_install`'s. |
+| `installer` | required | The installer by digest, as `stowage_docker_install`'s. |
 | `platform` | required | `--platform`: `truenas`, `proxmox`, `libvirt`, `vmware`, `hyperv`, `azure`, `gcp`, `aws`, `scaleway` or `metal`. |
 | `hostname`, `user`, `channel` | optional | `--hostname`, `--user` (the administrator, who logs in over SSH and runs `sudo`), `--channel` (the first install's). |
 | `ssh_public_key` | optional | The administrator's public key, e.g. `file("~/.ssh/id_ed25519.pub")` (`--ssh-key`, as a file). Left out, the installer's default key of the machine running OpenTofu. |
@@ -226,21 +252,21 @@ registry cannot be read. Exit 3 without that object breaks the machine interface
 | `ssh_allow` | optional list | `--ssh-allow`, one CIDR each (a comma or space is refused). |
 | `timezone`, `device` | optional | `--timezone`; `--device` (`metal`). |
 | `add_hosts`, `interfaces` | optional maps | `--add-host NAME=IP`, `--interface ROLE=SPEC`. |
-| `tls` | optional | `--tls`: `acme`, `dns-cloudflare`, `internal` or `byo`. With `byo` the VM's first install waits for the certificate, its key and CA (`await_tls`), which `stowage_install`'s `given_wo` gives over SSH (its `tls` section); the seed carries none. |
-| `await_secrets` | optional bool | `--await-secrets`: the VM's first install waits for a decrypted `secrets export` (a machine made again), which `stowage_install`'s `secrets_wo` gives over SSH. With `tls = "byo"` it is refused at plan (`await_secrets with tls byo`: the first install waits for one of them). |
+| `tls` | optional | `--tls`: `acme`, `dns-cloudflare`, `internal` or `byo`. With `byo` the VM's first install waits for the certificate, its key and CA (`await_tls`), which `stowage_vm_install`'s `given_wo` gives over SSH (its `tls` section); the seed carries none. |
+| `await_secrets` | optional bool | `--await-secrets`: the VM's first install waits for a decrypted `secrets export` (a machine made again), which `stowage_vm_install`'s `secrets_wo` gives over SSH. With `tls = "byo"` it is refused at plan (`await_secrets with tls byo`: the first install waits for one of them). |
 | `disk_dir` | optional | `--disk-dir`: an existing directory, an absolute, clean path (else refused at plan), on the machine running OpenTofu the `platform`'s disk is written into, decompressed (a file of that name already holding it is kept), for a hypervisor resource importing a local file (`disk_file`). The file is the caller's: destroying the seed leaves it. |
 | `domains` | optional map | `--domains route=host,…`. |
 | `http_port`, `https_port` | optional | `--http-port`, `--https-port` (1–65535). |
-| `inputs` | optional map | Non-secret inputs, `--set KEY=VALUE`: in the cloud-config and in state. A secret input goes to `stowage_install`'s `secret_inputs_wo`, given over SSH once the VM answers. |
+| `inputs` | optional map | Non-secret inputs, `--set KEY=VALUE`: in the cloud-config and in state. A secret input goes to `stowage_vm_install`'s `secret_inputs_wo`, given over SSH once the VM answers. |
 | `timeouts` | block | `create` (default 10m). |
 
 | Attribute | |
 |---|---|
 | `id`, `fingerprint` | The one-time host key's SHA256 fingerprint, as ssh prints it. |
-| `name`, `short_name` | The project's name; the installer's short name, for `stowage_install`'s `vm.short_name`. |
+| `name`, `short_name` | The project's name; the installer's short name, for `stowage_vm_install`'s `short_name`. |
 | `version`, `revision` | The release the seed's disk boots first. |
 | `user_data` | **sensitive** — the cloud-config for `platform` (a NoCloud seed's `user-data`, or a cloud's user data): no secret input, but the one-time host key's private key. |
-| `known_hosts_line` | The one-time key as a `known_hosts` line under `vm-seed-host-key`, for `stowage_install`'s `vm.known_hosts_line`. |
+| `known_hosts_line` | The one-time key as a `known_hosts` line under `vm-seed-host-key`, for `stowage_vm_install`'s `known_hosts_line`. |
 | `host_key_private` | **sensitive** — the one-time key's OpenSSH private key, which the VM serves until its install and the reboot after it. |
 | `disk` | Map, per platform the registry holds a disk for, of `{format, image, os_gib, disk_gib, cloud_image}`: the disk it boots, by digest; what Kairos takes of the VM's disk (`os_gib`) and the VM's disk size to create (`disk_gib`, `os_gib` plus `app_gib`); on a cloud the release publishes to, `cloud_image`, the name `ship --disks` registered its image under there (null otherwise, and for a release booting another release's disks; the ship registered it only when it had that cloud's settings: check it exists). |
 | `meta_data` | The NoCloud `meta-data` (`instance-id`, `local-hostname`) beside `user_data`, for a hypervisor that builds its own seed ISO. |
@@ -248,8 +274,12 @@ registry cannot be read. Exit 3 without that object breaks the machine interface
 | `disk_file` | With `disk_dir`: `{path, format, sha256, disk_gib}`, the disk as a file (an absolute path; the SHA-256 of its decompressed bytes); null otherwise. |
 | `await_tls` | The VM's first install waits for a `byo` certificate over SSH (`tls = "byo"`). |
 | `waiting` | The required secret inputs nothing gives, sorted: the VM's first install waits for them (`secret_inputs_wo`). |
-| `nics` | The NICs the VM is made with, by role (the release's `host.interfaces`, as `interfaces` gives them; `vm seed --json`'s `interfaces`): `mac`, the MAC its cloud-config names it by — `mac=` given, else generated (a locally administered unicast MAC) for a hypervisor's VM of more than one NIC; null for a VM of one NIC, named from the NIC it has, and on a cloud, which gives its NICs their MACs —, `attach`, the network it attaches to (`attach=`; null: the primary's), and `primary`. Give each NIC of the VM's resource its `mac` (`nics["edge"].mac`): a NIC of another MAC is not named, and the VM's network does not come up as the release expects. Empty when the release declares no NIC; null from an installer made before Stowage 0.38.0, whose seed names none, with a warning (`The seed names no NIC`: give each NIC's `mac=` in `interfaces`). |
+| `await_given` | The secret inputs the release's answers would hold, sorted (never a value): the first install waits for them too, given by `stowage_vm_install`'s `given_wo` (its `inputs`). |
+| `ctl_path` | The installer for the machine running OpenTofu, kept in the provider's cache (above): the program a root's steps run (`vm truenas import-image\|seed\|stop`, `vm host-key`, `vm kit …`). A refresh fetches it again when it is gone (a cache cleared, another machine), at the same path when this machine's cache is the one it names, else where this machine's cache keeps it (a warning when it cannot); a destroy-time step that recorded the path runs that path, so a root destroys from the machine that made it, or refreshes first. The cache keeps the eight index digests last used and removes the others, whatever state names them: a destroy refreshes first (unless `-refresh=false`), which fetches the program again at its path, and a root's destroy-time step checks the program is there and, when it is not, fails naming `tofu apply -refresh-only` (the TrueNAS guide's does). Null, with a warning, on a machine without a user cache directory. |
+| `size` | `{cpus, memory_mib, app_gib}`, each `{min, recommended}`: the VM's size the release takes (`shapes.kairos.size`, raised to the floor every VM needs). A root refuses a VM under `min` and warns under `recommended` (the platform guides' `check` blocks). A `min` under 1, or a `recommended` under its `min`, breaks the machine interface. Null from an installer made before Stowage 0.40.0. |
+| `firewall` | `{ssh_sources, open_ports}`: what a platform's firewall in front of the VM (a cloud's security group) lets through, as the VM's own firewall opens it — the CIDRs SSH accepts, and each port the VM opens besides SSH, `{protocol, port, sources}` (the front's HTTP and HTTPS ports, each L4 route's port and the sources its allow list gives). A port that is not `tcp`/`udp` 1–65535 breaks the machine interface. Null from an installer made before Stowage 0.40.0. |
+| `nics` | The NICs the VM is made with, by role (the release's `host.interfaces`, as `interfaces` gives them; `vm seed --json`'s `interfaces`): `mac`, the MAC its cloud-config names it by — `mac=` given, else, on a hypervisor with several roles, generated at random (a locally administered unicast MAC), each seed its own, which state keeps (a seed made again makes new ones); null for a release's one role given no MAC (the VM names it by its original name and pins that name to the NIC's MAC at its first boot, so a NIC added later never takes it: give it the platform's MAC, or one of the root's), and on a cloud, which gives its NICs their MACs —, `attach`, the network it attaches to (`attach=`; null: the primary's), and `primary`. Give each NIC of the VM's resource its `mac` (`nics["edge"].mac`): a NIC of another MAC is not named, and the VM's network does not come up as the release expects. Empty when the release declares no NIC: the VM's one NIC keeps the kernel's name, its MAC the platform's or the root's; null from an installer made before Stowage 0.38.0, whose seed names none, with a warning (`The seed names no NIC`: give each NIC's `mac=` in `interfaces`). |
 
 The private key is in state (in `user_data` and `host_key_private`) until it retires: encrypt
-state. The example above feeds the seed to Stowage's TrueNAS module; [the TrueNAS
-guide](../guides/truenas-vm.md) makes the VM with the upstream TrueNAS provider alone.
+state. A whole root per platform, the seed fed to the platform's own provider and to
+`stowage_vm_install`: the [platform guides](../guides/platforms.md).

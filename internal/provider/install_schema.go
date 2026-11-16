@@ -27,33 +27,39 @@ var previousType = map[string]attr.Type{
 }
 
 type installModel struct {
-	ID                    types.String   `tfsdk:"id"`
-	Installer             types.String   `tfsdk:"installer"`
-	Inputs                types.Map      `tfsdk:"inputs"`
-	SecretInputsWO        types.Map      `tfsdk:"secret_inputs_wo"`
-	SecretInputsWOVersion types.Int64    `tfsdk:"secret_inputs_wo_version"`
-	GivenWO               types.String   `tfsdk:"given_wo"`
-	SecretsWO             types.String   `tfsdk:"secrets_wo"`
-	TLS                   types.String   `tfsdk:"tls"`
-	Domains               types.Map      `tfsdk:"domains"`
-	Ports                 types.Map      `tfsdk:"ports"`
-	Address               types.String   `tfsdk:"address"`
-	AllowRollback         types.Bool     `tfsdk:"allow_rollback"`
-	DeletionProtection    types.Bool     `tfsdk:"deletion_protection"`
-	DeleteData            types.Bool     `tfsdk:"delete_data"`
-	PlanDryRun            types.Bool     `tfsdk:"plan_dry_run"`
-	Registry              types.String   `tfsdk:"registry"`
-	RegistryCADigest      types.String   `tfsdk:"registry_ca_digest"`
-	ShortName             types.String   `tfsdk:"short_name"`
-	Version               types.String   `tfsdk:"version"`
-	Revision              types.Int64    `tfsdk:"revision"`
-	Channel               types.String   `tfsdk:"channel"`
-	Status                types.String   `tfsdk:"status"`
-	Previous              types.Object   `tfsdk:"previous"`
-	Docker                *dockerModel   `tfsdk:"docker"`
-	Kubernetes            *k8sModel      `tfsdk:"kubernetes"`
-	VM                    *vmModel       `tfsdk:"vm"`
-	Timeouts              timeouts.Value `tfsdk:"timeouts"`
+	ID                     types.String   `tfsdk:"id"`
+	Installer              types.String   `tfsdk:"installer"`
+	Inputs                 types.Map      `tfsdk:"inputs"`
+	SecretInputsWO         types.Map      `tfsdk:"secret_inputs_wo"`
+	SecretInputsWOVersion  types.Int64    `tfsdk:"secret_inputs_wo_version"`
+	GivenWO                types.String   `tfsdk:"given_wo"`
+	SecretsWO              types.String   `tfsdk:"secrets_wo"`
+	TLS                    types.String   `tfsdk:"tls"`
+	Domains                types.Map      `tfsdk:"domains"`
+	Ports                  types.Map      `tfsdk:"ports"`
+	Address                types.String   `tfsdk:"address"`
+	AllowRollback          types.Bool     `tfsdk:"allow_rollback"`
+	DeletionProtection     types.Bool     `tfsdk:"deletion_protection"`
+	DeleteData             types.Bool     `tfsdk:"delete_data"`
+	PlanDryRun             types.Bool     `tfsdk:"plan_dry_run"`
+	Registry               types.String   `tfsdk:"registry"`
+	RegistryCADigest       types.String   `tfsdk:"registry_ca_digest"`
+	ShortName              types.String   `tfsdk:"short_name"`
+	Version                types.String   `tfsdk:"version"`
+	Revision               types.Int64    `tfsdk:"revision"`
+	Channel                types.String   `tfsdk:"channel"`
+	Status                 types.String   `tfsdk:"status"`
+	Previous               types.Object   `tfsdk:"previous"`
+	RegistryLoginWO        types.String   `tfsdk:"registry_login_wo"`
+	RegistryLoginWOVersion types.Int64    `tfsdk:"registry_login_wo_version"`
+	AcmeCA                 types.String   `tfsdk:"acme_ca"`
+	AcmeCARoot             types.String   `tfsdk:"acme_ca_root"`
+	KitFile                types.String   `tfsdk:"kit_file"`
+	KitCodeWO              types.String   `tfsdk:"kit_code_wo"`
+	Docker                 *dockerModel   `tfsdk:"docker"`
+	Kubernetes             *k8sModel      `tfsdk:"kubernetes"`
+	VM                     *vmModel       `tfsdk:"vm"`
+	Timeouts               timeouts.Value `tfsdk:"timeouts"`
 }
 
 type dockerModel struct {
@@ -76,6 +82,8 @@ type vmModel struct {
 	ShortName      types.String `tfsdk:"short_name"`
 	HostKeyLine    types.String `tfsdk:"host_key_line"`
 	SeedBootID     types.String `tfsdk:"seed_boot_id"`
+	Platform       types.String `tfsdk:"platform"`
+	Interfaces     types.Map    `tfsdk:"interfaces"`
 }
 
 func sshAttributes(hostDesc string) map[string]schema.Attribute {
@@ -117,13 +125,12 @@ func installSchema(ctx context.Context) schema.Schema {
 			PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()}}
 	}
 	return schema.Schema{
-		MarkdownDescription: "One install of a Stowage product on one target: a Docker host, a Kubernetes cluster or a Kairos VM. " +
-			"Exactly one of the `docker`, `kubernetes` and `vm` blocks.",
+		MarkdownDescription: "The install model the three install types are views of (split.go): one install on one target, its docker, kubernetes or vm block naming it.",
 		Attributes: map[string]schema.Attribute{
 			"id": computedString("`<work_dir>/<name>` on Docker; `<namespace>/<release>` on Kubernetes."),
 			"installer": schema.StringAttribute{
 				Optional:            true,
-				MarkdownDescription: "The installer image by digest, `<prefix>/<name>-installer@sha256:<64 hex>`, as `ship` prints it: an installer carries one release, so the digest is the release. Required with `docker` and `kubernetes`; the VM's release is `vm.version`.",
+				MarkdownDescription: "The installer image by digest, `<prefix>/<name>-installer@sha256:<64 hex>`, as `ship` prints it: an installer carries one release, so the digest is the release. A change upgrades the install (the new release's `upgrade`), or rolls it back to `previous.installer` with `allow_rollback`.",
 				Validators:          []validator.String{installerValidator{}},
 			},
 			"inputs": schema.MapAttribute{
@@ -149,7 +156,7 @@ func installSchema(ctx context.Context) schema.Schema {
 			"secrets_wo": schema.StringAttribute{
 				Optional:            true,
 				WriteOnly:           true,
-				MarkdownDescription: "A decrypted `secrets export` of a machine made again (the installer's `--secrets`), write-only, used at create, on standard input. Docker and the VM — on a VM, one seeded with `stowage_vm_seed`'s `await_secrets`, whose first install waits for it (the installer refuses it once that install ran); refused with `kubernetes`, whose release keeps its secrets in the cluster.",
+				MarkdownDescription: "A decrypted `secrets export` of a machine made again (the installer's `--secrets`), write-only, used at create, on standard input. On a VM, one seeded with `stowage_vm_seed`'s `await_secrets`, whose first install waits for it (the installer refuses it once that install ran).",
 			},
 			"tls": schema.StringAttribute{
 				Optional:            true,
@@ -180,11 +187,35 @@ func installSchema(ctx context.Context) schema.Schema {
 			},
 			"plan_dry_run": schema.BoolAttribute{
 				Optional: true, Computed: true, Default: booldefault.StaticBool(false),
-				MarkdownDescription: "A plan changing the release runs the change's dry run on the target, so the installer's refusal is a plan error. On Docker, a plan changing `installer`: the new release's `upgrade --dry-run` (fetched into a private directory beside the install and removed after), or the kept installer's `rollback --dry-run`. On Kubernetes, a plan changing `installer`: the new installer's `k8s upgrade --dry-run`, or `k8s rollback --dry-run`, run on this machine as an apply's. On a VM, a plan changing `vm.version`: `upgrade --version V --dry-run --json` or `rollback --dry-run --json` over SSH (the host daemon's checks before its job; no reboot; the VM's OS needs Stowage 0.38.0 or later). A plan that also re-runs the running release is not dry-run, with a warning. Opt-in: the plan reaches the target. On an imported state never applied it runs too, and says what the take-over changes (`Taking over the install: …`, the keys that differ, never a value); while a value it reads is not known yet, skipped with a warning (`No dry run of this plan yet`), as the plan OpenTofu makes again at apply runs it.",
+				MarkdownDescription: "A plan changing the release runs the change's dry run on the target, so the installer's refusal is a plan error. On Docker, a plan changing `installer`: the new release's `upgrade --dry-run` (fetched into a private directory beside the install and removed after), or the kept installer's `rollback --dry-run`. On Kubernetes, a plan changing `installer`: the new installer's `k8s upgrade --dry-run`, or `k8s rollback --dry-run`, run on this machine as an apply's. On a VM, a plan changing `version`: `upgrade --version V --dry-run --json` or `rollback --dry-run --json` over SSH (the host daemon's checks before its job; no reboot; the VM's OS needs Stowage 0.38.0 or later). A plan that also re-runs the running release is not dry-run, with a warning. Opt-in: the plan reaches the target. On an imported state never applied it runs too, and says what the take-over changes (`Taking over the install: …`, the keys that differ, never a value); while a value it reads is not known yet, skipped with a warning (`No dry run of this plan yet`), as the plan OpenTofu makes again at apply runs it.",
 			},
 			"delete_data": schema.BoolAttribute{
 				Optional: true, Computed: true, Default: booldefault.StaticBool(false),
-				MarkdownDescription: "A destroy runs `uninstall --data`, deleting the volumes, instead of `uninstall`, which keeps them. Docker and Kubernetes: `true` with a `vm` block is refused at validation (`delete_data is not the VM's`), as a VM's destroy forgets the install and deletes nothing.",
+				MarkdownDescription: "A destroy runs `uninstall --data`, deleting the volumes, instead of `uninstall`, which keeps them.",
+			},
+			"registry_login_wo": schema.StringAttribute{
+				Optional: true, WriteOnly: true,
+				MarkdownDescription: "The install's own registry login, write-only: a Docker config holding one `auths` entry for the host of the release's registry or of the provider's `registry` (`{\"auths\": {\"HOST\": {\"auth\": \"BASE64(USER:PASSWORD)\"}}}`), minted for this install, sent on standard input. Docker: the install's `--registry-login-file`, at the first install or a re-run. Kubernetes: `k8s install|upgrade --registry-login-file` (the release's pull Secret written from it; refused with `image_pull_login`). VM: `sudo -n <short>-stow registry-login` over SSH, before its first install is given anything, or alone. Sent at create, and again when `registry_login_wo_version` changes; leaving both out keeps the login the install holds.",
+			},
+			"registry_login_wo_version": schema.Int64Attribute{
+				Optional:            true,
+				MarkdownDescription: "Bump it to send `registry_login_wo` again. A refresh that reads the install holding no login (`status --json --values` `pull_login` false) takes it out of state, so the next plan sends the login again.",
+			},
+			"acme_ca": schema.StringAttribute{
+				Optional:            true,
+				MarkdownDescription: "Another ACME directory than Let's Encrypt's, its URL (`--acme-ca`), in the `acme` and `dns-cloudflare` modes; taken out, Let's Encrypt's again (`--acme-ca none`). A change re-runs the install. A refresh reads the one the install holds (`status --json --values` `acme_ca`).",
+			},
+			"acme_ca_root": schema.StringAttribute{
+				Optional:            true,
+				MarkdownDescription: "PEM of the root `acme_ca`'s certificates chain to (`--acme-ca-root`, a file on standard input), e.g. `file(\"acme-root.pem\")`; taken out, none (`--acme-ca-root none`). A change re-runs the install. A refresh compares its `sha256` with the one the install holds (`status --json --values` `acme_ca_root`): another puts that digest in state, so the next plan gives the root again.",
+			},
+			"kit_file": schema.StringAttribute{
+				Optional:            true,
+				MarkdownDescription: "A handoff kit, the file's path on the machine running OpenTofu, given to the first install (`--kit`, read at create and sent on standard input), with `kit_code_wo`. First-install only: a later change is not applied (a plan warning says so). Refused with `given_wo`.",
+			},
+			"kit_code_wo": schema.StringAttribute{
+				Optional: true, WriteOnly: true,
+				MarkdownDescription: "The kit's code (`--kit-code-file`), write-only, sent on standard input with the kit at create; required with `kit_file`.",
 			},
 			"registry":           computedString("The provider's `registry` at the install, which a later plan compares; null in an imported state until its first apply."),
 			"registry_ca_digest": computedString("`sha256:<hex>` of the registry CA the install keeps (the provider's `registry_ca` at its first install), as `status --json` reports it; null when it keeps none. A later plan compares it with the provider's `registry_ca`: first-install only on Docker and the VM. Null in an imported state until its first apply, which records it."),

@@ -266,7 +266,7 @@ func TestMovedSecretAtPlanOnEveryTarget(t *testing.T) {
 	}
 }
 
-// plan_dry_run on a VM: a plan changing vm.version runs `upgrade --version V --dry-run --json`
+// plan_dry_run on a VM: a plan changing version runs `upgrade --version V --dry-run --json`
 // over SSH, or `rollback --dry-run --json` going back to previous; a refusal is a plan error, the
 // apply's own errors come first, and a plan that also re-runs the release is not dry-run.
 func TestVMPlanDryRun(t *testing.T) {
@@ -296,7 +296,7 @@ func TestVMPlanDryRun(t *testing.T) {
 	if p := h.plan(state, both); errorsOf(p.Diagnostics) != "" || !strings.Contains(diagText(p.Diagnostics), "No dry run of this plan") || len(f.callsOf("dry-upgrade")) != 0 {
 		t.Fatalf("with a re-run: %q, calls %q", diagText(p.Diagnostics), f.ops())
 	}
-	// Off, or vm.version unchanged: nothing reaches the VM.
+	// Off, or version unchanged: nothing reaches the VM.
 	f.reset()
 	h.plan(state, h.vmConfig("1.2.0", nil))
 	h.plan(state, h.vmConfig("1.1.0", map[string]tftypes.Value{"plan_dry_run": boolean(true), "inputs": strMap(map[string]string{"ADMIN_EMAIL": "c@d"})}))
@@ -393,7 +393,7 @@ func TestK8sPlanDryRunWaitsForAllowRollback(t *testing.T) {
 	}
 }
 
-// vm.short_name not known yet (its seed made again): no dry run, nothing reaches the VM.
+// short_name not known yet (its seed made again): no dry run, nothing reaches the VM.
 func TestVMPlanDryRunWaitsForTheShortName(t *testing.T) {
 	t.Parallel()
 	h, f := newVMHarness(t)

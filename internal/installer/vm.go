@@ -82,8 +82,11 @@ type VMStatus struct {
 	// OS is the release the OS carries.
 	OS *Release `json:"os"`
 	// Boot is the system Kairos booted: active, passive (the fallback) or recovery.
-	Boot     string `json:"boot"`
-	Fallback bool   `json:"fallback"`
+	Boot string `json:"boot"`
+	// ResetFailed: on the recovery system, Kairos's automatic reset of the first boot failed, so
+	// the VM stays there (its unit's last journal lines).
+	ResetFailed string `json:"reset_failed"`
+	Fallback    bool   `json:"fallback"`
 	// OnTrial: the boot runs an upgrade's new system, which the health gate has not judged yet.
 	OnTrial bool `json:"on_trial"`
 	// FailedBoot is the last boot the health gate found unhealthy.
@@ -229,6 +232,8 @@ type VMInstall struct {
 	Change
 	Given   string // --given, a file on standard input
 	Secrets string // --secrets, a file on standard input
+	// Kit is --kit, a handoff kit, and KitCode its code (--kit-code-file): files on standard input.
+	Kit, KitCode string
 }
 
 // Install runs `sudo -n <short>-stow install --no-input --json` on the VM: its first install, or
@@ -249,6 +254,9 @@ func (v VM) Install(ctx context.Context, in VMInstall) (*Result, error) {
 			files[name] = val
 		}
 	}
+	if err := kitFiles(files, in.Kit, in.KitCode); err != nil {
+		return nil, err
+	}
 	names, stdin, err := filesInput(files)
 	if err != nil {
 		return nil, err
@@ -258,6 +266,185 @@ func (v VM) Install(ctx context.Context, in VMInstall) (*Result, error) {
 		return nil, fmt.Errorf("install: %w", err)
 	}
 	return Outcome("install", stdout, stderr, exit)
+}
+
+// PositionalScript is RunScript passing each file as an argument, its path alone, after the
+// program's own arguments: for a verb taking a file as a positional argument.
+var PositionalScript = strings.Replace(RunScript, `set -- "$@" "--$__stowage_f" "$__stowage_d/$__stowage_f"`, `set -- "$@" "$__stowage_d/$__stowage_f"`, 1)
+
+// plain runs `sudo -n <short>-stow <args…>` on the VM, a verb without --json, with file (when
+// not "") as its last argument, a file on standard input in a private directory removed
+// afterwards (PositionalScript): exit 0 done, 3 refused (its reason the last line of standard
+// error), another failed.
+func (v VM) plain(ctx context.Context, verb, file string, args ...string) error {
+	ctl, err := v.ctl()
+	if err != nil {
+		return err
+	}
+	var files map[string]string
+	if file != "" {
+		files = map[string]string{"file": file}
+	}
+	names, stdin, err := filesInput(files)
+	if err != nil {
+		return err
+	}
+	argv := append([]string{"sh", "-c", PositionalScript, "sh", ".", names, "sudo", "-n", ctl}, args...)
+	stdout, stderr, exit, err := v.Runner.Run(ctx, argv, stdin)
+	logRun(ctx, argv, stdout, stderr, true, exit, err)
+	switch {
+	case err != nil:
+		return fmt.Errorf("%s: %w", verb, err)
+	case exit == 0:
+		return nil
+	case exit == 3:
+		return &RefusedError{Verb: verb, Refusal: Refusal{Reason: lastLine(stderr)}}
+	}
+	return &FailedError{Verb: verb, Exit: exit, Stderr: tail(stderr)}
+}
+
+// lastLine is b's last line that is not blank, with an "error: " prefix taken off.
+func lastLine(b []byte) string {
+	lines := strings.Split(strings.TrimRight(string(b), "\r\n\t "), "\n")
+	return strings.TrimPrefix(strings.TrimSpace(lines[len(lines)-1]), "error: ")
+}
+
+// RegistryLogin runs `sudo -n <short>-stow registry-login FILE`: the VM's own registry login (a
+// Docker config holding one auths entry), recorded in place of the one it holds. The login is a
+// file on standard input, never on a command line.
+func (v VM) RegistryLogin(ctx context.Context, login string) error {
+	if login == "" {
+		return errors.New("registry-login: no login to give")
+	}
+	return v.plain(ctx, "registry-login", login, "registry-login")
+}
+
+// Interface is a NIC `network attach` names: the release's role, the MAC the VM's platform gave
+// it, and its addressing (Mode "" is the installer's default, none).
+type Interface struct {
+	Role, MAC, Mode, Address string
+}
+
+// NetworkAttach runs `sudo -n <short>-stow network attach --role R --mac M [--mode] [--address]`:
+// the NIC named and addressed from the VM's next boot.
+func (v VM) NetworkAttach(ctx context.Context, i Interface) error {
+	args := []string{"network", "attach", "--role", i.Role, "--mac", i.MAC}
+	if i.Mode != "" {
+		args = append(args, "--mode", i.Mode)
+	}
+	if i.Address != "" {
+		args = append(args, "--address", i.Address)
+	}
+	for _, a := range []string{i.Role, i.MAC, i.Mode, i.Address} {
+		if strings.HasPrefix(a, "-") || strings.ContainsAny(a, " \t\r\n") {
+			return fmt.Errorf("network attach: %q is not one argument", a)
+		}
+	}
+	return v.plain(ctx, "network attach --role "+i.Role, "", args...)
+}
+
+// NICRole is one of the release's secondary NIC roles as the VM names it (`network --json`'s
+// roles): the MAC of the link named so ("" when none is), its global addresses with their prefix,
+// and the addressing `network set --role` set over its own (nil: none, the cloud-config's or
+// `network attach`'s, which the VM does not report).
+type NICRole struct {
+	Role      string      `json:"role"`
+	MAC       string      `json:"mac"`
+	Addresses []string    `json:"addresses"`
+	Override  *NICAddress `json:"override"`
+}
+
+// NICAddress is a role's addressing as `network --json` reports an override: its mode (dhcp,
+// static or none) and, static, its IPv4 address with its prefix.
+type NICAddress struct {
+	Mode    string `json:"mode"`
+	Address string `json:"address"`
+}
+
+// NetworkRoles runs `sudo -n <short>-stow network --json` and returns its roles: the NICs the VM
+// names now, by role.
+func (v VM) NetworkRoles(ctx context.Context) ([]NICRole, error) {
+	ctl, err := v.ctl()
+	if err != nil {
+		return nil, err
+	}
+	argv := []string{"sudo", "-n", ctl, "network", "--json"}
+	stdout, stderr, exit, err := v.Runner.Run(ctx, argv, nil)
+	logRun(ctx, argv, stdout, stderr, true, exit, err)
+	switch {
+	case err != nil:
+		return nil, fmt.Errorf("network: %w", err)
+	case exit != 0:
+		return nil, &FailedError{Verb: "network --json", Exit: exit, Stderr: tail(stderr)}
+	}
+	var n struct {
+		Roles []NICRole `json:"roles"`
+	}
+	if err := json.Unmarshal(stdout, &n); err != nil {
+		return nil, fmt.Errorf("network --json: %w", err)
+	}
+	return n.Roles, nil
+}
+
+// DiskSet asks the VM's installer whether the registry holds a disk set a VM of its release boots
+// on platform: `sudo -n <short>-stow vm seed --json --platform P --ssh-key FILE [--registry R]`,
+// the release's own check (`vm create` makes a VM from that set), its output discarded (a seed of
+// a throwaway key). nil: it holds one; a *RefusedError: it holds none, as the installer says;
+// another error: not known.
+func (v VM) DiskSet(ctx context.Context, platform, registry, sshKey string) error {
+	ctl, err := v.ctl()
+	if err != nil {
+		return err
+	}
+	for _, a := range []string{platform, registry} {
+		if strings.HasPrefix(a, "-") || strings.ContainsAny(a, " \t\r\n") {
+			return fmt.Errorf("vm seed: %q is not one argument", a)
+		}
+	}
+	args := []string{"sudo", "-n", ctl, "vm", "seed", "--json", "--platform", platform}
+	if registry != "" {
+		args = append(args, "--registry", registry)
+	}
+	names, stdin, err := filesInput(map[string]string{"ssh-key": strings.TrimSpace(sshKey) + "\n"})
+	if err != nil {
+		return err
+	}
+	stdout, stderr, exit, err := v.Runner.Run(ctx, append([]string{"sh", "-c", RunScript, "sh", ".", names}, args...), stdin)
+	switch {
+	case err != nil:
+		return fmt.Errorf("vm seed: %w", err)
+	case exit == 0:
+		return nil
+	case exit == 3:
+		r, err := ParseRefused("vm seed --json", stdout, stderr)
+		if err != nil {
+			return err
+		}
+		return r
+	}
+	return &FailedError{Verb: "vm seed", Exit: exit, Stderr: tail(stderr)}
+}
+
+// Reboot runs `sudo -n <short>-stow reboot`: the VM drains its stack and reboots, so the
+// connection may end before it answers (ErrCut), which a status read after it tells from a
+// failure.
+func (v VM) Reboot(ctx context.Context) error {
+	ctl, err := v.ctl()
+	if err != nil {
+		return err
+	}
+	argv := []string{"sudo", "-n", ctl, "reboot"}
+	stdout, stderr, exit, err := v.Runner.Run(ctx, argv, nil)
+	logRun(ctx, argv, stdout, stderr, false, exit, err)
+	switch {
+	case err != nil:
+		return fmt.Errorf("reboot: %w", err)
+	case exit == SSHFailure:
+		return fmt.Errorf("reboot: %w (%s)", ErrCut, tail(stderr))
+	case exit != 0:
+		return &FailedError{Verb: "reboot", Exit: exit, Stderr: tail(stderr)}
+	}
+	return nil
 }
 
 // ErrCut is a verb whose SSH connection was lost before it printed its result (exit 255 and no

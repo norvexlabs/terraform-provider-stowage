@@ -127,11 +127,11 @@ func TestWorkDirLeftOutIsTheResolvedHome(t *testing.T) {
 	if got := errorsOf(h.plan(state, home(str("/home/ops"))).Diagnostics); got != "" {
 		t.Fatalf("the resolved home named: %q", got)
 	}
-	if got := errorsOf(h.plan(state, home(str("/srv"))).Diagnostics); !strings.Contains(got, `docker.work_dir was "/home/ops" at the install and is now "/srv"`) {
+	if got := errorsOf(h.plan(state, home(str("/srv"))).Diagnostics); !strings.Contains(got, `work_dir was "/home/ops" at the install and is now "/srv"`) {
 		t.Fatalf("another directory: %q", got)
 	}
 	given := h.create(h.dockerConfig(nil))
-	if got := errorsOf(h.plan(given, home(tftypes.NewValue(tftypes.String, nil))).Diagnostics); !strings.Contains(got, `docker.work_dir was "/srv" at the install and is now "."`) {
+	if got := errorsOf(h.plan(given, home(tftypes.NewValue(tftypes.String, nil))).Diagnostics); !strings.Contains(got, `work_dir was "/srv" at the install and is now "."`) {
 		t.Fatalf("a given work_dir left out: %q", got)
 	}
 	// A home the target does not resolve is an error before anything runs, and saves no state.

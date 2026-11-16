@@ -1,13 +1,13 @@
 # Quick start: a Kairos VM. stowage_vm_seed makes its first-boot material once; your hypervisor's
-# or cloud's own resource makes the VM from user_data and the disk (examples/guides/truenas-vm
-# makes it on TrueNAS with the TrueNAS provider); stowage_install then installs and keeps it over SSH.
+# or cloud's own resource makes the VM from user_data and the disk (examples/guides/<platform>-vm
+# makes it, one complete root per platform); stowage_vm_install then installs and keeps it over SSH.
 # `make install-local` in the provider's checkout first, then `tofu init`.
 terraform {
   required_version = ">= 1.11.0"
   required_providers {
     stowage = {
       source  = "norvexlabs/stowage"
-      version = "~> 0.1"
+      version = "~> 0.3"
     }
   }
 }
@@ -34,16 +34,15 @@ output "disk" {
   value = stowage_vm_seed.vm.disk["truenas"]
 }
 
-resource "stowage_install" "vm" {
+resource "stowage_vm_install" "vm" {
+  host             = var.address
+  user             = "ops"
+  private_key_file = pathexpand("~/.ssh/id_ed25519")
+  known_hosts_line = stowage_vm_seed.vm.known_hosts_line # the one-time key, until the VM's own is read
+  short_name       = stowage_vm_seed.vm.short_name
+  version          = stowage_vm_seed.vm.version # a later release upgrades the VM
+  platform         = stowage_vm_seed.vm.platform
+
   inputs = { ADMIN_EMAIL = var.admin_email }
   tls    = "internal"
-
-  vm {
-    host             = var.address
-    user             = "ops"
-    private_key_file = pathexpand("~/.ssh/id_ed25519")
-    known_hosts_line = stowage_vm_seed.vm.known_hosts_line # the one-time key, until the VM's own is read
-    short_name       = stowage_vm_seed.vm.short_name
-    version          = stowage_vm_seed.vm.version # a later release upgrades the VM
-  }
 }

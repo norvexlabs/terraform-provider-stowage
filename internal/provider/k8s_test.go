@@ -1,10 +1,13 @@
 package provider
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -21,8 +24,10 @@ import (
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
 
+	"github.com/norvexlabs/terraform-provider-stowage/internal/fetch"
 	"github.com/norvexlabs/terraform-provider-stowage/internal/installer"
 	"github.com/norvexlabs/terraform-provider-stowage/internal/target"
+	"github.com/norvexlabs/terraform-provider-stowage/internal/testutil"
 )
 
 const (
@@ -90,13 +95,10 @@ func TestK8sValidation(t *testing.T) {
 		config tftypes.Value
 		want   string
 	}{
-		"no namespace":       {block(nil), "kubernetes.namespace is required"},
-		"a namespace's form": {block(map[string]tftypes.Value{"namespace": str("My_ns")}), "kubernetes.namespace is not a DNS label"},
-		"a long release":     {block(map[string]tftypes.Value{"namespace": str("n"), "release": str(strings.Repeat("r", 54))}), "kubernetes.release is not a DNS label"},
-		"tls":                {h.k8sConfig(map[string]tftypes.Value{"tls": str("internal")}), "tls is not Kubernetes's"},
-		"ports":              {h.k8sConfig(map[string]tftypes.Value{"ports": tftypes.NewValue(tftypes.Map{ElementType: tftypes.Number}, map[string]tftypes.Value{"web": num(80)})}), "ports is not Kubernetes's"},
-		"a secrets export":   {h.k8sConfig(map[string]tftypes.Value{"secrets_wo": str("x")}), "secrets_wo is not Kubernetes's"},
-		"values not YAML":    {block(map[string]tftypes.Value{"namespace": str("n"), "values": str("a: [")}), "kubernetes.values is not a chart values file"},
+		"no namespace":       {block(nil), "namespace is required"},
+		"a namespace's form": {block(map[string]tftypes.Value{"namespace": str("My_ns")}), "namespace is not a DNS label"},
+		"a long release":     {block(map[string]tftypes.Value{"namespace": str("n"), "release": str(strings.Repeat("r", 54))}), "release is not a DNS label"},
+		"values not YAML":    {block(map[string]tftypes.Value{"namespace": str("n"), "values": str("a: [")}), "values is not a chart values file"},
 		"values a list":      {block(map[string]tftypes.Value{"namespace": str("n"), "values": str("- a\n")}), "its document is not a mapping"},
 		"values empty":       {block(map[string]tftypes.Value{"namespace": str("n"), "values": str("")}), "its document is not a mapping"},
 		"values two docs":    {block(map[string]tftypes.Value{"namespace": str("n"), "values": str("a: 1\n---\n- x\n")}), "more than one YAML document"},
@@ -186,10 +188,12 @@ func TestK8sCreate(t *testing.T) {
 	if install.argv[6] != "answers registry-ca" || files["answers"] != `SMTP_PASSWORD: "`+secretVal+`"`+"\n" || !strings.HasPrefix(files["registry-ca"], "-----BEGIN") {
 		t.Fatalf("install files %q %q", install.argv[6], files)
 	}
-	// Every call reads the kubeconfig written for the run, removed once it ended.
+	// Every call reads the kubeconfig written for the run, in TempDir, never in the cache, removed
+	// once it ended; the run's working directory beside it.
 	kc := install.argv[5]
-	if !strings.HasSuffix(kc, "/kubeconfig") || !strings.HasPrefix(kc, h.tmp+"/stowage-k8s-") {
-		t.Fatalf("kubeconfig %q", kc)
+	if !strings.HasSuffix(kc, "/kubeconfig") || !strings.HasPrefix(kc, h.tmp+"/stowage-k8s-") || strings.HasPrefix(kc, h.cache+"/") ||
+		!strings.HasPrefix(install.argv[4], filepath.Dir(kc)+"/") {
+		t.Fatalf("kubeconfig %q, the run in %q", kc, install.argv[4])
 	}
 	if _, err := os.Stat(kc); !os.IsNotExist(err) {
 		t.Fatalf("the run's kubeconfig is left: %v", err)
@@ -287,7 +291,7 @@ func TestK8sCreateOverTheRelease(t *testing.T) {
 	if g := untarAll(t, up.stdin)["given"]; g != "project: \"notes\"\ninputs:\n  ADMIN_EMAIL: \"ops@example.com\"\n" || flags(up.argv)["--set"] != "" {
 		t.Fatalf("take-over %q %q", up.argv, g)
 	}
-	// Nothing to give but kubernetes.values: the release is applied again with them.
+	// Nothing to give but values: the release is applied again with them.
 	h.fake.reset()
 	config = h.k8sConfig(map[string]tftypes.Value{"kubernetes": h.block("kubernetes", map[string]tftypes.Value{"namespace": str("notes"), "values": str("replicas: 2\n")})})
 	p = h.plan(nil, config)
@@ -401,9 +405,9 @@ func TestK8sPlanRefusals(t *testing.T) {
 		want   string
 	}{
 		"another namespace": {h.k8sConfig(map[string]tftypes.Value{"kubernetes": h.block("kubernetes", map[string]tftypes.Value{
-			"namespace": str("other")})}), "kubernetes.namespace is first-install only"},
+			"namespace": str("other")})}), "namespace is first-install only"},
 		"another release": {h.k8sConfig(map[string]tftypes.Value{"kubernetes": h.block("kubernetes", map[string]tftypes.Value{
-			"namespace": str("notes"), "release": str("notes2")})}), "the helm release (kubernetes.release, else the project's name) is first-install only"},
+			"namespace": str("notes"), "release": str("notes2")})}), "the helm release (release, else the project's name) is first-install only"},
 		"rollback without allow_rollback": {h.k8sConfig(nil), ""},
 	} {
 		got := errorsOf(h.plan(state, c.config).Diagnostics)
@@ -474,7 +478,7 @@ func TestK8sImport(t *testing.T) {
 		t.Fatalf("state %v", at)
 	}
 	for _, id := range []string{"kubernetes:prod", "kubernetes:/notes", "kubernetes:prod/notes/x", "kubernetes:Prod/notes"} {
-		if got := errorsOf(h.importState(id).Diagnostics); !strings.Contains(got, "kubernetes:<namespace>/<release>") {
+		if got := errorsOf(h.importState(id).Diagnostics); !strings.Contains(got, "want <namespace>/<release>") {
 			t.Errorf("%s: %q", id, got)
 		}
 	}
@@ -534,15 +538,15 @@ func TestK8sRunIsPrivate(t *testing.T) {
 	}
 }
 
-// Not linux/amd64: refused before anything runs. Sets a package variable: not parallel.
-func TestK8sPlatform(t *testing.T) {
-	was := k8sPlatform
-	k8sPlatform = "darwin/arm64"
-	defer func() { k8sPlatform = was }()
+// An installer image without an entry for this machine's platform: refused before anything runs
+// on the cluster, naming the platforms it has.
+func TestK8sNoEntryForThisPlatform(t *testing.T) {
+	t.Parallel()
 	h := k8sHarness(t, nil)
+	h.fake.set("fetch", reply{exit: 1, stderr: image + " has no image for plan9/amd64 (it has linux/amd64, darwin/arm64)"})
 	config := h.k8sConfig(nil)
 	p := h.plan(nil, config)
-	if got := errorsOf(h.apply(nil, p.PlannedState, config).Diagnostics); !strings.Contains(got, "needs linux/amd64") || len(h.fake.calls) != 0 {
+	if got := errorsOf(h.apply(nil, p.PlannedState, config).Diagnostics); !strings.Contains(got, "it has linux/amd64, darwin/arm64") || slices.ContainsFunc(h.fake.ops(), func(o string) bool { return strings.HasPrefix(o, "k8s-") }) {
 		t.Fatalf("got %q, calls %q", got, h.fake.ops())
 	}
 }
@@ -805,50 +809,254 @@ func TestK8sUpdateRefusesABusyRelease(t *testing.T) {
 	}
 }
 
-// writingRunner answers a fetch by writing a bootstrap script, as `docker run` does, and counts it.
-type writingRunner struct{ fetches int }
+// quietRunner answers every run with exit 0 and nothing: a Kubernetes run's tools all found.
+type quietRunner struct{}
 
-func (w *writingRunner) Run(_ context.Context, argv []string, _ []byte) ([]byte, []byte, int, error) {
-	if len(argv) > 6 && argv[2] == installer.FetchScript {
-		w.fetches++
-		return nil, nil, 0, os.WriteFile(filepath.Join(argv[4], argv[6]+".sh"), []byte("echo bootstrap\n"), 0o644)
-	}
+func (quietRunner) Run(context.Context, []string, []byte) ([]byte, []byte, int, error) {
 	return nil, nil, 0, nil
 }
 
-// An installer's bootstrap script is fetched once per digest, then read from the cache (0600 in a
-// 0700 directory); another digest is fetched.
+// countingGet is a registry read counting its calls, each answered with an installer of short
+// name notes.
+type countingGet struct{ n int }
+
+func (c *countingGet) get(_ context.Context, ref string, o fetch.Options) (*fetch.Installer, error) {
+	c.n++
+	if o.Platform != Platform {
+		return nil, fmt.Errorf("asked %s", o.Platform)
+	}
+	f, err := os.CreateTemp(o.Dir, ".installer-*.part")
+	if err != nil {
+		return nil, err
+	}
+	_, err = f.Write(withPayload("exe of " + ref))
+	if err = errors.Join(err, f.Chmod(0o700), f.Close()); err != nil {
+		return nil, err
+	}
+	return &fetch.Installer{Short: "notes", Path: f.Name(), Image: ref}, nil
+}
+
+// withPayload is exe with a release payload of files appended, as an installer carries one.
+func withPayload(exe string, files ...[2]string) []byte {
+	var tb bytes.Buffer
+	tw := tar.NewWriter(&tb)
+	for _, f := range files {
+		_ = tw.WriteHeader(&tar.Header{Name: f[0], Mode: 0o644, Size: int64(len(f[1])), Typeflag: tar.TypeReg})
+		_, _ = tw.Write([]byte(f[1]))
+	}
+	_ = tw.Close()
+	out := append([]byte(exe), tb.Bytes()...)
+	out = binary.BigEndian.AppendUint64(out, uint64(tb.Len()))
+	return append(out, "STOWAGE-PAYLOAD1"...)
+}
+
+// An installer is read once per digest, then from the cache (0700 in 0700 directories, by the
+// index's digest and this machine's platform); another digest is read; the run's script, in the
+// run's directory in TempDir, runs its own link to the kept program, in the cache's runs/.
 func TestK8sScriptCache(t *testing.T) {
 	t.Parallel()
-	w := &writingRunner{}
+	g := &countingGet{}
 	tmp, cache := t.TempDir(), t.TempDir()
-	r := &installResource{data: &Data{NewRunner: func(Connection) (target.Runner, error) { return w, nil }, TempDir: tmp, CacheDir: cache}}
+	r := &installResource{data: &Data{NewRunner: func(Connection) (target.Runner, error) { return quietRunner{}, nil }, TempDir: tmp, CacheDir: cache,
+		Installers: nativeSource{get: g.get}}}
 	m := &installModel{Kubernetes: &k8sModel{Namespace: types.StringValue("notes")}}
+	kept := filepath.Join(cache, strings.TrimPrefix(digest, "sha256:"), strings.ReplaceAll(Platform, "/", "-"), "notes-stow")
 	for i, ref := range []string{image, image, image2} {
 		var diags diag.Diagnostics
 		run := r.k8sStart(context.Background(), m, "notes", &diags)
 		if run == nil {
 			t.Fatal(diags)
 		}
+		if filepath.Dir(run.progs) != filepath.Join(cache, "runs") || filepath.Dir(run.dir) != tmp {
+			t.Fatalf("run %d: the run's directories %s, %s", i, run.progs, run.dir)
+		}
+		if b, ok := run.k.Runner.(busyRunner); !ok || b.dir != run.progs {
+			t.Fatalf("run %d: the runs are not made again on a busy program: %#v", i, run.k.Runner)
+		}
 		k, _ := run.in("run", &diags)
 		if err := run.script(context.Background(), k, ref); err != nil {
 			t.Fatal(err)
 		}
-		if b, err := os.ReadFile(filepath.Join(k.Dir, "notes.sh")); err != nil || string(b) != "echo bootstrap\n" {
+		own := filepath.Join(run.progs, "run", "notes-stow")
+		if b, err := os.ReadFile(filepath.Join(k.Dir, "notes.sh")); err != nil || string(b) != "#!/bin/sh\nexec '"+own+"' \"$@\"\n" {
 			t.Fatalf("run %d: script %q %v", i, b, err)
+		}
+		ofRef := filepath.Join(cache, strings.TrimPrefix(map[string]string{image: digest, image2: digest2}[ref], "sha256:"), strings.ReplaceAll(Platform, "/", "-"), "notes-stow")
+		if !sameFile(t, own, ofRef) {
+			t.Fatalf("run %d: the run's program is not a link to the kept one", i)
 		}
 		run.close()
 	}
-	if w.fetches != 2 {
-		t.Fatalf("%d fetches, want 2 (one per digest)", w.fetches)
+	if g.n != 2 {
+		t.Fatalf("%d reads, want 2 (one per digest)", g.n)
 	}
-	kept := filepath.Join(cache, strings.TrimPrefix(digest, "sha256:"), "bootstrap.sh")
-	if fi, err := os.Stat(kept); err != nil || fi.Mode() != 0o600 {
+	if fi, err := os.Stat(kept); err != nil || fi.Mode() != 0o700 {
 		t.Fatalf("kept %v %v", fi, err)
+	}
+	if b, _ := os.ReadFile(kept); string(b) != string(withPayload("exe of "+image)) {
+		t.Fatalf("kept %q", b)
 	}
 	if fi, err := os.Stat(filepath.Dir(kept)); err != nil || fi.Mode() != 0o700|os.ModeDir {
 		t.Fatalf("kept dir %v %v", fi, err)
 	}
+	noneLeft(t, tmp)
+	noneLeft(t, filepath.Join(cache, "runs"))
+}
+
+// sameFile says whether a and b are the same file (a hard link of one another).
+func sameFile(t *testing.T, a, b string) bool {
+	t.Helper()
+	fa, err := os.Stat(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fb, err := os.Stat(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return os.SameFile(fa, fb)
+}
+
+// The program a run executes is its own, in its directory: a prune of the cache removing the
+// entry it came from (another run's, meanwhile) leaves it whole.
+func TestProgramOutlivesAPrune(t *testing.T) {
+	t.Parallel()
+	g := &countingGet{}
+	src := nativeSource{get: g.get}
+	d := &Data{CacheDir: t.TempDir()}
+	for _, fresh := range []bool{true, false} {
+		dir := t.TempDir()
+		p, err := src.Program(context.Background(), d, Want{Ref: image}, dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if filepath.Dir(p.Path) != dir || p.Kept == "" || !sameFile(t, p.Path, p.Kept) {
+			t.Fatalf("fresh %v: %+v", fresh, p)
+		}
+		if fi, err := os.Stat(p.Path); err != nil || fi.Mode() != 0o700 {
+			t.Fatalf("fresh %v: %v %v", fresh, fi, err)
+		}
+		if fresh {
+			continue // the second takes the cache's
+		}
+		if err := os.RemoveAll(filepath.Join(d.CacheDir, strings.TrimPrefix(digest, "sha256:"))); err != nil {
+			t.Fatal(err)
+		}
+		if b, err := os.ReadFile(p.Path); err != nil || string(b) != string(withPayload("exe of "+image)) {
+			t.Fatalf("after a prune: %q %v", b, err)
+		}
+	}
+	if g.n != 1 {
+		t.Fatalf("%d reads", g.n)
+	}
+}
+
+// A run's program is a hard link to the kept one, else a copy of it (0700, renamed into place:
+// nothing else left in the run's directory), on a cache hit as on a fetch, and a cache hit is
+// not fetched again.
+func TestProgramLinkFails(t *testing.T) {
+	t.Parallel()
+	g := &countingGet{}
+	fail := false
+	src := nativeSource{get: g.get, link: func(o, n string) error {
+		if fail {
+			return errors.New("invalid cross-device link")
+		}
+		return os.Link(o, n)
+	}}
+	d := &Data{CacheDir: t.TempDir()}
+	if _, err := src.Program(context.Background(), d, Want{Ref: image}, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	fail = true
+	for _, ref := range []string{image, image2} { // a cache hit, then a fetch
+		dir := t.TempDir()
+		p, err := src.Program(context.Background(), d, Want{Ref: ref}, dir)
+		if err != nil {
+			t.Fatalf("%s: %v", ref, err)
+		}
+		if p.Path != filepath.Join(dir, "notes-stow") || p.Kept == "" || sameFile(t, p.Path, p.Kept) {
+			t.Fatalf("%s: not a copy: %+v", ref, p)
+		}
+		if fi, err := os.Stat(p.Path); err != nil || fi.Mode() != 0o700 {
+			t.Fatalf("%s: %v %v", ref, fi, err)
+		}
+		if b, err := os.ReadFile(p.Path); err != nil || string(b) != string(withPayload("exe of "+ref)) {
+			t.Fatalf("%s: the copy %q %v", ref, b, err)
+		}
+		if left, _ := os.ReadDir(dir); len(left) != 1 {
+			t.Fatalf("%s: left %v", ref, left)
+		}
+	}
+	if g.n != 2 {
+		t.Fatalf("%d reads, want 2: the cache hit is not fetched again", g.n)
+	}
+}
+
+// A run's directory is in the cache's runs/ when there is a cache (so its program is a link to
+// the kept one), else in TempDir; making one removes the runs' directories a day old or more.
+func TestRunDir(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	if dir, err := (&Data{TempDir: tmp}).runDir("stowage-k8s-"); err != nil || filepath.Dir(dir) != tmp {
+		t.Fatalf("no cache: %q %v", dir, err)
+	}
+	d := &Data{TempDir: t.TempDir(), CacheDir: t.TempDir()}
+	runs := filepath.Join(d.CacheDir, "runs")
+	old, young := filepath.Join(runs, "stowage-k8s-old"), filepath.Join(runs, "stowage-k8s-young")
+	for _, p := range []string{old, young} {
+		if err := os.MkdirAll(filepath.Join(p, "sub"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	at := time.Now().Add(-runsStale)
+	if err := os.Chtimes(old, at, at); err != nil {
+		t.Fatal(err)
+	}
+	at = at.Add(time.Minute)
+	if err := os.Chtimes(young, at, at); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := d.runDir("stowage-seed-")
+	if err != nil || filepath.Dir(dir) != runs || !strings.HasPrefix(filepath.Base(dir), "stowage-seed-") {
+		t.Fatalf("cache: %q %v", dir, err)
+	}
+	if fi, err := os.Stat(dir); err != nil || fi.Mode() != 0o700|os.ModeDir {
+		t.Fatalf("mode %v %v", fi, err)
+	}
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Fatalf("a run's directory a day old is kept: %v", err)
+	}
+	if _, err := os.Stat(young); err != nil {
+		t.Fatalf("a younger one is removed: %v", err)
+	}
+	noneLeft(t, d.TempDir)
+	// A cache that cannot be written: TempDir.
+	ro := &Data{TempDir: t.TempDir(), CacheDir: filepath.Join(t.TempDir(), "file")}
+	if err := os.WriteFile(ro.CacheDir, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if dir, err := ro.runDir("stowage-k8s-"); err != nil || filepath.Dir(dir) != ro.TempDir {
+		t.Fatalf("a cache that cannot be written: %q %v", dir, err)
+	}
+}
+
+// Without a cache, the program is written in the run's directory, removed with it.
+func TestK8sNoCache(t *testing.T) {
+	t.Parallel()
+	g := &countingGet{}
+	tmp := t.TempDir()
+	r := &installResource{data: &Data{NewRunner: func(Connection) (target.Runner, error) { return quietRunner{}, nil }, TempDir: tmp, Installers: nativeSource{get: g.get}}}
+	var diags diag.Diagnostics
+	run := r.k8sStart(context.Background(), &installModel{Kubernetes: &k8sModel{Namespace: types.StringValue("notes")}}, "notes", &diags)
+	k, _ := run.in("run", &diags)
+	if err := run.script(context.Background(), k, image); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(filepath.Join(run.progs, "run", "notes-stow")); err != nil || fi.Mode() != 0o700 {
+		t.Fatalf("written %v %v", fi, err)
+	}
+	run.close()
 	noneLeft(t, tmp)
 }
 
@@ -954,15 +1162,16 @@ func TestK8sSettleCanceled(t *testing.T) {
 	}
 }
 
-// A kept script whose checksum does not match is fetched again; the cache keeps the last used
+// A kept program whose checksum does not match is read again; the cache keeps the last used
 // cacheKeep entries.
 func TestK8sScriptCacheChecksAndEvicts(t *testing.T) {
 	t.Parallel()
-	w := &writingRunner{}
+	g := &countingGet{}
 	cache := t.TempDir()
-	r := &installResource{data: &Data{NewRunner: func(Connection) (target.Runner, error) { return w, nil }, TempDir: t.TempDir(), CacheDir: cache}}
+	r := &installResource{data: &Data{NewRunner: func(Connection) (target.Runner, error) { return quietRunner{}, nil }, TempDir: t.TempDir(), CacheDir: cache,
+		Installers: nativeSource{get: g.get}}}
 	m := &installModel{Kubernetes: &k8sModel{Namespace: types.StringValue("notes")}}
-	fetch := func(ref string) {
+	fetchOne := func(ref string) {
 		var diags diag.Diagnostics
 		run := r.k8sStart(context.Background(), m, "notes", &diags)
 		defer run.close()
@@ -971,19 +1180,21 @@ func TestK8sScriptCacheChecksAndEvicts(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	fetch(image)
-	entry := filepath.Join(cache, strings.TrimPrefix(digest, "sha256:"))
-	if err := os.WriteFile(filepath.Join(entry, "bootstrap.sh"), []byte("echo tampered\n"), 0o600); err != nil {
+	fetchOne(image)
+	kept := filepath.Join(cache, strings.TrimPrefix(digest, "sha256:"), strings.ReplaceAll(Platform, "/", "-"), "notes-stow")
+	if err := os.WriteFile(kept, []byte("tampered"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	fetch(image)
-	if w.fetches != 2 {
-		t.Fatalf("%d fetches: a script not matching its checksum was used", w.fetches)
+	fetchOne(image)
+	if b, _ := os.ReadFile(kept); g.n != 2 || string(b) != string(withPayload("exe of "+image)) {
+		t.Fatalf("%d reads, kept %q: a program not matching its checksum was used", g.n, b)
 	}
 	for i := 0; i < cacheKeep+2; i++ {
-		fetch(fmt.Sprintf("registry.example.com/notes/notes-installer@sha256:%064x", i))
+		fetchOne(fmt.Sprintf("registry.example.com/notes/notes-installer@sha256:%064x", i))
 	}
-	if entries, _ := os.ReadDir(cache); len(entries) != cacheKeep {
+	entries, _ := os.ReadDir(cache)
+	entries = slices.DeleteFunc(entries, func(e os.DirEntry) bool { return e.Name() == "runs" })
+	if len(entries) != cacheKeep {
 		t.Fatalf("%d entries kept, want %d", len(entries), cacheKeep)
 	}
 }
@@ -1393,7 +1604,7 @@ func TestK8sImportedTakeOverComparesTheRecordedValues(t *testing.T) {
 	}
 }
 
-// kubernetes.values goes to helm as a values file (`--values`, on standard input) at the install,
+// values goes to helm as a values file (`--values`, on standard input) at the install,
 // a change of it alone applies the release again with it, an upgrade carries it, a rollback beside
 // a change of it is refused, and leaving it out runs nothing, with a warning.
 func TestK8sChartValues(t *testing.T) {
@@ -1450,7 +1661,7 @@ func TestK8sChartValues(t *testing.T) {
 	back := cfg("replicas: 4\n", map[string]tftypes.Value{"allow_rollback": boolean(true)})
 	p := h.plan(upgraded.NewState, back)
 	got := errorsOf(p.Diagnostics) + errorsOf(h.apply(upgraded.NewState, p.PlannedState, back).Diagnostics)
-	if !strings.Contains(got, "a rollback goes alone") || !strings.Contains(got, "kubernetes.values") || len(h.fake.callsOf("k8s-rollback")) != 0 {
+	if !strings.Contains(got, "a rollback goes alone") || !strings.Contains(got, "values") || len(h.fake.callsOf("k8s-rollback")) != 0 {
 		t.Fatalf("a rollback with values changed: %q %q", got, h.fake.ops())
 	}
 	// State's previous stale (the plan sees no rollback): the apply, reading the release's, refuses.
@@ -1509,7 +1720,7 @@ func TestK8sChartValues(t *testing.T) {
 	// Left out: nothing runs, and the plan says the release keeps them.
 	h.fake.reset()
 	p = h.plan(state, cfg("", nil))
-	if w := warningsOf(p.Diagnostics); !strings.Contains(w, "kubernetes.values left out: the release keeps its values") {
+	if w := warningsOf(p.Diagnostics); !strings.Contains(w, "values left out: the release keeps its values") {
 		t.Fatalf("left out: %q", w)
 	}
 	if d := errorsOf(h.apply(state, p.PlannedState, cfg("", nil)).Diagnostics); d != "" || len(h.fake.callsOf("k8s-upgrade")) != 0 {
@@ -1517,7 +1728,7 @@ func TestK8sChartValues(t *testing.T) {
 	}
 }
 
-// An imported release taken over with kubernetes.values: its recorded inputs matching, the release
+// An imported release taken over with values: its recorded inputs matching, the release
 // is still applied again with the values (they are not read), which the plan's report says.
 func TestK8sImportedTakeOverGivesTheChartValues(t *testing.T) {
 	t.Parallel()
@@ -1531,7 +1742,7 @@ func TestK8sImportedTakeOverGivesTheChartValues(t *testing.T) {
 		return h.k8sConfig(c)
 	}
 	p := h.plan(state, cfg(map[string]tftypes.Value{"plan_dry_run": boolean(true)}))
-	if w := warningsOf(p.Diagnostics); !strings.Contains(w, "its values match, applied again for kubernetes.values") || !strings.Contains(w, "It gives kubernetes.values again") {
+	if w := warningsOf(p.Diagnostics); !strings.Contains(w, "its values match, applied again for values") || !strings.Contains(w, "It gives values again") {
 		t.Fatalf("plan: %s %s", errorsOf(p.Diagnostics), w)
 	}
 	h.fake.reset()
@@ -1541,4 +1752,151 @@ func TestK8sImportedTakeOverGivesTheChartValues(t *testing.T) {
 	if ups := h.fake.callsOf("k8s-upgrade"); len(ups) != 1 || untarAll(t, ups[0].stdin)["values"] != "replicas: 2\n" {
 		t.Fatalf("calls %q", h.fake.ops())
 	}
+}
+
+// Part files a fetch cut off left (fetch.PartPattern) are removed once unwritten for partStale:
+// at a fetch into their entry, and by a prune of the cache's entries kept; a newer one (a fetch
+// under way) and any other file stay.
+func TestStalePartsAreRemoved(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	parts := func(t *testing.T, dir string) (stale, fresh, other string) {
+		t.Helper()
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		stale, fresh, other = filepath.Join(dir, ".installer-1.part"), filepath.Join(dir, ".installer-2.part"), filepath.Join(dir, ".keys.json-3")
+		for p, age := range map[string]time.Duration{stale: partStale, fresh: partStale - time.Minute, other: 2 * partStale} {
+			if err := os.WriteFile(p, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chtimes(p, now.Add(-age), now.Add(-age)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return stale, fresh, other
+	}
+	left := func(t *testing.T, gone string, kept ...string) {
+		t.Helper()
+		if _, err := os.Stat(gone); !os.IsNotExist(err) {
+			t.Errorf("%s left: %v", gone, err)
+		}
+		for _, k := range kept {
+			if _, err := os.Stat(k); err != nil {
+				t.Errorf("%s removed: %v", k, err)
+			}
+		}
+	}
+	plat := strings.ReplaceAll(Platform, "/", "-")
+	// At the boundary, against a fixed now.
+	dir := t.TempDir()
+	stale, fresh, other := parts(t, dir)
+	removeStaleParts(dir, now)
+	left(t, stale, fresh, other)
+	// A fetch into the entry, before it reads anything: one that fails then (no prune follows).
+	d := &Data{CacheDir: t.TempDir()}
+	stale, fresh, other = parts(t, filepath.Join(d.CacheDir, strings.TrimPrefix(digest, "sha256:"), plat))
+	failing := func(context.Context, string, fetch.Options) (*fetch.Installer, error) {
+		return nil, errors.New("the registry is away")
+	}
+	if _, err := (nativeSource{get: failing}).Program(context.Background(), d, Want{Ref: image}, t.TempDir()); err == nil {
+		t.Fatal("no error")
+	}
+	left(t, stale, fresh, other)
+	// A prune: the entry kept and another kept entry.
+	cache := t.TempDir()
+	keep := strings.Repeat("a", 64)
+	s1, f1, o1 := parts(t, filepath.Join(cache, keep, plat))
+	s2, f2, o2 := parts(t, filepath.Join(cache, strings.Repeat("b", 64), plat))
+	prune(cache, keep)
+	left(t, s1, f1, o1)
+	left(t, s2, f2, o2)
+}
+
+// scriptedRunner answers each run with the next of its replies (the last one again after them),
+// and counts the runs; after, when set, runs after each.
+type scriptedRunner struct {
+	replies []reply
+	n       int
+	after   func(n int)
+}
+
+func (s *scriptedRunner) Run(context.Context, []string, []byte) ([]byte, []byte, int, error) {
+	r := s.replies[min(s.n, len(s.replies)-1)]
+	s.n++
+	if s.after != nil {
+		s.after(s.n)
+	}
+	return []byte(r.stdout), []byte(r.stderr), r.exit, nil
+}
+
+// A run the shell could not exec as its program in the run's directory was busy (ETXTBSY) is made
+// again, up to busyTries times; any other failure is the run's result at once.
+func TestBusyRunnerRetries(t *testing.T) {
+	t.Parallel()
+	const dir = "/cache/runs/stowage-k8s-1/run"
+	busyDash := reply{exit: 126, stderr: "./notes.sh: 2: exec: " + dir + "/notes-stow: Text file busy\n"}
+	busyBash := reply{exit: 126, stderr: "./notes.sh: line 2: " + dir + "/notes-stow: Text file busy\n"}
+	for name, c := range map[string]struct {
+		replies []reply
+		runs    int
+		exit    int
+	}{
+		"busy, then runs":     {[]reply{busyDash, busyBash, {stdout: "ok"}}, 3, 0},
+		"busy every time":     {[]reply{busyDash}, busyTries, 126},
+		"another program":     {[]reply{{exit: 126, stderr: "./notes.sh: 2: exec: /elsewhere/notes-stow: Text file busy\n"}}, 1, 126},
+		"not exit 126":        {[]reply{{exit: 1, stderr: dir + "/notes-stow: Text file busy\n"}}, 1, 1},
+		"another 126":         {[]reply{{exit: 126, stderr: "./notes.sh: 2: exec: " + dir + "/notes-stow: Permission denied\n"}}, 1, 126},
+		"the program's error": {[]reply{{exit: 3, stdout: `{"format":1}`}}, 1, 3},
+	} {
+		s := &scriptedRunner{replies: c.replies}
+		_, _, exit, err := busyRunner{Runner: s, dir: dir, delay: time.Microsecond}.Run(context.Background(), []string{"sh"}, nil)
+		if err != nil || exit != c.exit || s.n != c.runs {
+			t.Errorf("%s: exit %d, %d runs, %v", name, exit, s.n, err)
+		}
+	}
+	// A cancelled context stops the retries.
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &scriptedRunner{replies: []reply{busyDash}, after: func(int) { cancel() }}
+	if _, _, exit, _ := (busyRunner{Runner: s, dir: dir, delay: time.Hour}).Run(ctx, []string{"sh"}, nil); exit != 126 || s.n != 1 {
+		t.Fatalf("cancelled: exit %d, %d runs", exit, s.n)
+	}
+}
+
+// The real shell's ETXTBSY: a program held open for writing does not run, and once closed, the
+// run made again runs it.
+func TestBusyRunnerRealShell(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	prog := filepath.Join(dir, "notes-stow")
+	testutil.WriteExecutable(t, prog, "#!/bin/sh\necho ran \"$@\"\n")
+	if err := wrapper(dir, "notes", prog); err != nil {
+		t.Fatal(err)
+	}
+	held, err := os.OpenFile(prog, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &scriptedRunner{}
+	inner := runFunc(func(ctx context.Context, argv []string, stdin []byte) ([]byte, []byte, int, error) {
+		stdout, stderr, exit, err := target.Local{}.Run(ctx, argv, stdin)
+		if s.n++; s.n == 1 {
+			if exit != 126 || !strings.Contains(strings.ToLower(string(stderr)), "text file busy") {
+				t.Errorf("the first run: exit %d %q", exit, stderr)
+			}
+			_ = held.Close()
+		}
+		return stdout, stderr, exit, err
+	})
+	stdout, stderr, exit, err := busyRunner{Runner: inner, dir: dir, delay: time.Millisecond}.Run(context.Background(), []string{"sh", filepath.Join(dir, "notes.sh"), "x"}, nil)
+	if err != nil || exit != 0 || string(stdout) != "ran x\n" || s.n < 2 {
+		t.Fatalf("exit %d, %d runs, %q %q %v", exit, s.n, stdout, stderr, err)
+	}
+}
+
+// runFunc is a function as a target.Runner.
+type runFunc func(ctx context.Context, argv []string, stdin []byte) ([]byte, []byte, int, error)
+
+func (f runFunc) Run(ctx context.Context, argv []string, stdin []byte) ([]byte, []byte, int, error) {
+	return f(ctx, argv, stdin)
 }

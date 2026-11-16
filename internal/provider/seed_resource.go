@@ -40,6 +40,14 @@ var nicType = map[string]attr.Type{"mac": types.StringType, "attach": types.Stri
 
 var diskFileType = map[string]attr.Type{"path": types.StringType, "format": types.StringType, "sha256": types.StringType, "disk_gib": types.Int64Type}
 
+var boundType = types.ObjectType{AttrTypes: map[string]attr.Type{"min": types.Int64Type, "recommended": types.Int64Type}}
+
+var sizeType = map[string]attr.Type{"cpus": boundType, "memory_mib": boundType, "app_gib": boundType}
+
+var portType = types.ObjectType{AttrTypes: map[string]attr.Type{"protocol": types.StringType, "port": types.Int64Type, "sources": types.ListType{ElemType: types.StringType}}}
+
+var firewallType = map[string]attr.Type{"ssh_sources": types.ListType{ElemType: types.StringType}, "open_ports": types.ListType{ElemType: portType}}
+
 type seedModel struct {
 	ID             types.String   `tfsdk:"id"`
 	Installer      types.String   `tfsdk:"installer"`
@@ -83,6 +91,10 @@ type seedModel struct {
 	DiskFile       types.Object   `tfsdk:"disk_file"`
 	AwaitTLS       types.Bool     `tfsdk:"await_tls"`
 	NICs           types.Map      `tfsdk:"nics"`
+	CtlPath        types.String   `tfsdk:"ctl_path"`
+	Size           types.Object   `tfsdk:"size"`
+	Firewall       types.Object   `tfsdk:"firewall"`
+	AwaitGiven     types.List     `tfsdk:"await_given"`
 	Timeouts       timeouts.Value `tfsdk:"timeouts"`
 }
 
@@ -91,6 +103,7 @@ type seedResource struct{ data *Data }
 var (
 	_ resource.ResourceWithConfigure      = (*seedResource)(nil)
 	_ resource.ResourceWithValidateConfig = (*seedResource)(nil)
+	_ resource.ResourceWithModifyPlan     = (*seedResource)(nil)
 )
 
 func newSeedResource() resource.Resource { return &seedResource{} }
@@ -134,9 +147,9 @@ func (r *seedResource) Schema(ctx context.Context, _ resource.SchemaRequest, res
 			Validators:    []validator.Int64{int64validator.Between(1, 65535)}}
 	}
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "A new Kairos VM's first-boot material, `vm seed --json` of the release an installer carries, run on the machine running OpenTofu (`docker run --rm <installer> > <name>.sh`, then `sh <name>.sh vm seed --json …`; a linux/amd64 machine with Docker). " +
+		MarkdownDescription: "A new Kairos VM's first-boot material, `vm seed --json` of the release an installer carries, run on the machine running OpenTofu: the installer image's entry for that machine's platform (linux/amd64, linux/arm64, darwin/amd64 or darwin/arm64), read from the registry and checked against the release's keys, kept in the provider's cache (`ctl_path`), with no Docker. " +
 			"Generated once: its one-time SSH host key would change at every plan otherwise, so every change of an argument replaces it. " +
-			"Feed `user_data` and `disk` to the resource that creates the VM (a hypervisor's or a cloud's own provider), and `known_hosts_line` to `stowage_install`'s `vm` block. " +
+			"Feed `user_data` and `disk` to the resource that creates the VM (a hypervisor's or a cloud's own provider), and `known_hosts_line`, `short_name` and `version` to `stowage_vm_install`. " +
 			"`user_data` and `host_key_private` hold the one-time host key's private key: they are in state, which should be encrypted.",
 		Attributes: map[string]schema.Attribute{
 			"id": out("The one-time host key's fingerprint.", false),
@@ -169,21 +182,21 @@ func (r *seedResource) Schema(ctx context.Context, _ resource.SchemaRequest, res
 			"add_hosts":    smap("Host records, name → IP (`--add-host NAME=IP`)."),
 			"interfaces":   smap("NICs the release names, role → spec (`--interface ROLE=SPEC`)."),
 			"device":       str("`metal`: the disk the OS installs on (`--device`), wiped."),
-			"tls":          str("The front's TLS mode (`--tls`): `acme`, `dns-cloudflare`, `internal` or `byo`. With `byo` the VM's first install waits for the certificate, its key and CA, given over SSH by `stowage_install`'s `given_wo` (its `tls` section); the seed carries none (`await_tls`).", stringvalidator.OneOf(TLSModes...)),
+			"tls":          str("The front's TLS mode (`--tls`): `acme`, `dns-cloudflare`, `internal` or `byo`. With `byo` the VM's first install waits for the certificate, its key and CA, given over SSH by `stowage_vm_install`'s `given_wo` (its `tls` section); the seed carries none (`await_tls`).", stringvalidator.OneOf(TLSModes...)),
 			"domains":      smap("Route → domain (`--domains route=host,…`)."),
 			"http_port":    port("The VM's HTTP port in a TLS mode (`--http-port`)."),
 			"https_port":   port("The VM's HTTPS port in a TLS mode (`--https-port`)."),
-			"inputs":       smap("Non-secret inputs (`--set KEY=VALUE`), in the cloud-config and in state. A secret input is refused by the installer: give it to `stowage_install`'s `secret_inputs_wo`, which goes over SSH once the VM answers."),
+			"inputs":       smap("Non-secret inputs (`--set KEY=VALUE`), in the cloud-config and in state. A secret input is refused by the installer: give it to `stowage_vm_install`'s `secret_inputs_wo`, which goes over SSH once the VM answers."),
 			"await_secrets": schema.BoolAttribute{Optional: true, PlanModifiers: []planmodifier.Bool{boolplanmodifier.RequiresReplace()},
-				MarkdownDescription: "The VM's first install waits for a decrypted `secrets export` (`--await-secrets`): a machine made again, given by `stowage_install`'s `secrets_wo` over SSH once the VM answers. Refused with `tls = \"byo\"` by the installer (the first install waits for one of them)."},
+				MarkdownDescription: "The VM's first install waits for a decrypted `secrets export` (`--await-secrets`): a machine made again, given by `stowage_vm_install`'s `secrets_wo` over SSH once the VM answers. Refused with `tls = \"byo\"` by the installer (the first install waits for one of them)."},
 			"disk_dir":   str("An existing directory on the machine running OpenTofu the `platform`'s disk is written into, decompressed (`--disk-dir`): `disk_file` names it, for a hypervisor resource that imports a local file. The file is the caller's: destroying the seed leaves it, and a file of that name already holding the disk is kept."),
 			"name":       out("The project's name (`describe`'s).", false),
-			"short_name": out("The installer's short name: the VM runs `<short_name>-stow`. Give it to `stowage_install`'s `vm.short_name`.", false),
+			"short_name": out("The installer's short name: the VM runs `<short_name>-stow`. Give it to `stowage_vm_install`'s `short_name`.", false),
 			"version":    out("The release the seed's disk boots first.", false),
 			"revision": schema.Int64Attribute{Computed: true, MarkdownDescription: "That release's package revision.",
 				PlanModifiers: []planmodifier.Int64{int64planmodifier.UseStateForUnknown()}},
 			"user_data":        out("The cloud-config for `platform`: a NoCloud seed's `user-data`, or a cloud's user data. It holds no secret input, but the one-time host key's private key.", true),
-			"known_hosts_line": out("The one-time host key as a `known_hosts` line, under the name `vm-seed-host-key`: give it to `stowage_install`'s `vm.known_hosts_line`.", false),
+			"known_hosts_line": out("The one-time host key as a `known_hosts` line, under the name `vm-seed-host-key`: give it to `stowage_vm_install`'s `known_hosts_line`.", false),
 			"fingerprint":      out("The one-time host key's SHA256 fingerprint, as ssh prints it.", false),
 			"host_key_private": out("The one-time host key's OpenSSH private key, which the VM serves until its install and the reboot after it.", true),
 			"disk": schema.MapAttribute{Computed: true, ElementType: types.ObjectType{AttrTypes: diskType},
@@ -198,12 +211,22 @@ func (r *seedResource) Schema(ctx context.Context, _ resource.SchemaRequest, res
 			"await_tls": schema.BoolAttribute{Computed: true, MarkdownDescription: "The VM's first install waits for a `byo` certificate given over SSH (`tls = \"byo\"`).",
 				PlanModifiers: []planmodifier.Bool{boolplanmodifier.UseStateForUnknown()}},
 			"nics": schema.MapAttribute{Computed: true, ElementType: types.ObjectType{AttrTypes: nicType},
-				MarkdownDescription: "The NICs the VM is made with, by role (the release's `host.interfaces`, as `interfaces` gives them): `mac`, the MAC its cloud-config names it by — given (`mac=`), else generated for a hypervisor's VM of more than one NIC; null for a VM of one NIC, named from the NIC it has, and on a cloud, which gives its NICs their MACs —, `attach`, the network it attaches to (`attach=`; null: the primary's), and `primary`. " +
-					"Give each NIC of the VM's resource its `mac`: a NIC of another MAC is not named, and the VM's network does not come up as the release expects. Empty when the release declares no NIC; null from an installer made before Stowage 0.38.0, which names none (with a warning: give each NIC's `mac=` in `interfaces`).",
+				MarkdownDescription: "The NICs the VM is made with, by role (the release's `host.interfaces`, as `interfaces` gives them): `mac`, the MAC its cloud-config names it by — given (`mac=`), else, on a hypervisor with several roles, generated at random (locally administered), each seed its own (state keeps it); null for a release's one role given no MAC (the VM names it by its original name and pins that name to the NIC's MAC at its first boot: give that NIC the platform's MAC, or one of the root's), and on a cloud, which gives its NICs their MACs —, `attach`, the network it attaches to (`attach=`; null: the primary's), and `primary`. " +
+					"Give each NIC of the VM's resource its `mac`: a NIC of another MAC is not named, and the VM's network does not come up as the release expects. Empty when the release declares no NIC: the VM's one NIC keeps the kernel's name, its MAC the platform's or the root's; null from an installer made before Stowage 0.38.0, which names none (with a warning: give each NIC's `mac=` in `interfaces`).",
 				PlanModifiers: []planmodifier.Map{mapplanmodifier.UseStateForUnknown()}},
 			"waiting": schema.ListAttribute{Computed: true, ElementType: types.StringType,
-				MarkdownDescription: "The required secret inputs nothing gives, sorted: the VM's first install waits for them, which `stowage_install`'s `secret_inputs_wo` gives over SSH.",
+				MarkdownDescription: "The required secret inputs nothing gives, sorted: the VM's first install waits for them, which `stowage_vm_install`'s `secret_inputs_wo` gives over SSH.",
 				PlanModifiers:       []planmodifier.List{listplanmodifier.UseStateForUnknown()}},
+			"await_given": schema.ListAttribute{Computed: true, ElementType: types.StringType,
+				MarkdownDescription: "The secret inputs the release's answers would hold, sorted (never a value), which the first install waits for too: `stowage_vm_install`'s `given_wo` gives them over SSH. Empty when none.",
+				PlanModifiers:       []planmodifier.List{listplanmodifier.UseStateForUnknown()}},
+			"ctl_path": out("The installer for the machine running OpenTofu, `<short_name>-stow` with the release's payload, kept in the provider's cache (the user's cache directory's `terraform-provider-stowage/installers/<index digest>/<os>-<arch>/`): the program a root's steps run (`vm truenas import-image|seed|stop`, `vm host-key`, `vm kit …`). A refresh fetches it again when it is gone (a cache cleared, another machine), at the same path when this machine's cache is the one it names.", false),
+			"size": schema.ObjectAttribute{Computed: true, AttributeTypes: sizeType,
+				MarkdownDescription: "The VM's size the release takes: `cpus`, `memory_mib` and `app_gib` (the app's space, which each disk's `disk_gib` adds to `os_gib`), each `{min, recommended}`. A root refuses a VM under `min` and warns under `recommended`. Null from an installer made before Stowage 0.40.0.",
+				PlanModifiers:       []planmodifier.Object{objectplanmodifier.UseStateForUnknown()}},
+			"firewall": schema.ObjectAttribute{Computed: true, AttributeTypes: firewallType,
+				MarkdownDescription: "What a platform's firewall in front of the VM (a cloud's security group) lets through, as the VM's own firewall opens it: `ssh_sources` (CIDRs) and `open_ports`, each `{protocol, port, sources}` (the front's HTTP and HTTPS ports, each L4 route's port and its allowed sources). Null from an installer made before Stowage 0.40.0.",
+				PlanModifiers:       []planmodifier.Object{objectplanmodifier.UseStateForUnknown()}},
 		},
 		Blocks: map[string]schema.Block{
 			"timeouts": timeouts.Block(ctx, timeouts.Opts{Create: true}),
@@ -263,7 +286,7 @@ func (r *seedResource) Create(ctx context.Context, req resource.CreateRequest, r
 		return
 	}
 	// The installer runs here, in a private directory of its own.
-	work, err := os.MkdirTemp("", "stowage-seed-")
+	work, err := r.data.runDir("stowage-seed-")
 	if err != nil {
 		resp.Diagnostics.AddError("A directory for the installer", err.Error())
 		return
@@ -274,9 +297,22 @@ func (r *seedResource) Create(ctx context.Context, req resource.CreateRequest, r
 		resp.Diagnostics.AddError("Running the installer here", err.Error())
 		return
 	}
-	d := installer.Docker{Runner: run, WorkDir: work, Name: name, Mirror: r.data.mirrorLogin()}
-	if err := d.Fetch(ctx, ref, r.data.fetchLogin(host)); err != nil {
+	d := installer.Docker{Runner: busyRunner{Runner: run, dir: work}, WorkDir: work, Name: name, Mirror: r.data.mirrorLogin()}
+	prog, err := r.data.source().Program(ctx, r.data, Want{Ref: ref, Configured: []string{ref}}, work)
+	if err != nil {
 		addInstallerError(&resp.Diagnostics, "Fetching the installer", err)
+		return
+	}
+	ctl := prog.Path
+	if prog.Kept != "" {
+		m.CtlPath = types.StringValue(prog.Kept)
+	} else {
+		resp.Diagnostics.AddWarning("No cache for ctl_path",
+			"The provider has no cache directory on this machine (the user's cache directory), so the installer is not kept: ctl_path is null, and a root's steps need another program.")
+		m.CtlPath = types.StringNull()
+	}
+	if err := wrapper(work, name, ctl); err != nil {
+		resp.Diagnostics.AddError("Writing the installer's script", err.Error())
 		return
 	}
 	desc, err := d.Describe(ctx)
@@ -346,7 +382,40 @@ func (r *seedResource) Create(ctx context.Context, req resource.CreateRequest, r
 	waiting, d2 := types.ListValueFrom(ctx, types.StringType, seed.Waiting)
 	resp.Diagnostics.Append(d2...)
 	m.Waiting = waiting
+	given, d3 := types.ListValueFrom(ctx, types.StringType, seed.AwaitGiven)
+	resp.Diagnostics.Append(d3...)
+	m.AwaitGiven = given
+	m.Size, m.Firewall = seedSize(seed.Size), seedFirewall(ctx, seed.Firewall, &resp.Diagnostics)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
+}
+
+// seedSize is the seed's size as its attribute: null without one.
+func seedSize(z *installer.SeedSize) types.Object {
+	if z == nil {
+		return types.ObjectNull(sizeType)
+	}
+	b := func(v installer.SeedBound) attr.Value {
+		return types.ObjectValueMust(boundType.AttrTypes, map[string]attr.Value{"min": types.Int64Value(v.Min), "recommended": types.Int64Value(v.Recommended)})
+	}
+	return types.ObjectValueMust(sizeType, map[string]attr.Value{"cpus": b(z.CPUs), "memory_mib": b(z.MemoryMiB), "app_gib": b(z.AppGiB)})
+}
+
+// seedFirewall is the seed's firewall as its attribute: null without one.
+func seedFirewall(ctx context.Context, f *installer.SeedFirewall, diags *diag.Diagnostics) types.Object {
+	if f == nil {
+		return types.ObjectNull(firewallType)
+	}
+	list := func(l []string) attr.Value {
+		v, d := types.ListValueFrom(ctx, types.StringType, append([]string{}, l...))
+		diags.Append(d...)
+		return v
+	}
+	ports := make([]attr.Value, 0, len(f.OpenPorts))
+	for _, p := range f.OpenPorts {
+		ports = append(ports, types.ObjectValueMust(portType.AttrTypes, map[string]attr.Value{
+			"protocol": types.StringValue(p.Protocol), "port": types.Int64Value(p.Port), "sources": list(p.Sources)}))
+	}
+	return types.ObjectValueMust(firewallType, map[string]attr.Value{"ssh_sources": list(f.SSHSources), "open_ports": types.ListValueMust(portType, ports)})
 }
 
 // seedLogin is the provider's pull account for the seed's own reads of the registry (its disks),
@@ -392,8 +461,49 @@ func (r *seedResource) seedArgs(ctx context.Context, m *seedModel, diags *diag.D
 	}
 }
 
-// Read keeps state: a seed is generated once, and nothing remote holds it.
-func (r *seedResource) Read(context.Context, resource.ReadRequest, *resource.ReadResponse) {}
+// Read keeps state — a seed is generated once, and nothing remote holds it — but ctl_path: a
+// program gone from the cache is fetched again, at the path state names when it is this
+// machine's cache's (a root's destroy-time step runs the path it recorded), else where this
+// machine's cache keeps it.
+func (r *seedResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
+	var m seedModel
+	resp.Diagnostics.Append(req.State.Get(ctx, &m)...)
+	if resp.Diagnostics.HasError() || !known(m.CtlPath) || r.data == nil {
+		return
+	}
+	if fi, err := os.Stat(m.CtlPath.ValueString()); err == nil && fi.Mode().IsRegular() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, seedTimeout)
+	defer cancel()
+	work, err := r.data.runDir("stowage-seed-")
+	if err != nil {
+		resp.Diagnostics.AddWarning("ctl_path is gone", "The installer kept for this seed is gone, and could not be fetched again: "+err.Error())
+		return
+	}
+	defer os.RemoveAll(work)
+	ref := m.Installer.ValueString()
+	prog, err := r.data.source().Program(ctx, r.data, Want{Ref: ref, Configured: []string{ref}}, work)
+	if err != nil || prog.Kept == "" {
+		why := "this machine has no cache directory"
+		if err != nil {
+			why = err.Error()
+		}
+		resp.Diagnostics.AddWarning("ctl_path is gone",
+			fmt.Sprintf("The installer kept for this seed (%s) is gone, and could not be fetched again: %s. A root's steps running it fail until it is there.", m.CtlPath.ValueString(), why))
+		return
+	}
+	m.CtlPath = types.StringValue(prog.Kept)
+	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
+}
+
+// ModifyPlan warns, at a create's plan, that without the provider's public_keys the installer is
+// trusted by its digest alone.
+func (r *seedResource) ModifyPlan(_ context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	if req.State.Raw.IsNull() && !req.Plan.Raw.IsNull() {
+		digestTrustWarning(r.data, &resp.Diagnostics)
+	}
+}
 
 // Update is reached only by a change of timeouts: every argument replaces the seed.
 func (r *seedResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {

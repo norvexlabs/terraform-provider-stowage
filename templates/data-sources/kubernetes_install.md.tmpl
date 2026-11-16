@@ -1,0 +1,41 @@
+---
+page_title: "{{.Name}} {{.Type}} - {{.ProviderName}}"
+subcategory: ""
+description: |-
+{{ .Description | plainmarkdown | trimspace | prefixlines "  " }}
+---
+
+# {{.Name}} ({{.Type}})
+
+{{ .Description | trimspace }}
+
+## Example Usage
+
+{{ tffile .ExampleFile }}
+
+{{ .SchemaMarkdown | trimspace }}
+
+## Details
+
+Reads a Kubernetes release's `k8s status --json --values` without managing it, on the cluster the
+provider's `kubernetes` block reaches: the installer image given is read from its registry for the
+machine running OpenTofu, checked against the provider's `public_keys` when given (as `stowage_vm_seed`'s: [trust](../guides/trust.md)), and runs
+there with `helm` and `kubectl` on `PATH`, in a private directory removed afterwards (the
+kubeconfig written there as the resource's). Nothing on the cluster changes. The read is bounded
+by 5 minutes. No release of the name (`No release`) and another project's (`Another project's
+release`) are errors.
+
+| Argument | | |
+|---|---|---|
+| `installer` | required | An installer image of the release's project by digest: its `k8s status` reads the release. |
+| `namespace` | required | The release's namespace, a DNS label. |
+| `release` | optional | The helm release's name; left out, the project's name. |
+
+| Attribute | |
+|---|---|
+| `id` | `<namespace>/<release>`. |
+| `installed`, `previous` | `{version, revision, installer}`; null before the first install, and when the install keeps no release for `rollback`. |
+| `channel`, `status` | As the resource's. |
+| `inputs` | The input keys the install records, sorted, never a value; null when the installer does not tell. |
+| `registry`, `registry_ca_digest` | What the first install recorded; null when the status gives none. |
+| `pull_login` | Whether the install holds its own registry login (`status --json --values` `pull_login`; the release's pull Secret holding a login a run gave); null from an installer that does not tell (before Stowage 0.40.0). |

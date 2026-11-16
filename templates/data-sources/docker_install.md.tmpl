@@ -1,0 +1,38 @@
+---
+page_title: "{{.Name}} {{.Type}} - {{.ProviderName}}"
+subcategory: ""
+description: |-
+{{ .Description | plainmarkdown | trimspace | prefixlines "  " }}
+---
+
+# {{.Name}} ({{.Type}})
+
+{{ .Description | trimspace }}
+
+## Example Usage
+
+{{ tffile .ExampleFile }}
+
+{{ .SchemaMarkdown | trimspace }}
+
+## Details
+
+Reads a Docker install's `status --json --values` without managing it, by the installer it keeps
+(`<work_dir>/<name>/<short_name>-stow status --json --values`, through the same scripts as the
+resource's read), on a host reached over SSH or on the machine running OpenTofu. Nothing on the
+target changes, and no installer image is fetched. The read is bounded by 5 minutes. No install in
+the directory (`No install`) and another project's (`Another project's install`) are errors.
+
+| Argument | | |
+|---|---|---|
+| `name`, `short_name` | required | The project's name (the install directory `<name>/`; compared with the status's) and the installer's short name, one path element each. |
+| `host`, `port`, `user`, `private_key_file`, `known_hosts_line`, `work_dir` | optional | As `stowage_docker_install`'s (left out, `host` is this machine and `work_dir` the home; `work_dir` an absolute, clean path). |
+
+| Attribute | |
+|---|---|
+| `id` | `<work_dir>/<name>`. |
+| `installed`, `previous` | `{version, revision, installer}`; null before the first install, and when the install keeps no release for `rollback`. |
+| `channel`, `status` | As the resource's. |
+| `inputs` | The input keys the install records, sorted, never a value; null when the installer does not tell. |
+| `registry`, `registry_ca_digest`, `address` | What the first install recorded; null when the status gives none. |
+| `pull_login` | Whether the install holds its own registry login (`status --json --values` `pull_login`); null from an installer that does not tell (before Stowage 0.40.0). |

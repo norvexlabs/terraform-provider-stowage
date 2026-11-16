@@ -1,0 +1,96 @@
+---
+page_title: "A VM per platform - stowage"
+subcategory: "Guides"
+description: |-
+  One complete OpenTofu root per platform: stowage_vm_seed, the platform's own provider making the VM, stowage_vm_install keeping it.
+---
+
+# A VM per platform
+
+Stowage keeps no state of a VM: an OpenTofu root of yours makes it, with the platform's own
+provider, from `stowage_vm_seed`, and `stowage_vm_install` installs and keeps it. Each platform has
+a complete root in the provider's repository, `examples/guides/<platform>-vm/`: copy it into your
+own root. Each README lists its resources' import IDs, for a VM made by Stowage 0.39.0 or earlier
+(`vm create --create opentofu`, whose state Stowage reads no more).
+
+| Root | Platform's provider | Status |
+|---|---|---|
+| [`truenas-vm`](https://github.com/norvexlabs/terraform-provider-stowage/tree/main/examples/guides/truenas-vm) | `truenas/truenas` 1.9.1, with Stowage's `vm truenas` steps | proven (`make acc-vm`), but `extra_nics` |
+| [`proxmox-vm`](https://github.com/norvexlabs/terraform-provider-stowage/tree/main/examples/guides/proxmox-vm) | `bpg/proxmox` 0.117.0 | preview |
+| [`libvirt-vm`](https://github.com/norvexlabs/terraform-provider-stowage/tree/main/examples/guides/libvirt-vm) | `dmacvicar/libvirt` 0.9.9 | preview (the domain applied against libvirtd under QEMU, `make acc-libvirt`; not on a KVM host) |
+| [`vmware-vm`](https://github.com/norvexlabs/terraform-provider-stowage/tree/main/examples/guides/vmware-vm) | `vmware/vsphere` 2.17.1 | preview |
+| [`aws-vm`](https://github.com/norvexlabs/terraform-provider-stowage/tree/main/examples/guides/aws-vm) | `hashicorp/aws` 6.69.1 | preview |
+| [`azure-vm`](https://github.com/norvexlabs/terraform-provider-stowage/tree/main/examples/guides/azure-vm) | `hashicorp/azurerm` 5.10.0 | preview |
+| [`gcp-vm`](https://github.com/norvexlabs/terraform-provider-stowage/tree/main/examples/guides/gcp-vm) | `hashicorp/google` 8.7.0 | preview |
+| [`scaleway-vm`](https://github.com/norvexlabs/terraform-provider-stowage/tree/main/examples/guides/scaleway-vm) | `scaleway/scaleway` 2.91.0 | preview |
+
+An example is a preview until it has been applied on its platform; every one passes `tofu
+validate` and `tofu test` (its `tests/`, each run at `command = plan` under mocked providers; `make
+examples-test` runs them all). Each pins its providers exactly, with their checksums in its
+`.terraform.lock.hcl`.
+
+Every root, in order:
+
+1. `stowage_vm_seed` makes the VM's first-boot material once (its `lifecycle` ignores later
+   changes: the VM upgrades by `stowage_vm_install`'s `version`), with `disk_dir` on a hypervisor,
+   whose disk is a file (`disk_file`);
+2. on a hypervisor, `seed-iso.sh` (an `external` data source: `xorriso` and `jq`) writes the
+   NoCloud seed ISO of `user_data` and `meta_data`, the same bytes for the same seed; on a cloud,
+   `user_data` is the instance's user data;
+3. the platform's resources make the VM: its disk from `disk[<platform>]` (a hypervisor's import
+   of `disk_file`; a cloud's image, the one `ship --disks` registered — `cloud_image`, looked up by
+   name — else `image_id`, which a cloud's `image/` root registers), sized `os_gib` plus `app_gib`;
+   its NICs by `nic_roles` (the roles, the primary first: known at plan, as the seed is made in
+   the same apply; a release naming more than one NIC with a role missing there is refused), each
+   with the MAC a hypervisor's root's `nic_macs` gives its role (role → MAC, given to the seed too:
+   its `interfaces`, `mac=`, after the role's own spec in `seed_interfaces`, which then gives no
+   `mac=` of its own, refused otherwise), else the `mac` the seed's `nics` gives it (`nic_roles`
+   left out: one NIC, the primary's, by `nic_macs` or the seed's MAC, else the platform's own —
+   TrueNAS's root derives one from the name — for a release that declares no NIC or whose one role
+   the seed gives none; that MAC goes to the primary alone, listed first: a role in `nic_roles`
+   with no MAC, a secondary role the seed's `nics` gives no MAC — its fix `nic_macs`, then
+   `-replace=stowage_vm_seed.vm`, as the seed is made once; or, an installer made with Stowage
+   before 0.40.0, which gives a secondary NIC none, upgrading Stowage and shipping the release
+   again —, a `nic_macs` MAC other than the one the seed's `nics` names its role by, and two NICs
+   sharing a MAC — the seed's and those added after it — refuse the plan), on its `attach`
+   network; its CPUs
+   and memory from `size` (left out, the release's recommended; under `min` a precondition refuses
+   the plan, under `recommended` a `check` warns); on a cloud, its firewall rules from `firewall`
+   (SSH from `ssh_sources`, each of `open_ports` from its sources);
+4. `stowage_vm_install`, depending on the VM (on TrueNAS, on its power resource), waits for the
+   first boot under the seed's one-time key, gives the VM over SSH what goes there (secret inputs,
+   `given_wo`, a registry login, a kit), waits for its first install, reads its own host key and
+   retires the one-time key. A later `version` upgrades it, `interfaces` names a NIC added after
+   the seed.
+
+A destroy: `deletion_protection = false` applied first, then `tofu destroy`, which forgets the
+install (its plan warns, before approval, when the registry holds no disk set to make the VM
+again) and then removes the VM.
+
+## TrueNAS
+
+`truenas/truenas` declares the VM, its devices, its power, its zvol and a staging dataset. What it
+cannot declare yet — a file put on the host, a disk image written into a zvol, a VM stopped before
+its devices are deleted — goes through Stowage's documented stopgap steps, run by `local-exec`
+with the release's installer for this machine, `stowage_vm_seed`'s `ctl_path`: `vm truenas
+import-image` (the disk into a fresh zvol, by its digest; a zvol holding it already is left as it
+is), `vm truenas seed` (the seed ISO, named by its digest) and, at destroy, `vm truenas stop` (the
+VM stopped before its devices go: the path recorded at create runs, so the step first checks the
+installer is on this machine — the provider's cache keeps the last eight installers used, and a
+destroy's refresh of `stowage_vm_seed` fetches it again — and otherwise fails naming `tofu apply
+-refresh-only`, from another machine `tofu apply`). They read `TRUENAS_ENDPOINT` and `TRUENAS_API_KEY` as the
+provider does: no credential enters the state. A new disk image (a new seed) replaces the zvol,
+its device and the stop step, the VM stopped first. `truenas_vm_power`'s `restart_triggers`
+restart the VM when what it reads at boot changes: a NIC added (`extra_nics`, which
+`stowage_vm_install`'s `interfaces` then names), the disk, the seed, the size. The steps go once
+`truenas/truenas` covers the three.
+
+{{ tffile "examples/guides/truenas-vm/main.tf" }}
+
+## A NIC added after the seed
+
+The root adds the platform's NIC device; the platform restarts the VM so it sees the NIC
+(TrueNAS: `truenas_vm_power`'s `restart_triggers`, keyed on the NIC devices); `stowage_vm_install`,
+which depends on that restart, waits for the VM to answer, runs `network attach --role R --mac M`
+for the role (its `interfaces`), reboots the VM and follows the reboot to the health gate's
+verdict. A change of `interfaces` goes alone, without one of `version`.

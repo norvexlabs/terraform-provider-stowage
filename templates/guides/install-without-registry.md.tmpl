@@ -60,7 +60,7 @@ This copies `bin/terraform-provider-stowage` to
 `~/.terraform.d/plugins/registry.opentofu.org/norvexlabs/stowage/<version>/linux_amd64/terraform-provider-stowage_v<version>`,
 `<version>` being the top entry of `CHANGELOG.md` (on `main`, the next release's). `PLUGIN_DIR=<dir>` picks another of
 OpenTofu's implied mirror directories (`~/.local/share/opentofu/plugins`, say). The build is
-linux/amd64.
+linux/amd64; a release's zips hold every platform's.
 
 A root then names the provider as it will once published, at a version that takes it:
 

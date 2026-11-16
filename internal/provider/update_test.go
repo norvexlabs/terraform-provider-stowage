@@ -3,6 +3,7 @@ package provider
 import (
 	"bytes"
 	"context"
+	"errors"
 	"maps"
 	"slices"
 	"strings"
@@ -269,6 +270,31 @@ func TestUpdateSameReleaseIsNoUpgrade(t *testing.T) {
 	}
 }
 
+// The new installer is read before what the keys of the release installed say: when they cannot
+// be read (public_keys given, so the read goes on), the same release still stays, and another
+// digest of it is refused as such.
+func TestSameReleaseBeforeTheInstalledKeys(t *testing.T) {
+	t.Parallel()
+	key := []byte(publicKeyPEM(t))
+	h := newHarness(t, map[string]tftypes.Value{"public_keys": strList(string(key))})
+	h.fake.keys = map[string]map[string][]byte{image: {"r.pub": key}, image2: {"r.pub": key}}
+	state := h.create(h.dockerConfig(nil))
+	h.fake.keysErr = map[string]error{image: errors.New("dial tcp: registry.example.com: no route to host")}
+	h.fake.set("kept-payload", reply{exit: 1, stderr: "./notes/notes-stow: no installer kept there"})
+	if got := errorsOf(h.update(state, h.dockerConfig(map[string]tftypes.Value{"installer": str(image2)})).Diagnostics); !strings.Contains(got, "installer is another digest of the release installed") || strings.Contains(got, "cannot be read") {
+		t.Fatalf("another digest: %q", got)
+	}
+	h.fake.set("status", reply{stdout: `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1},"channel":"stable","previous":null}`})
+	h.fake.reset()
+	a := h.update(state, h.dockerConfig(map[string]tftypes.Value{"installer": str(image2)}))
+	if d := diagText(a.Diagnostics); d != "" {
+		t.Fatalf("the same release: %q", d)
+	}
+	if asString(t, h.attrs(a.NewState)["installer"]) != image2 {
+		t.Fatal("the desired installer is not in state")
+	}
+}
+
 func TestRollback(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t, nil)
@@ -417,11 +443,22 @@ func TestReadDropsUnrecordedInputs(t *testing.T) {
 	}
 }
 
+// importState imports id into the type its prefix names (vm: and kubernetes:, taken off; else
+// Docker), each imported state as a model value.
 func (h *harness) importState(id string) *tfprotov6.ImportResourceStateResponse {
 	h.t.Helper()
-	resp, err := h.srv.ImportResourceState(context.Background(), &tfprotov6.ImportResourceStateRequest{TypeName: "stowage_install", ID: id})
+	kind := "docker"
+	for _, k := range []string{"vm", "kubernetes"} {
+		if rest, ok := strings.CutPrefix(id, k+":"); ok {
+			kind, id = k, rest
+		}
+	}
+	resp, err := h.srv.ImportResourceState(context.Background(), &tfprotov6.ImportResourceStateRequest{TypeName: h.outers[kind].name, ID: id})
 	if err != nil {
 		h.t.Fatal(err)
+	}
+	for _, r := range resp.ImportedResources {
+		r.State = h.inDV(kind, r.State)
 	}
 	return resp
 }
@@ -1111,21 +1148,37 @@ func TestImportedTakeOverPaths(t *testing.T) {
 }
 
 // Beside a release change the take-over's report names what the running release declares
-// alone; an install recording no installer leaves the change open; a secret the install records
-// is kept on the VM's upgrade too.
+// alone; an install recording no installer leaves the change open with public_keys, and is refused
+// without them, nothing fetched; a secret the install records is kept on the VM's upgrade too.
 func TestImportedTakeOverReportBesideARelease(t *testing.T) {
 	t.Parallel()
 	const recorded = `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1,"installer":"` + image + `"},"channel":"stable","previous":null,` +
 		`"inputs":["ADMIN_EMAIL"],"values":{"inputs":{"ADMIN_EMAIL":"a@example.com"},"tls":"none"}}`
-	for name, c := range map[string]struct{ status, want string }{
-		"recorded":     {recorded, "The release change the plan makes runs after it, as planned."},
-		"not recorded": {strings.Replace(recorded, `,"installer":"`+image+`"`, "", 1), "If the plan changes the release (the install records no installer to tell), that change runs after it."},
+	notRecorded := strings.Replace(recorded, `,"installer":"`+image+`"`, "", 1)
+	for name, c := range map[string]struct {
+		status, want, refused string
+		publicKeys            bool
+	}{
+		"recorded":                    {status: recorded, want: "The release change the plan makes runs after it, as planned."},
+		"not recorded, public_keys":   {status: notRecorded, publicKeys: true, want: "If the plan changes the release (the install records no installer to tell), that change runs after it."},
+		"not recorded, no public_key": {status: notRecorded, refused: "Nothing was fetched or run on the target. Set the provider's public_keys"},
 	} {
-		h := newHarness(t, nil)
+		var config map[string]tftypes.Value
+		if c.publicKeys {
+			config = map[string]tftypes.Value{"public_keys": strList(publicKeyPEM(t))}
+		}
+		h := newHarness(t, config)
 		h.fake.set("status", reply{stdout: c.status})
 		state := h.importState("app.example:/srv/notes/notes-stow").ImportedResources[0].State
 		p := h.plan(state, h.dockerConfig(map[string]tftypes.Value{"installer": str("registry.example.com/notes/notes-installer@sha256:" + strings.Repeat("c", 64)),
 			"plan_dry_run": boolean(true), "inputs": strMap(map[string]string{"ADMIN_EMAIL": "b@example.com", "NEW_KEY": "k"})}))
+		if c.refused != "" {
+			if got := errorsOf(p.Diagnostics); !strings.Contains(got, "The keys of the release installed cannot be told") || !strings.Contains(got, c.refused) ||
+				len(h.fake.callsOf("fetch")) != 0 || len(h.fake.callsOf("plan-dir")) != 0 {
+				t.Errorf("%s: %s %q", name, got, h.fake.ops())
+			}
+			continue
+		}
 		w := warningsOf(p.Diagnostics)
 		if !strings.Contains(w, "what differs from what it records: input ADMIN_EMAIL.") || !strings.Contains(w, "The running release does not declare input NEW_KEY: the new release's upgrade gives what it declares, the re-run refuses the rest.") || !strings.Contains(w, c.want) {
 			t.Errorf("%s: %s %s", name, errorsOf(p.Diagnostics), w)
@@ -1145,23 +1198,45 @@ func TestImportedTakeOverReportBesideARelease(t *testing.T) {
 
 // The take-over's report when the new installer is read (no certain re-run): another release is an
 // upgrade after it; the release the install runs, no release change — though the install records
-// no installer. On the VM a domain of a route only the new release has waits for its upgrade.
+// no installer, read under the provider's public_keys. Without them, the keys the install trusts
+// cannot be told and nothing checks the new installer: refused, nothing fetched. On the VM a
+// domain of a route only the new release has waits for its upgrade.
 func TestImportedTakeOverReportReadsTheNewRelease(t *testing.T) {
 	t.Parallel()
 	const recorded = `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1},"channel":"stable","previous":null,` +
 		`"inputs":["ADMIN_EMAIL"],"values":{"inputs":{"ADMIN_EMAIL":"a@example.com"},"tls":"none"}}`
+	key := publicKeyPEM(t)
 	for name, c := range map[string]struct {
 		describe, want string
+		publicKeys     bool
+		fetched        bool // the new installer fetched before the refusal (want an error)
 	}{
-		"same release": {describe1, "The plan changes no release."},
-		"upgrade":      {describe2, "The release change the plan makes runs after it, as planned."},
+		"same release":                 {describe: describe1, want: "The plan changes no release.", publicKeys: true},
+		"upgrade":                      {describe: describe2, publicKeys: true, fetched: true},
+		"same release, no public_keys": {describe: describe1},
+		"upgrade, no public_keys":      {describe: describe2},
 	} {
-		h := newHarness(t, nil)
+		var config map[string]tftypes.Value
+		if c.publicKeys {
+			config = map[string]tftypes.Value{"public_keys": strList(key)}
+		}
+		h := newHarness(t, config)
+		h.fake.keys = map[string]map[string][]byte{image: {"release.pub": []byte(key)}}
 		h.fake.set("status", reply{stdout: recorded})
 		h.fake.set("describe", reply{stdout: c.describe})
 		state := h.importState("app.example:/srv/notes/notes-stow").ImportedResources[0].State
 		p := h.plan(state, h.dockerConfig(map[string]tftypes.Value{"plan_dry_run": boolean(true), "inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@example.com"})}))
-		if w := warningsOf(p.Diagnostics); !strings.Contains(w, "its values match") || !strings.Contains(w, c.want) || len(h.fake.callsOf("fetch")) != 1 {
+		w := warningsOf(p.Diagnostics)
+		if c.want == "" {
+			// The install records no installer, so the keys it trusts cannot be told: the
+			// upgrade is refused; without public_keys before anything is fetched.
+			if got := errorsOf(p.Diagnostics); !strings.Contains(got, "The keys of the release installed cannot be told") || len(h.fake.callsOf("upgrade")) != 0 ||
+				(len(h.fake.callsOf("fetch")) != 0) != c.fetched || strings.Contains(got, "Nothing was fetched") == c.fetched {
+				t.Errorf("%s: %s %q", name, got, h.fake.ops())
+			}
+			continue
+		}
+		if !strings.Contains(w, "its values match") || !strings.Contains(w, c.want) || len(h.fake.callsOf("fetch")) != 1 {
 			t.Errorf("%s: %s %s %q", name, errorsOf(p.Diagnostics), w, h.fake.ops())
 		}
 	}

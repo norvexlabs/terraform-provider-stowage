@@ -2,9 +2,11 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -50,6 +52,8 @@ func (c call) op() string {
 		return "plan-dir"
 	case installer.PlanRemoveScript:
 		return "plan-rm"
+	case installer.KeptPayloadScript:
+		return "kept-payload"
 	case installer.RunLoginScript:
 		return "install" // vm seed, the one program run so
 	case installer.K8sScript:
@@ -119,6 +123,17 @@ type fake struct {
 	// lenient answers a call whose context is done, but for a blocking reply: a test of a
 	// timeout then reaches the step it tests however slow the host is before it.
 	lenient bool
+	// programs is where Program says it keeps the installers (the cache's place).
+	programs string
+	// keys are the keys each installer's release carries, by reference.
+	keys map[string]map[string][]byte
+	// checks records each check made under a trust (Program's and Check's): the reference and
+	// the trust's names; checkErr fails the check of a reference. keyReads records Keys' reads.
+	checks   []string
+	checkErr map[string]error
+	keyReads []string
+	// keysErr fails Keys' read of a reference (the registry not reachable).
+	keysErr map[string]error
 }
 
 const describe1 = `{"format":1,"name":"notes","short_name":"notes","release":{"version":"1.2.0","revision":1},"channel":"stable","shapes":["docker"],"inputs":[{"key":"ADMIN_EMAIL"},{"key":"SMTP_PASSWORD","secret":true},{"key":"LEGACY"}],"first_install_only":["address","registry","registry_ca","channel"],"routes":[{"name":"web","loopback_port":8080}],"l4_routes":[]}`
@@ -230,6 +245,66 @@ func (f *fake) run(ctx context.Context, argv []string, stdin []byte, unset []str
 	return []byte(r.stdout), []byte(r.stderr), r.exit, nil
 }
 
+// Program is the fake as the installer source: it records the fetch as a call shaped as a remote
+// target's (FetchScript's argv: its directory at 4, the reference at 5, the name at 6), answered by
+// the fetch's reply: an exit but 0 fails it.
+func (f *fake) Program(ctx context.Context, d *Data, w Want, dir string) (*Program, error) {
+	ref := w.Ref
+	if err := f.Check(ctx, d, w); err != nil {
+		return nil, err
+	}
+	name, _, _ := installer.ParseInstaller(ref)
+	stdout, stderr, exit, err := f.run(ctx, []string{"sh", "-c", installer.FetchScript, "sh", dir, ref, name, "", ""}, nil, nil)
+	switch {
+	case err != nil:
+		return nil, err
+	case exit != 0:
+		return nil, fmt.Errorf("fetching %s: %s%s", ref, stdout, stderr)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// With programs (the cache's place), the run's program is its own, the cache's Kept.
+	p := &Program{Path: filepath.Join(dir, name+"-stow"), Keys: f.keys[ref]}
+	if f.programs != "" {
+		p.Kept = filepath.Join(f.programs, name+"-stow")
+	}
+	return p, nil
+}
+
+// Check is the fake's check: recorded with the trust's names when one applies, failed by
+// checkErr.
+func (f *fake) Check(_ context.Context, d *Data, w Want) error {
+	trust := d.trust(w.Installed)
+	if len(trust) == 0 {
+		return nil
+	}
+	var names []string
+	for _, t := range trust {
+		names = append(names, t.Name)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.checks = append(f.checks, w.Ref+" against "+strings.Join(names, " and "))
+	if err := f.checkErr[w.Ref]; err != nil {
+		return err
+	}
+	if len(f.keys[w.Ref]) == 0 {
+		return errors.New("the release carries no public key")
+	}
+	return nil
+}
+
+// Keys is the fake's keys of a reference, the read recorded.
+func (f *fake) Keys(_ context.Context, _ *Data, w Want) (map[string][]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.keyReads = append(f.keyReads, w.Ref)
+	if err := f.keysErr[w.Ref]; err != nil {
+		return nil, err
+	}
+	return f.keys[w.Ref], nil
+}
+
 func (f *fake) ops() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -247,20 +322,132 @@ type harness struct {
 	mu          sync.Mutex
 	failedPlans map[*tfprotov6.DynamicValue]bool
 	srv         tfprotov6.ProviderServer
-	typ         tftypes.Object
-	ptyp        tftypes.Object
-	fake        *fake
-	schema      *tfprotov6.Schema
-	tmp         string // where Kubernetes runs make their private directories
+	// typ is the install model's value type (installSchema): tests build and read values of it,
+	// which the harness converts to and from each resource type's (outers), by the block a value
+	// holds, as shapeResource does.
+	typ    tftypes.Object
+	ptyp   tftypes.Object
+	fake   *fake
+	outers map[string]*outerType
+	runs   string // where runs on this machine make their private directories (the cache's runs/)
+	tmp    string // the provider's TempDir
+	cache  string // the provider's CacheDir
+	// private is the private state each state and planned state carries, as OpenTofu keeps it.
+	private map[*tfprotov6.DynamicValue][]byte
+}
+
+// privateOf is the private state d carries.
+func (h *harness) privateOf(d *tfprotov6.DynamicValue) []byte {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.private[d]
+}
+
+// keepPrivate records p as the private state d carries.
+func (h *harness) keepPrivate(d *tfprotov6.DynamicValue, p []byte) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.private == nil {
+		h.private = map[*tfprotov6.DynamicValue][]byte{}
+	}
+	h.private[d] = p
+}
+
+// outerType is a resource type of one shape, as the provider serves it.
+type outerType struct {
+	name   string
+	schema *tfprotov6.Schema
+	typ    tftypes.Object
+	shape  *shape
+}
+
+// modelType is the install model's value type.
+func modelType() tftypes.Object {
+	return installSchema(context.Background()).Type().TerraformType(context.Background()).(tftypes.Object)
+}
+
+// outersOf are the provider's install resource types, by shape.
+func outersOf(t *testing.T, s *tfprotov6.GetProviderSchemaResponse) map[string]*outerType {
+	t.Helper()
+	out := map[string]*outerType{}
+	for kind, sh := range shapes {
+		name := sh.typeName("stowage")
+		sc := s.ResourceSchemas[name]
+		if sc == nil {
+			t.Fatalf("no resource type %s", name)
+		}
+		out[kind] = &outerType{name: name, schema: sc, typ: sc.ValueType().(tftypes.Object), shape: sh}
+	}
+	return out
+}
+
+// kindOf is the shape of the first of vals that names one (its block), else docker.
+func kindOf(vals ...tftypes.Value) string {
+	for _, v := range vals {
+		var m map[string]tftypes.Value
+		if v.IsNull() || !v.IsKnown() || v.As(&m) != nil {
+			continue
+		}
+		for _, k := range []string{"docker", "kubernetes", "vm"} {
+			if b, ok := m[k]; ok && !b.IsNull() {
+				return k
+			}
+		}
+	}
+	return "docker"
+}
+
+// out is v, a model value, as the type of kind's.
+func (h *harness) out(kind string, v tftypes.Value) tftypes.Value {
+	h.t.Helper()
+	o, err := h.outers[kind].shape.toOuter(v, h.outers[kind].typ)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return o
+}
+
+// outDV is d, a model value, as a value of the type of kind.
+func (h *harness) outDV(kind string, d *tfprotov6.DynamicValue) *tfprotov6.DynamicValue {
+	h.t.Helper()
+	if d == nil {
+		return nil
+	}
+	v := h.dv(h.outers[kind].typ, h.out(kind, h.value(d)))
+	return &v
+}
+
+// inDV is d, a value of the type of kind, as a model value.
+func (h *harness) inDV(kind string, d *tfprotov6.DynamicValue) *tfprotov6.DynamicValue {
+	h.t.Helper()
+	if d == nil {
+		return nil
+	}
+	o, err := d.Unmarshal(h.outers[kind].typ)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	in, err := h.outers[kind].shape.toInner(o, h.typ)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	v := h.dv(h.typ, in)
+	return &v
 }
 
 func newHarness(t *testing.T, providerConfig map[string]tftypes.Value) *harness {
 	t.Helper()
 	f := newFake()
-	// Kubernetes runs make their private directories here, and leave none.
-	tmp := t.TempDir()
-	t.Cleanup(func() { noneLeft(t, tmp) })
-	srv, err := providerserver.NewProtocol6WithError(newIn("test", f.factory, time.Millisecond, tmp, t.TempDir())())()
+	f.programs = t.TempDir()
+	// Runs on this machine make their private directories in the cache's runs/, and leave none
+	// there or in TempDir.
+	tmp, cache := t.TempDir(), t.TempDir()
+	runs := filepath.Join(cache, "runs")
+	if err := os.Mkdir(runs, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { noneLeft(t, tmp); noneLeft(t, runs) })
+	srv, err := providerserver.NewProtocol6WithError(newIn("test", f.factory, time.Millisecond, tmp, cache, f)())()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,8 +456,7 @@ func newHarness(t *testing.T, providerConfig map[string]tftypes.Value) *harness 
 	if err != nil || len(s.Diagnostics) > 0 {
 		t.Fatalf("schema: %v %v", err, s.Diagnostics)
 	}
-	h := &harness{t: t, srv: srv, fake: f, schema: s.ResourceSchemas["stowage_install"], tmp: tmp}
-	h.typ = h.schema.ValueType().(tftypes.Object)
+	h := &harness{t: t, srv: srv, fake: f, runs: runs, tmp: tmp, cache: cache, typ: modelType(), outers: outersOf(t, s)}
 	h.ptyp = s.Provider.ValueType().(tftypes.Object)
 	cfg := h.dv(h.ptyp, fill(h.ptyp, providerConfig))
 	resp, err := srv.ConfigureProvider(ctx, &tfprotov6.ConfigureProviderRequest{Config: &cfg})
@@ -359,9 +545,10 @@ func errorsOf(ds []*tfprotov6.Diagnostic) string {
 
 func (h *harness) validate(config tftypes.Value) []*tfprotov6.Diagnostic {
 	h.t.Helper()
-	cfg := h.dv(h.typ, config)
+	kind := kindOf(config)
+	cfg := h.dv(h.outers[kind].typ, h.out(kind, config))
 	resp, err := h.srv.ValidateResourceConfig(context.Background(), &tfprotov6.ValidateResourceConfigRequest{
-		TypeName: "stowage_install", Config: &cfg,
+		TypeName: h.outers[kind].name, Config: &cfg,
 		ClientCapabilities: &tfprotov6.ValidateResourceConfigClientCapabilities{WriteOnlyAttributesAllowed: true},
 	})
 	if err != nil {
@@ -370,20 +557,21 @@ func (h *harness) validate(config tftypes.Value) []*tfprotov6.Diagnostic {
 	return resp.Diagnostics
 }
 
-// withoutWriteOnly is config with each write-only attribute null, as OpenTofu proposes a new
-// state.
-func (h *harness) withoutWriteOnly(config tftypes.Value) tftypes.Value {
+// withoutWriteOnly is config, a value of the type of kind, with each write-only attribute null,
+// as OpenTofu proposes a new state.
+func (h *harness) withoutWriteOnly(kind string, config tftypes.Value) tftypes.Value {
+	o := h.outers[kind]
 	orig := map[string]tftypes.Value{}
 	if err := config.As(&orig); err != nil {
 		h.t.Fatal(err)
 	}
 	vals := maps.Clone(orig) // As shares the value's own map
-	for _, a := range h.schema.Block.Attributes {
+	for _, a := range o.schema.Block.Attributes {
 		if a.WriteOnly {
-			vals[a.Name] = tftypes.NewValue(h.typ.AttributeTypes[a.Name], nil)
+			vals[a.Name] = tftypes.NewValue(o.typ.AttributeTypes[a.Name], nil)
 		}
 	}
-	return tftypes.NewValue(h.typ, vals)
+	return tftypes.NewValue(o.typ, vals)
 }
 
 // plan plans config against prior (nil: a create); proposed is config without its write-only
@@ -394,14 +582,20 @@ func (h *harness) plan(prior *tfprotov6.DynamicValue, config tftypes.Value) *tfp
 		p := h.dv(h.typ, tftypes.NewValue(h.typ, nil))
 		prior = &p
 	}
-	cfg := h.dv(h.typ, config)
-	proposed := h.dv(h.typ, h.proposedNew(h.value(prior), h.withoutWriteOnly(config)))
+	kind := kindOf(config, h.value(prior))
+	o := h.outers[kind]
+	outPrior := h.out(kind, h.value(prior))
+	cfg := h.dv(o.typ, h.out(kind, config))
+	proposed := h.dv(o.typ, h.proposedNew(o.schema, outPrior, h.withoutWriteOnly(kind, h.out(kind, config))))
+	priorDV := h.dv(o.typ, outPrior)
 	resp, err := h.srv.PlanResourceChange(context.Background(), &tfprotov6.PlanResourceChangeRequest{
-		TypeName: "stowage_install", PriorState: prior, ProposedNewState: &proposed, Config: &cfg,
+		TypeName: o.name, PriorState: &priorDV, ProposedNewState: &proposed, Config: &cfg, PriorPrivate: h.privateOf(prior),
 	})
 	if err != nil {
 		h.t.Fatal(err)
 	}
+	resp.PlannedState = h.inDV(kind, resp.PlannedState)
+	h.keepPrivate(resp.PlannedState, resp.PlannedPrivate)
 	if errorsOf(resp.Diagnostics) != "" && resp.PlannedState != nil {
 		h.mu.Lock()
 		if h.failedPlans == nil {
@@ -415,11 +609,11 @@ func (h *harness) plan(prior *tfprotov6.DynamicValue, config tftypes.Value) *tfp
 
 // proposedNew is the proposed new state as OpenTofu makes it: config, with prior's value for each
 // computed attribute config leaves null, at the top and in each nested block both hold.
-func (h *harness) proposedNew(prior, config tftypes.Value) tftypes.Value {
+func (h *harness) proposedNew(sc *tfprotov6.Schema, prior, config tftypes.Value) tftypes.Value {
 	if prior.IsNull() || config.IsNull() {
 		return config
 	}
-	v, err := mergeComputed(h.schema.Block, prior, config)
+	v, err := mergeComputed(sc.Block, prior, config)
 	if err != nil {
 		h.t.Fatal(err)
 	}
@@ -440,8 +634,10 @@ func mergeComputed(b *tfprotov6.SchemaBlock, prior, config tftypes.Value) (tftyp
 	}
 	for _, a := range b.Attributes {
 		switch {
+		case a.NestedType != nil && a.NestedType.Nesting != tfprotov6.SchemaObjectNestingModeSingle && hasComputed(a.NestedType.Attributes):
+			return config, fmt.Errorf("the harness models no %v nested attribute with a computed attribute (%s)", a.NestedType.Nesting, a.Name)
 		case a.NestedType != nil && a.NestedType.Nesting != tfprotov6.SchemaObjectNestingModeSingle:
-			return config, fmt.Errorf("the harness models no %v nested attribute (%s)", a.NestedType.Nesting, a.Name)
+			// Nothing computed in it: config's stands.
 		case a.Computed && cv[a.Name].IsNull():
 			out[a.Name] = pv[a.Name]
 		case a.NestedType != nil && !cv[a.Name].IsNull() && !pv[a.Name].IsNull():
@@ -491,6 +687,11 @@ func mergeComputed(b *tfprotov6.SchemaBlock, prior, config tftypes.Value) (tftyp
 	return tftypes.NewValue(config.Type(), out), nil
 }
 
+// hasComputed says whether one of attrs is computed.
+func hasComputed(attrs []*tfprotov6.SchemaAttribute) bool {
+	return slices.ContainsFunc(attrs, func(a *tfprotov6.SchemaAttribute) bool { return a.Computed })
+}
+
 func (h *harness) apply(prior *tfprotov6.DynamicValue, planned *tfprotov6.DynamicValue, config tftypes.Value) *tfprotov6.ApplyResourceChangeResponse {
 	h.t.Helper()
 	if prior == nil {
@@ -521,13 +722,17 @@ func (h *harness) apply(prior *tfprotov6.DynamicValue, planned *tfprotov6.Dynami
 	for _, e := range h.inconsistencies(planned, final.PlannedState, false) {
 		h.t.Errorf("inconsistent final plan: %s", e)
 	}
-	cfg := h.dv(h.typ, config)
+	kind := kindOf(config, h.value(prior))
+	cfg := h.dv(h.outers[kind].typ, h.out(kind, config))
 	resp, err := h.srv.ApplyResourceChange(context.Background(), &tfprotov6.ApplyResourceChangeRequest{
-		TypeName: "stowage_install", PriorState: prior, PlannedState: final.PlannedState, Config: &cfg,
+		TypeName: h.outers[kind].name, PriorState: h.outDV(kind, prior), PlannedState: h.outDV(kind, final.PlannedState), Config: &cfg,
+		PlannedPrivate: final.PlannedPrivate,
 	})
 	if err != nil {
 		h.t.Fatal(err)
 	}
+	resp.NewState = h.inDV(kind, resp.NewState)
+	h.keepPrivate(resp.NewState, resp.Private)
 	h.consistent(final.PlannedState, resp.NewState, errorsOf(resp.Diagnostics) == "")
 	resp.Diagnostics = append(append(validated, final.Diagnostics...), resp.Diagnostics...) // OpenTofu shows them all
 	return resp
@@ -550,16 +755,35 @@ func (h *harness) create(config tftypes.Value) *tfprotov6.DynamicValue {
 	return a.NewState
 }
 
-// destroy applies a destroy of state.
-func (h *harness) destroy(state *tfprotov6.DynamicValue) *tfprotov6.ApplyResourceChangeResponse {
+// planDestroy plans a destroy of state, as OpenTofu does before it asks for approval: a null
+// configuration and proposed state.
+func (h *harness) planDestroy(state *tfprotov6.DynamicValue) *tfprotov6.PlanResourceChangeResponse {
 	h.t.Helper()
-	null := h.dv(h.typ, tftypes.NewValue(h.typ, nil))
-	resp, err := h.srv.ApplyResourceChange(context.Background(), &tfprotov6.ApplyResourceChangeRequest{
-		TypeName: "stowage_install", PriorState: state, PlannedState: &null, Config: &null,
+	kind := kindOf(h.value(state))
+	o := h.outers[kind]
+	null := h.dv(o.typ, tftypes.NewValue(o.typ, nil))
+	resp, err := h.srv.PlanResourceChange(context.Background(), &tfprotov6.PlanResourceChangeRequest{
+		TypeName: o.name, PriorState: h.outDV(kind, state), ProposedNewState: &null, Config: &null, PriorPrivate: h.privateOf(state),
 	})
 	if err != nil {
 		h.t.Fatal(err)
 	}
+	return resp
+}
+
+// destroy applies a destroy of state.
+func (h *harness) destroy(state *tfprotov6.DynamicValue) *tfprotov6.ApplyResourceChangeResponse {
+	h.t.Helper()
+	null := h.dv(h.typ, tftypes.NewValue(h.typ, nil))
+	kind := kindOf(h.value(state))
+	onull := h.dv(h.outers[kind].typ, tftypes.NewValue(h.outers[kind].typ, nil))
+	resp, err := h.srv.ApplyResourceChange(context.Background(), &tfprotov6.ApplyResourceChangeRequest{
+		TypeName: h.outers[kind].name, PriorState: h.outDV(kind, state), PlannedState: &onull, Config: &onull,
+	})
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	resp.NewState = h.inDV(kind, resp.NewState)
 	// A destroy that succeeds returns no state; one that fails, a wholly known one.
 	h.consistent(&null, resp.NewState, errorsOf(resp.Diagnostics) == "")
 	return resp
@@ -577,10 +801,13 @@ func (h *harness) update(state *tfprotov6.DynamicValue, config tftypes.Value) *t
 
 func (h *harness) read(state *tfprotov6.DynamicValue) *tfprotov6.ReadResourceResponse {
 	h.t.Helper()
-	resp, err := h.srv.ReadResource(context.Background(), &tfprotov6.ReadResourceRequest{TypeName: "stowage_install", CurrentState: state})
+	kind := kindOf(h.value(state))
+	resp, err := h.srv.ReadResource(context.Background(), &tfprotov6.ReadResourceRequest{TypeName: h.outers[kind].name, CurrentState: h.outDV(kind, state), Private: h.privateOf(state)})
 	if err != nil {
 		h.t.Fatal(err)
 	}
+	resp.NewState = h.inDV(kind, resp.NewState)
+	h.keepPrivate(resp.NewState, resp.Private)
 	return resp
 }
 

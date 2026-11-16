@@ -45,7 +45,7 @@ func k8sBlock() schema.SingleNestedBlock {
 			"driving its `helm` and `kubectl` against the cluster the provider's `kubernetes` block reaches (one cluster per provider; an alias per cluster).",
 		Attributes: map[string]schema.Attribute{
 			"namespace": schema.StringAttribute{Optional: true,
-				MarkdownDescription: "The release's namespace; required in this block. First-install only."},
+				MarkdownDescription: "The release's namespace. First-install only."},
 			"release": schema.StringAttribute{Optional: true,
 				MarkdownDescription: "The helm release's name; left out, the project's name (the installer's default). First-install only."},
 			"image_pull_login": schema.BoolAttribute{Optional: true,
@@ -62,7 +62,7 @@ func k8sBlock() schema.SingleNestedBlock {
 
 func k8sConnBlock() providerschema.SingleNestedBlock {
 	return providerschema.SingleNestedBlock{
-		MarkdownDescription: "The cluster the `kubernetes` targets reach, named as the helm provider's `kubernetes` block. " +
+		MarkdownDescription: "The cluster `stowage_kubernetes_install` (and its data source) reach, named as the helm provider's `kubernetes` block. " +
 			"With `host`, a kubeconfig of these values is written for each run (0600, in a private directory removed afterwards); " +
 			"with `config_path`, that file is used; with neither, or without this block, kubectl's default (`KUBECONFIG`, else `~/.kube/config`). " +
 			"A provider's configuration is read at every run and never written to state.",
