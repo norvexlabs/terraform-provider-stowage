@@ -76,6 +76,10 @@ func vmOp(argv []string) string {
 	switch {
 	case len(argv) > 9 && argv[0] == "sh" && argv[2] == installer.RunScript && argv[9] == "vm":
 		return "vm-seed"
+	case len(argv) > 9 && argv[0] == "sh" && argv[2] == installer.RunScript && argv[9] == "upgrade" && contains(argv, "--dry-run"):
+		return "dry-upgrade" // given inputs on standard input
+	case len(argv) > 9 && argv[0] == "sh" && argv[2] == installer.RunScript && argv[9] == "upgrade":
+		return "upgrade"
 	case len(argv) > 2 && argv[0] == "sh" && argv[2] == installer.RunScript:
 		return "install"
 	case len(argv) > 9 && argv[0] == "sh" && argv[2] == installer.PositionalScript:
@@ -88,6 +92,8 @@ func vmOp(argv []string) string {
 		return "status"
 	case len(argv) == 5 && argv[1] == "events":
 		return "events"
+	case len(argv) == 5 && argv[1] == "updates":
+		return "updates"
 	case len(argv) > 4 && argv[0] == "sudo" && argv[2] == "systemctl":
 		return "boot"
 	case len(argv) == 5 && argv[0] == "sudo" && argv[3] == "host-key" && argv[4] == "--json":
@@ -130,6 +136,7 @@ func newVMFake() *vmFake {
 		"hostkey":  {stdout: "ssh-ed25519 " + ownKey + " root@notes\n"},
 		"retire":   {stdout: `{"format":1,"public_key":"ssh-ed25519 ` + ownKey + `","known_hosts_line":"notes ssh-ed25519 ` + ownKey + `","retired":true,"fingerprint":"SHA256:own"}`},
 		"probe":    {}, // the installer is found
+		"updates":  {stdout: `{"channel":"stable","takes_inputs":true}`},
 	}}
 }
 
@@ -559,8 +566,39 @@ func TestVMFirstBootSwitchesOS(t *testing.T) {
 	}
 }
 
-// TestVMUpgradeAddsInputs: an upgrade takes no input; what the new release adds goes to its
-// re-run after the reboot, and an input it declares secret is refused there before it is given.
+// TestVMUpdateWaitsForARestartedVM: an apply finding the VM restarted by another resource (ssh
+// failing, then its daemon not up, then its boot not settled) waits it out and goes on.
+func TestVMUpdateWaitsForARestartedVM(t *testing.T) {
+	t.Parallel()
+	h, f := newVMHarness(t)
+	state := h.create(h.vmConfig("1.1.0", nil))
+	f.reset()
+	unsettled := strings.Replace(vmStatusJSON("1.1.0", "boot-1", ""), `"boot_id"`, `"boot_settled":false,"boot_id"`, 1)
+	f.then("status", reply{exit: 255, stderr: "ssh: connect to host vm port 22: No route to host"},
+		reply{exit: 1, stderr: "error: the host daemon is not reachable"}, reply{stdout: unsettled})
+	cfg := h.vmConfig("1.1.0", map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "new@b"})})
+	a := h.update(state, cfg)
+	// The re-run comes after the fourth read: the first settled one.
+	ops := f.ops()
+	reads, rerun := 0, -1
+	for _, op := range ops {
+		switch op {
+		case "status":
+			reads++
+		case "install":
+			rerun = reads
+		}
+	}
+	if d := errorsOf(a.Diagnostics); d != "" || len(f.callsOf("install")) != 1 || rerun != 4 {
+		t.Fatalf("%s, the re-run after %d reads, ops %q", d, rerun, ops)
+	}
+}
+
+// TestVMUpgradeAddsInputs: the inputs the new release adds go with the upgrade, which stages them
+// for the boot into it; the domains of the routes it adds go to its re-run after the reboot. An
+// OS whose upgrade takes no input (built before Stowage 0.43.0) is upgraded without them, and its
+// re-run gives them. An input the new release declares secret, given in inputs, is refused once
+// it runs, and kept out of state.
 func TestVMUpgradeAddsInputs(t *testing.T) {
 	t.Parallel()
 	h, f := newVMHarness(t)
@@ -578,8 +616,11 @@ func TestVMUpgradeAddsInputs(t *testing.T) {
 	if d := errorsOf(a.Diagnostics); d != "" {
 		t.Fatal(d)
 	}
-	installs := f.callsOf("install")
-	if len(installs) != 1 || !slices.Contains(installs[0].argv, "NEW_IN_12=x") || !slices.Contains(installs[0].argv, "admin=admin.lan") {
+	installs, upgrades := f.callsOf("install"), f.callsOf("upgrade")
+	if len(upgrades) != 1 || !strings.Contains(untarAll(t, upgrades[0].stdin)["answers"], `NEW_IN_12: "x"`) || slices.Contains(upgrades[0].argv, "--set") || slices.Contains(upgrades[0].argv, "admin=admin.lan") {
+		t.Errorf("upgrades %q", upgrades)
+	}
+	if len(installs) != 1 || slices.Contains(installs[0].argv, "NEW_IN_12=x") || !slices.Contains(installs[0].argv, "admin=admin.lan") {
 		t.Errorf("installs %q", installs)
 	}
 	if i := slices.Index(f.ops(), "upgrade"); i < 0 || i > slices.Index(f.ops(), "install") {
@@ -589,8 +630,59 @@ func TestVMUpgradeAddsInputs(t *testing.T) {
 		t.Errorf("state %v", h.attrs(a.NewState))
 	}
 
-	// A secret input of the new release given in inputs: refused before the re-run, and kept
-	// out of state.
+	// An older OS: the upgrade refuses --answers, runs again without it, and the re-run gives it.
+	ho, fo := newVMHarness(t)
+	state = ho.create(ho.vmConfig("1.1.0", nil))
+	fo.reset()
+	fo.then("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", "")})
+	fo.set("status", reply{stdout: vmStatusJSON("1.2.0", "boot-2", "")})
+	fo.then("describe", reply{stdout: vmDescribe}, reply{stdout: describeOf("1.2.0", `{"key":"NEW_IN_12"}`)})
+	fo.then("upgrade", reply{exit: 1, stderr: "Error: unknown flag: --answers\n"})
+	a = ho.update(state, ho.vmConfig("1.2.0", map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@b", "NEW_IN_12": "x"})}))
+	if d := errorsOf(a.Diagnostics); d != "" {
+		t.Fatal(d)
+	}
+	if up, in := fo.callsOf("upgrade"), fo.callsOf("install"); len(up) != 2 || len(up[1].stdin) != 0 || len(in) != 1 || !slices.Contains(in[0].argv, "NEW_IN_12=x") {
+		t.Errorf("an older OS: upgrades %q, installs %q", up, in)
+	}
+
+	// A release whose boot takes no input (the VM's updates says so: built before Stowage 0.43.0):
+	// upgraded without it, the re-run gives it.
+	hn, fn := newVMHarness(t)
+	state = hn.create(hn.vmConfig("1.1.0", nil))
+	fn.reset()
+	fn.then("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", "")})
+	fn.set("status", reply{stdout: vmStatusJSON("1.2.0", "boot-2", "")})
+	fn.then("describe", reply{stdout: vmDescribe}, reply{stdout: describeOf("1.2.0", `{"key":"NEW_IN_12"}`)})
+	fn.set("updates", reply{stdout: `{"channel":"stable"}`})
+	a = hn.update(state, hn.vmConfig("1.2.0", map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@b", "NEW_IN_12": "x"})}))
+	if d := errorsOf(a.Diagnostics); d != "" {
+		t.Fatal(d)
+	}
+	if up, in := fn.callsOf("upgrade"), fn.callsOf("install"); len(up) != 1 || len(up[0].stdin) != 0 || len(in) != 1 || !slices.Contains(in[0].argv, "NEW_IN_12=x") {
+		t.Errorf("a release taking no input: upgrades %q, installs %q", up, in)
+	}
+
+	// updates failing: an error before the upgrade, which does not run.
+	hu, fu := newVMHarness(t)
+	state = hu.create(hu.vmConfig("1.1.0", nil))
+	fu.reset()
+	fu.set("updates", reply{exit: 3, stdout: `{"format":1,"result":"nothing","refused":{"reason":"1.2.0 is not on beta"}}`})
+	a = hu.update(state, hu.vmConfig("1.2.0", map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@b", "NEW_IN_12": "x"})}))
+	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "Reading the VM's updates") || !strings.Contains(got, "1.2.0 is not on beta") || len(fu.callsOf("upgrade")) != 0 {
+		t.Errorf("updates refused: %s, ops %q", got, fu.ops())
+	}
+	hu, fu = newVMHarness(t)
+	state = hu.create(hu.vmConfig("1.1.0", nil))
+	fu.reset()
+	fu.set("updates", reply{exit: 1, stderr: "error: the registry did not answer"})
+	a = hu.update(state, hu.vmConfig("1.2.0", map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@b", "NEW_IN_12": "x"})}))
+	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "Reading the VM's updates") || !strings.Contains(got, "updates failed (exit 1)") || len(fu.callsOf("upgrade")) != 0 {
+		t.Errorf("updates failing: %s, ops %q", got, fu.ops())
+	}
+
+	// A secret input of the new release given in inputs: refused once it runs, no re-run, and
+	// kept out of state.
 	h2, f2 := newVMHarness(t)
 	state = h2.create(h2.vmConfig("1.1.0", nil))
 	f2.reset()
@@ -693,8 +785,8 @@ func TestVMUpgradeFallsBack(t *testing.T) {
 		t.Errorf("the journal's cursor: %v", ev)
 	}
 
-	// The same, the new release adding an input: the error says its re-run comes next; a verdict
-	// without a reason or a release still reads.
+	// The same, the new release adding a route whose domain the re-run gives: the error says that
+	// re-run comes next; a verdict without a reason or a release still reads.
 	h9, f9 := newVMHarness(t)
 	state = h9.create(h9.vmConfig("1.1.0", nil))
 	f9.reset()
@@ -702,7 +794,8 @@ func TestVMUpgradeFallsBack(t *testing.T) {
 	f9.set("status", reply{stdout: vmStatusJSON("1.2.0", "boot-2", "")})
 	f9.then("describe", reply{stdout: vmDescribe}, reply{stdout: describeOf("1.2.0", `{"key":"NEW_IN_12"}`)})
 	f9.set("events", reply{stdout: `{"seq":4,"kind":"boot.judged","boot_id":"boot-2","on_trial":true,"verdict":"kept_unhealthy"}` + "\n"})
-	a = h9.update(state, h9.vmConfig("1.2.0", map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@b", "NEW_IN_12": "x"})}))
+	a = h9.update(state, h9.vmConfig("1.2.0", map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@b", "NEW_IN_12": "x"}),
+		"domains": strMap(map[string]string{"admin": "admin.lan"})}))
 	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "found a release's boot unhealthy: no reason given. It kept that boot, as going back is refused: no reason given") || !strings.Contains(got, "What 1.2.0 adds (inputs, domains, ports) was not given: the next plan proposes that re-run") {
 		t.Errorf("a kept boot adding an input: %s", got)
 	}
@@ -760,7 +853,8 @@ func TestVMUpgradeLastReadFails(t *testing.T) {
 	f.set("status", reply{exit: 1, stderr: "the host daemon does not answer"})
 	f.set("events", reply{stdout: judgedJSON(3, "boot-2", "1.2.0", "healthy", "", true, "")})
 	f.then("describe", reply{stdout: vmDescribe}, reply{stdout: describeOf("1.2.0", `{"key":"NEW_IN_12"}`)})
-	a := h.update(state, h.vmConfig("1.2.0", map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@b", "NEW_IN_12": "x"})}))
+	a := h.update(state, h.vmConfig("1.2.0", map[string]tftypes.Value{"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@b", "NEW_IN_12": "x"}),
+		"domains": strMap(map[string]string{"admin": "admin.lan"})}))
 	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "the host daemon does not answer") {
 		t.Errorf("got %s", got)
 	}

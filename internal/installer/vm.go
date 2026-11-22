@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-log/tflog"
@@ -99,6 +101,9 @@ type VMStatus struct {
 	// cannot be read, EventsError then saying why.
 	Events      *int64 `json:"events"`
 	EventsError string `json:"events_error"`
+	// BootSettled: this boot is over (its install unit and its health gate ended), so what the
+	// status says of it changes no more but by a job; nil from a VM whose status does not say.
+	BootSettled *bool `json:"boot_settled"`
 }
 
 // Event is an entry of the VM's event journal (`events --json`), the fields the provider reads:
@@ -225,6 +230,43 @@ func (v VM) StatusOf(ctx context.Context, values bool) (*VMStatus, error) {
 		return nil, r
 	}
 	return nil, &FailedError{Verb: "status", Exit: exit, Stderr: tail(stderr)}
+}
+
+// TakesInputs runs `<short>-stow updates --version version --json` and says whether an upgrade
+// to that release gives the boot into it the inputs it adds (`takes_inputs`): false from a VM
+// whose answer does not say (an OS built with Stowage before 0.43.0), whose upgrade takes none.
+func (v VM) TakesInputs(ctx context.Context, version string) (bool, error) {
+	if err := versionArg(version); err != nil {
+		return false, err
+	}
+	ctl, err := v.ctl()
+	if err != nil {
+		return false, err
+	}
+	argv := []string{ctl, "updates", "--version", version, "--json"}
+	stdout, stderr, exit, err := v.Runner.Run(ctx, argv, nil)
+	logRun(ctx, argv, stdout, stderr, true, exit, err)
+	if err != nil {
+		return false, fmt.Errorf("updates: %w", err)
+	}
+	switch exit {
+	case 0:
+	case 3: // a refusal: its reason and fix
+		r, err := ParseRefused("updates --json", stdout, stderr)
+		if err != nil {
+			return false, err
+		}
+		return false, r
+	default:
+		return false, &FailedError{Verb: "updates", Exit: exit, Stderr: tail(stderr)}
+	}
+	var u struct {
+		TakesInputs bool `json:"takes_inputs"`
+	}
+	if err := json.Unmarshal(stdout, &u); err != nil {
+		return false, &FailedError{Verb: "updates", Exit: exit, Stderr: tail(stderr), Cause: err}
+	}
+	return u.TakesInputs, nil
 }
 
 // VMInstall is what the VM's `install` is given: a first install, or its re-run.
@@ -451,13 +493,57 @@ func (v VM) Reboot(ctx context.Context) error {
 // result object): an upgrade or a rollback may have scheduled its reboot, which status tells.
 var ErrCut = errors.New("the connection ended before the result")
 
-// Upgrade runs `sudo -n <short>-stow upgrade --version version --yes --json`: the job ends as it
-// schedules the reboot, so the result's release is the one installed before it.
-func (v VM) Upgrade(ctx context.Context, version string) (*Result, error) {
-	if err := versionArg(version); err != nil {
+// Upgrade runs `sudo -n <short>-stow upgrade --version version --yes --json`, given added — the
+// inputs and secret inputs the release adds, in an answers file on standard input —
+// which the VM stages for the boot into it. The job ends as it schedules the reboot, so the
+// result's release is the one installed before it. An installer that takes no input on upgrade
+// is ErrNoUpgradeInputs.
+func (v VM) Upgrade(ctx context.Context, version string, added Change) (*Result, error) {
+	args, files, err := upgradeArgs(version, added, "--yes", "--json")
+	if err != nil {
 		return nil, err
 	}
-	return v.rebooting(ctx, "upgrade", "upgrade", "--version", version, "--yes", "--json")
+	return v.rebooting(ctx, "upgrade", files, args...)
+}
+
+// upgradeArgs are `upgrade --version version`, then extra, then added's inputs and secret inputs,
+// all in an answers file (in files), never on the command line: the release adding them may
+// declare secret an input given in inputs, which the provider can tell only once it runs. Anything
+// else added holds is no upgrade's.
+func upgradeArgs(version string, added Change, extra ...string) ([]string, map[string]string, error) {
+	if err := versionArg(version); err != nil {
+		return nil, nil, err
+	}
+	for k := range added.Inputs {
+		if !ValidInputKey(k) {
+			return nil, nil, fmt.Errorf("inputs: %q is not an input key", k)
+		}
+	}
+	all := maps.Clone(added.SecretInputs)
+	if all == nil {
+		all = map[string]string{}
+	}
+	maps.Copy(all, added.Inputs)
+	return changeArgs(Change{SecretInputs: all}, append([]string{"upgrade", "--version", version}, extra...)...)
+}
+
+// ErrNoUpgradeInputs is a VM's `<short>-stow` whose upgrade takes no input: one of an OS built
+// with Stowage before 0.43.0, whose boot gives the release's added inputs nothing.
+var ErrNoUpgradeInputs = errors.New("the VM's installer gives an upgrade no input (an OS built with Stowage before 0.43.0)")
+
+// unknownFlag says whether a run refused one of flags as unknown: a line of its standard error
+// ends with pflag's refusal of that flag ("unknown flag: --x"), never a flag it begins.
+func unknownFlag(stderr []byte, exit int, flags ...string) bool {
+	if exit == 0 || exit == 3 {
+		return false
+	}
+	for _, l := range bytes.Split(stderr, []byte("\n")) {
+		l = bytes.TrimSpace(l)
+		if slices.ContainsFunc(flags, func(f string) bool { return bytes.HasSuffix(l, []byte("unknown flag: "+f)) }) {
+			return true
+		}
+	}
+	return false
 }
 
 // versionArg refuses a vm.version that is no command-line argument: empty, an option, or holding
@@ -469,62 +555,82 @@ func versionArg(version string) error {
 	return nil
 }
 
-// DryRunUpgrade runs `sudo -n <short>-stow upgrade --version version --dry-run --json`: every
-// check the upgrade runs before its job, nothing asked, nothing changed.
-func (v VM) DryRunUpgrade(ctx context.Context, version string) (*Result, error) {
-	if err := versionArg(version); err != nil {
+// DryRunUpgrade runs `sudo -n <short>-stow upgrade --version version --dry-run --json`, given
+// added as Upgrade gives it: every check the upgrade runs before its job, nothing asked, nothing
+// changed.
+func (v VM) DryRunUpgrade(ctx context.Context, version string, added Change) (*Result, error) {
+	args, files, err := upgradeArgs(version, added, "--dry-run", "--json")
+	if err != nil {
 		return nil, err
 	}
-	return v.dryRun(ctx, "upgrade --dry-run", "upgrade", "--version", version, "--dry-run", "--json")
+	return v.dryRun(ctx, "upgrade --dry-run", files, args...)
 }
 
 // DryRunRollback runs `sudo -n <short>-stow rollback --dry-run --json`: every check the rollback
 // runs before its job, nothing asked, nothing changed.
 func (v VM) DryRunRollback(ctx context.Context) (*Result, error) {
-	return v.dryRun(ctx, "rollback --dry-run", "rollback", "--dry-run", "--json")
+	return v.dryRun(ctx, "rollback --dry-run", nil, "rollback", "--dry-run", "--json")
 }
 
 // ErrNoDryRun is a VM's `<short>-stow` that has no --dry-run on upgrade and rollback: one of an
 // OS built with Stowage before 0.38.0.
 var ErrNoDryRun = errors.New("the VM's installer has no --dry-run (an OS built with Stowage before 0.38.0)")
 
-// dryRun runs `sudo -n <short>-stow <args…>`, a verb's dry run: logged as the verbs are, and a
-// connection cut before its result is an error like any other (nothing was scheduled). An
-// installer that does not know the flag is ErrNoDryRun.
-func (v VM) dryRun(ctx context.Context, verb string, args ...string) (*Result, error) {
-	ctl, err := v.ctl()
-	if err != nil {
-		return nil, err
-	}
-	argv := append([]string{"sudo", "-n", ctl}, args...)
-	stdout, stderr, exit, err := v.Runner.Run(ctx, argv, nil)
-	logRun(ctx, argv, stdout, stderr, false, exit, err)
+// dryRun runs `sudo -n <short>-stow <args…>`, a verb's dry run, with files on standard input:
+// logged as the verbs are, and a connection cut before its result is an error like any other
+// (nothing was scheduled). An installer that does not know --dry-run is ErrNoDryRun, one that
+// gives an upgrade no input ErrNoUpgradeInputs.
+func (v VM) dryRun(ctx context.Context, verb string, files map[string]string, args ...string) (*Result, error) {
+	stdout, stderr, exit, err := v.verb(ctx, files, args...)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", verb, err)
 	}
-	// pflag's refusal of an unknown flag: "unknown flag: --dry-run".
-	if exit != 0 && exit != 3 && bytes.Contains(stderr, []byte("unknown flag")) && bytes.Contains(stderr, []byte("--dry-run")) {
+	switch {
+	case unknownFlag(stderr, exit, "--dry-run"):
 		return nil, fmt.Errorf("%s: %w", verb, ErrNoDryRun)
+	case unknownFlag(stderr, exit, "--answers"):
+		return nil, fmt.Errorf("%s: %w", verb, ErrNoUpgradeInputs)
 	}
 	return Outcome(verb, stdout, stderr, exit)
+}
+
+// verb runs `sudo -n <short>-stow <args…>`, logged; with files, through RunScript, which unpacks
+// them from standard input into a private directory on the VM and passes each as --<name> <path>.
+func (v VM) verb(ctx context.Context, files map[string]string, args ...string) (stdout, stderr []byte, exit int, err error) {
+	ctl, err := v.ctl()
+	if err != nil {
+		return nil, nil, -1, err
+	}
+	argv := append([]string{"sudo", "-n", ctl}, args...)
+	run, stdin := argv, []byte(nil)
+	if len(files) > 0 {
+		var names string
+		if names, stdin, err = filesInput(files); err != nil {
+			return nil, nil, -1, err
+		}
+		run = append([]string{"sh", "-c", RunScript, "sh", ".", names}, argv...)
+	}
+	stdout, stderr, exit, err = v.Runner.Run(ctx, run, stdin)
+	logRun(ctx, argv, stdout, stderr, false, exit, err)
+	return stdout, stderr, exit, err
 }
 
 // Rollback runs `sudo -n <short>-stow rollback --yes --json`: the reboot into the passive
 // system, back to the release the last upgrade replaced.
 func (v VM) Rollback(ctx context.Context) (*Result, error) {
-	return v.rebooting(ctx, "rollback", "rollback", "--yes", "--json")
+	return v.rebooting(ctx, "rollback", nil, "rollback", "--yes", "--json")
 }
 
-func (v VM) rebooting(ctx context.Context, verb string, args ...string) (*Result, error) {
-	ctl, err := v.ctl()
-	if err != nil {
-		return nil, err
-	}
-	argv := append([]string{"sudo", "-n", ctl}, args...)
-	stdout, stderr, exit, err := v.Runner.Run(ctx, argv, nil)
-	logRun(ctx, argv, stdout, stderr, false, exit, err)
+// rebooting runs a verb whose job ends as it schedules a reboot, with files on standard input: a
+// connection cut before its result is ErrCut, an installer that gives an upgrade no input
+// ErrNoUpgradeInputs.
+func (v VM) rebooting(ctx context.Context, verb string, files map[string]string, args ...string) (*Result, error) {
+	stdout, stderr, exit, err := v.verb(ctx, files, args...)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", verb, err)
+	}
+	if unknownFlag(stderr, exit, "--answers") {
+		return nil, fmt.Errorf("%s: %w", verb, ErrNoUpgradeInputs)
 	}
 	if exit == SSHFailure && len(strings.TrimSpace(string(stdout))) == 0 {
 		return nil, fmt.Errorf("%s: %w (%s)", verb, ErrCut, tail(stderr))

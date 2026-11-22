@@ -107,7 +107,8 @@ argument.
   `<host>/<short>-stow`, the address a read uses).
 - **Plan, with `plan_dry_run`**: a plan changing `version` reads `status --json` and chooses the
   step as the update does (its errors — `a rollback needs allow_rollback`, `a rollback goes alone` —
-  at plan), then runs `sudo -n <short>-stow upgrade --version <version> --dry-run --json`, or
+  at plan), then runs `sudo -n <short>-stow upgrade --version <version> --dry-run --json` (given the
+  inputs and secret inputs only the new release declares, as the upgrade is: step 4), or
   `rollback --dry-run --json`, over SSH under the connection state accepts: the host daemon runs
   every check the verb runs before its job (the release confirmed, the boot judged, no job running,
   no system written that no boot ran yet, and for an upgrade the checks its boot would refuse) and
@@ -115,19 +116,46 @@ argument.
   summary and its fix the detail. A plan that also re-runs the running release (inputs, secret
   inputs, TLS, domains or ports) gets a warning instead (`No dry run of this plan`). The VM's OS needs
   Stowage 0.38.0 or later: an older `<short>-stow` has no `--dry-run`, and the change is planned
-  without one, with a warning (`No dry run of this plan`), so the upgrade bringing it can be planned. The update's
+  without one, with a warning (`No dry run of this plan`), so the upgrade bringing it can be planned. Before it,
+  the VM's status is read as the update reads it, waiting as step 1 does, within `plan_dry_run`'s
+  10 minutes (OpenTofu plans again at apply, perhaps right after another resource restarted the
+  VM). The update's
   own refusals before it runs anything (no install, no `boot_id` or event journal, the channel of an
   imported state) are plan errors too. The dry run covers the upgrade alone: when the plan also gives
-  what only the new release declares, a warning says the re-run after its reboot is not checked
-  (`The dry run covers the upgrade alone`); when state has no VM's own key, a warning says the apply
-  reads it first and refuses the change when it cannot. While any value of the configuration (but `deletion_protection`, `delete_data` and `timeouts`)
+  the `domains` or `ports` of routes only the new release declares, a warning says the re-run after
+  its reboot is not checked (`The dry run covers the upgrade alone`). When the plan gives inputs
+  only the new release declares, `<short>-stow updates --version <version> --json` tells first
+  whether an upgrade to it takes them (`takes_inputs`); one that does not — the VM's OS or the
+  new release built with Stowage before 0.43.0 (an answer without `takes_inputs`, an
+  `<short>-stow` refusing `--answers` as unknown, or one without `--dry-run`) — is dry-run without
+  them, with a warning that the re-run after its reboot gives them unchecked (an `updates` that
+  fails or refuses is a plan error, `Reading the VM's updates`, with its reason and fix, and no
+  dry run runs), and that one the
+  new release requires with no default fails the boot into it, the VM going back (`The VM's
+  upgrade takes no input`: upgrade first to a release built with Stowage 0.43.0 or later that
+  adds no required input). When state has no VM's own key, a warning says the apply reads it first and
+  refuses the change when it cannot. While any value of the configuration (but `deletion_protection`, `delete_data` and `timeouts`)
   is not known, no dry run, with a warning (`No dry run of this plan yet`): OpenTofu plans again at
   apply, with it known, and that plan runs it (a dry run runs again there in any case). On an
   imported state never applied it runs too, and says what the take-over changes (see Import).
 - **Update**: a change of the provider's own settings alone is saved without touching the VM.
   Otherwise, in this order:
   1. `status --json` (no release installed is an error; no `<short>-stow` on the VM is the Read
-     step's rename route) and `describe --json` (the running release).
+     step's rename route) and `describe --json` (the running release). The status is read again
+     every 10 seconds, within the update timeout (`plan_dry_run`'s read at plan within its 10
+     minutes; `the VM did not answer over SSH, or its boot did not settle, when the timeout … ran
+     out; the last attempt: …`, naming the bound, with the platform's console hint), while — a
+     power resource of the same apply may be restarting the VM — ssh fails as a VM down or
+     booting fails it (no route to host, connection refused, timed out or reset, closed by the
+     remote host, network unreachable, host down), the status run fails (exit 1: sshd answers
+     before the VM's host daemon early in a boot; with no such ssh failure before it, for 12 reads,
+     about two minutes, as one that never answers is no boot), or the VM's boot is not settled
+     (`boot_settled` `false`: its install unit or its health gate still running, or their state
+     cannot be read — `systemctl status <name> <name>-health` on the VM tells; a status without
+     `boot_settled`, from an OS built with an older Stowage, is taken as it answers). So a VM that
+     is off, or a `host` or `port` nothing answers on, waits out the timeout. Anything else stops
+     at once: another ssh failure (a refused login, another host key, a host name that does not
+     resolve), a refusal, no installer, a status this provider cannot read.
      The refusals that need no change come first: a rollback without `allow_rollback`, a secret
      input in `inputs`, a rollback with other changes, an imported state's `channel` other than
      the VM's (`channel is not the VM's`), and a release change on a status without `boot_id`
@@ -155,11 +183,21 @@ argument.
      `secret_inputs_wo_version`, the changed `tls`, and the changed `domains` and `ports` (added
      ones too without an upgrade). When a release change follows, state is saved here, the release
      unchanged.
-  4. The **upgrade**: `sudo -n <short>-stow upgrade --version <version> --yes --json`, which
-     ends as it schedules the VM's reboot (an ssh cut with no result, exit 255, is taken as that
-     reboot beginning); or the **rollback**, `sudo -n <short>-stow rollback --yes --json`, alone (a
-     change of inputs, secret inputs, TLS mode, domains or ports with it is an error, `a rollback
-     goes alone`). The VM's upgrade takes no input.
+  4. The **upgrade**: `sudo -n <short>-stow upgrade --version <version> --yes --json`, given what
+     the plan gives that only the new release declares when the VM's `updates --version <version>
+     --json` says the upgrade takes it (`takes_inputs`) — its inputs and secret inputs together in
+     an answers file on standard input (`--answers`, a private temporary directory on the VM),
+     never on its command line, as the new release may declare secret an input given in
+     `inputs` — which the VM's host daemon checks as the boot into it takes them and stages for
+     that boot; it ends as it schedules the VM's reboot (an ssh cut with no result, exit 255, is
+     taken as that reboot beginning). An upgrade that takes no input (the VM's OS or the new
+     release built with Stowage before 0.43.0: no `takes_inputs`, or an `<short>-stow` refusing
+     `--answers` as unknown) runs without them (an `updates` that fails or refuses is an error,
+     `Reading the VM's updates`, before the upgrade: state stays as step 3 saved it, the release
+     unchanged), step 6 giving them after the reboot (one the new
+     release requires with no default then fails the boot into it, and the VM goes back). Or the **rollback**, `sudo -n
+     <short>-stow rollback --yes --json`, alone (a change of inputs, secret inputs, TLS mode,
+     domains or ports with it is an error, `a rollback goes alone`).
   5. The reboot followed to the health gate's verdict: every 10 seconds (ssh failing
      meanwhile), the event journal after the entry the status before the change named
      (`<short>-stow events --after <events> --json`), until the last boot it judges after the
@@ -187,11 +225,13 @@ argument.
      which names input keys and never a value, the journal's entries, or the verb's JSON result;
      its first 16 KiB), and the standard error of the reads; a verb's standard error, its run's
      free-text log, is logged by its size alone.
-  6. After an upgrade, `describe --json` of the new release, then the re-run again with what it
-     adds: the inputs and secret inputs the old release did not declare, and the `domains` and
-     `ports` of routes state does not record. An input given a non-empty value the new release
-     marks `secret` is refused there, before the re-run (state saves the release the VM runs, and
-     not that input). Then `status --json` fills the computed attributes (one that cannot be read
+  6. After an upgrade that gave or leaves something it adds, `describe --json` of the new release;
+     an input given in `inputs` a non-empty value the new release marks `secret` is an error then
+     (state saves the release the VM runs, and not that input; with an OS that took the inputs on
+     its upgrade, the install records it already: move it to `secret_inputs_wo`). Then the re-run
+     again with what the upgrade did not give: the `domains` and `ports` of routes state does not
+     record, and on an OS whose upgrade takes no input the inputs and secret inputs the old release
+     did not declare. Then `status --json` fills the computed attributes (one that cannot be read
      keeps the status read after the reboot, with the error); `seed_boot_id` is null (the reboot
      retired the one-time key). After the reboot was followed, an error — the new release's
      describe, its re-run — saves the release the VM runs and the inputs applied; a reboot not
@@ -200,13 +240,11 @@ argument.
   `registry_login_wo_version` changed: `sudo -n <short>-stow registry-login FILE`, before the
   re-run (the login given again; refused with a release change's rollback, `a rollback goes
   alone`). `acme_ca` and `acme_ca_root` changed go to the re-run (`--acme-ca URL|none`,
-  `--acme-ca-root FILE|none`). `interfaces` with a role added or changed: before anything else,
-  `status --json` tried every 10 seconds until the VM answers over SSH (the platform restarted it
-  to give it the NIC; an imported state's first apply too, its status read with `--values`), within
-  the resource's `timeouts` (`plan_dry_run`'s read at plan within its 10 minutes, its error naming
-  that bound); a refused login or another host key stops the wait at once with the read's error
-  and its ways on (`ssh's login to the VM … was refused`, `The VM … serves another host key`),
-  then the re-run, its state saved with `interfaces` as planned but for the roles to attach (as
+  `--acme-ca-root FILE|none`). `interfaces` with a role added or changed: the status read as step 1
+  reads it (the platform restarted the VM to give it the NIC; an imported state's first apply
+  too, its status read with `--values`), a refused login or another host key stopping the wait at
+  once with the read's error and its ways on (`ssh's login to the VM … was refused`, `The VM …
+  serves another host key`), then the re-run, its state saved with `interfaces` as planned but for the roles to attach (as
   state had them, absent when it had none: an imported VM's roles taken over are recorded, never
   attached again), then `network attach` for each (and each role a create left pending) and the
   reboot followed, as at create — one that fails is an error, the next apply attaching those roles

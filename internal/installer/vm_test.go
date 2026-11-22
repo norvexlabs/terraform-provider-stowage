@@ -67,26 +67,76 @@ func TestVMVerbs(t *testing.T) {
 		t.Errorf("status: %v %q", err, r.argv)
 	}
 	r.stdout = `{"format":1,"result":"done","release":{"version":"1.1.0","revision":1}}`
-	if _, err := v.Upgrade(ctx, "1.2.0"); err != nil || !slices.Equal(r.argv, []string{"sudo", "-n", "notes-stow", "upgrade", "--version", "1.2.0", "--yes", "--json"}) {
+	if _, err := v.Upgrade(ctx, "1.2.0", Change{}); err != nil || !slices.Equal(r.argv, []string{"sudo", "-n", "notes-stow", "upgrade", "--version", "1.2.0", "--yes", "--json"}) {
 		t.Errorf("upgrade: %v %q", err, r.argv)
 	}
+	// The inputs and secret inputs the release adds, in an answers file on standard input, never
+	// on the command line; the dry run gives them the same way.
+	added := Change{Inputs: map[string]string{"SMTP_HOST": "mail"}, SecretInputs: map[string]string{"SMTP_PASSWORD": "s3cret"}, Domains: map[string]string{"web": "x"}}
+	for name, run := range map[string]func() (*Result, error){
+		"upgrade": func() (*Result, error) { return v.Upgrade(ctx, "1.2.0", added) },
+		"dry run": func() (*Result, error) { return v.DryRunUpgrade(ctx, "1.2.0", added) },
+	} {
+		_, err := run()
+		answers := untar(t, r.stdin)["answers"]
+		if err != nil || !slices.Contains(r.argv, "answers") || slices.Contains(r.argv, "--domains") || slices.Contains(r.argv, "--set") ||
+			strings.Contains(strings.Join(r.argv, " "), "s3cret") || !strings.Contains(answers, "s3cret") || !strings.Contains(answers, `SMTP_HOST: "mail"`) {
+			t.Errorf("%s with inputs: %v %q", name, err, r.argv)
+		}
+	}
+	// updates --json says whether the upgrade takes them; an answer without it, no; a refusal keeps
+	// its reason; another failure, or an answer it cannot read, is an error.
+	for name, c := range map[string]struct {
+		stdout string
+		exit   int
+		takes  bool
+		err    string
+	}{
+		"takes":      {`{"channel":"beta","takes_inputs":true}`, 0, true, ""},
+		"not said":   {`{"channel":"beta"}`, 0, false, ""},
+		"refused":    {`{"format":1,"result":"nothing","refused":{"reason":"no such version","fix":"name another"}}`, 3, false, "no such version"},
+		"failed":     {"", 1, false, "updates failed (exit 1)"},
+		"unreadable": {"not json", 0, false, "updates failed"},
+	} {
+		r.stdout, r.stderr, r.exit = c.stdout, "", c.exit
+		takes, err := v.TakesInputs(ctx, "1.2.0")
+		if takes != c.takes || (c.err == "") != (err == nil) || (err != nil && !strings.Contains(err.Error(), c.err)) || !slices.Equal(r.argv, []string{"notes-stow", "updates", "--version", "1.2.0", "--json"}) {
+			t.Errorf("updates %s: %v %v %q", name, takes, err, r.argv)
+		}
+	}
+	// An installer whose upgrade takes no input (an OS built before Stowage 0.43.0).
+	r.stdout, r.stderr, r.exit = "", "Error: unknown flag: --answers\n", 1
+	for name, run := range map[string]func() (*Result, error){
+		"upgrade": func() (*Result, error) { return v.Upgrade(ctx, "1.2.0", added) },
+		"dry run": func() (*Result, error) { return v.DryRunUpgrade(ctx, "1.2.0", added) },
+	} {
+		if _, err := run(); !errors.Is(err, ErrNoUpgradeInputs) {
+			t.Errorf("%s on an older installer: %v", name, err)
+		}
+	}
+	// A run log naming a flag that begins with one of them is no refusal of it.
+	r.stdout, r.stderr, r.exit = `{"format":1,"result":"nothing"}`, "a hook: unknown flag: --answers-file\n", 1
+	if _, err := v.Upgrade(ctx, "1.2.0", added); errors.Is(err, ErrNoUpgradeInputs) {
+		t.Errorf("--answers-file taken for --answers: %v", err)
+	}
+	r.stdout, r.stderr, r.exit = `{"format":1,"result":"done","release":{"version":"1.1.0","revision":1}}`, "", 0
 	if _, err := v.Rollback(ctx); err != nil || !slices.Equal(r.argv, []string{"sudo", "-n", "notes-stow", "rollback", "--yes", "--json"}) {
 		t.Errorf("rollback: %v %q", err, r.argv)
 	}
 	for _, bad := range []string{"", "-x", "1 2"} {
-		if _, err := v.Upgrade(ctx, bad); err == nil {
+		if _, err := v.Upgrade(ctx, bad, Change{}); err == nil {
 			t.Errorf("upgrade --version %q is taken", bad)
 		}
 	}
 	// ssh's own failure with no result: the reboot may have cut it.
 	r.stdout, r.stderr, r.exit = "", "Connection closed by remote host", 255
-	if _, err := v.Upgrade(ctx, "1.2.0"); !errors.Is(err, ErrCut) {
+	if _, err := v.Upgrade(ctx, "1.2.0", Change{}); !errors.Is(err, ErrCut) {
 		t.Errorf("a cut upgrade: %v", err)
 	}
 	// A refusal stays one.
 	r.stdout, r.exit = `{"format":1,"result":"nothing","refused":{"reason":"older","fix":"none"}}`, 3
 	var refused *RefusedError
-	if _, err := v.Upgrade(ctx, "0.9.0"); !errors.As(err, &refused) {
+	if _, err := v.Upgrade(ctx, "0.9.0", Change{}); !errors.As(err, &refused) {
 		t.Errorf("a refused upgrade: %v", err)
 	}
 	if _, err := (VM{Runner: r, Short: "../x"}).Status(ctx); err == nil || !strings.Contains(err.Error(), "short_name") {

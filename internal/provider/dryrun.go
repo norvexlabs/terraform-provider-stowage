@@ -147,12 +147,48 @@ func (r *installResource) vmPlanDryRun(ctx context.Context, plan, state *install
 	case !p.now.Empty():
 		noDryRun(diags, true)
 	default:
-		if _, err := p.v.DryRunUpgrade(ctx, plan.VM.Version.ValueString()); err != nil {
-			vmDryRunFailed(diags, "The plan's dry run of the VM's upgrade to "+plan.VM.Version.ValueString(), err)
+		// The upgrade gives the boot into the release the inputs it adds; the domains and ports of
+		// the routes it adds wait for the re-run after its reboot.
+		v := plan.VM.Version.ValueString()
+		rest := p.later
+		rest.Inputs, rest.SecretInputs = nil, nil
+		added := installer.Change{Inputs: p.later.Inputs, SecretInputs: p.later.SecretInputs}
+		gives := len(added.Inputs)+len(added.SecretInputs) > 0
+		// The VM's OS or the new release built before Stowage 0.43.0 (an OS without --dry-run
+		// among them) takes no input on upgrade: the apply gives them by the re-run after the
+		// reboot, as the dry run is not given them.
+		noInputs := false
+		if gives {
+			takes, err := p.v.TakesInputs(ctx, v)
+			if err != nil {
+				addInstallerError(diags, "Reading the VM's updates", err)
+				return
+			}
+			noInputs = !takes
 		}
-		if !p.later.Empty() {
+		if noInputs {
+			added = installer.Change{}
+		}
+		_, err := p.v.DryRunUpgrade(ctx, v, added)
+		if errors.Is(err, installer.ErrNoUpgradeInputs) || errors.Is(err, installer.ErrNoDryRun) {
+			noInputs = true
+		}
+		if errors.Is(err, installer.ErrNoUpgradeInputs) {
+			_, err = p.v.DryRunUpgrade(ctx, v, installer.Change{})
+		}
+		if noInputs {
+			rest = p.later
+		}
+		if err != nil {
+			vmDryRunFailed(diags, "The plan's dry run of the VM's upgrade to "+v, err)
+		}
+		switch {
+		case noInputs && gives:
+			diags.AddWarning("The VM's upgrade takes no input",
+				"The VM's OS, or "+v+", was built with Stowage before 0.43.0: what the plan gives that only "+v+" declares (inputs, secret inputs, domains or ports) is given by the re-run after its reboot, which no dry run checks. An input "+v+" adds as required with no default fails the boot into it, and the VM goes back to the release it runs: upgrade first to a release built with Stowage 0.43.0 or later that adds no required input.")
+		case !rest.Empty():
 			diags.AddWarning("The dry run covers the upgrade alone",
-				"What the plan gives that only "+plan.VM.Version.ValueString()+" declares (inputs, secret inputs, TLS, domains or ports) is given by the re-run after its reboot, which no dry run checks: a refusal of it then leaves the VM on the new release, and the next plan proposes the re-run again.")
+				"The domains and ports of the routes only "+v+" declares are given by the re-run after its reboot, which no dry run checks: a refusal of it then leaves the VM on the new release, and the next plan proposes the re-run again.")
 		}
 	}
 }

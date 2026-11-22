@@ -421,18 +421,54 @@ func TestVMPlanDryRunWaitsForAllowRollback(t *testing.T) {
 	}
 }
 
-// An upgrade whose plan also gives what only the new release declares: the dry run covers the
-// upgrade, and a warning says the re-run after its reboot is not checked.
+// An upgrade whose plan also gives what only the new release declares: the dry run is given its
+// inputs, as the upgrade is; a warning says the domains the re-run gives after the reboot are not
+// checked. An OS whose upgrade takes no input is dry-run without them, with a warning naming the
+// way on.
 func TestVMPlanDryRunWarnsOfTheReRunAfter(t *testing.T) {
 	t.Parallel()
 	h, f := newVMHarness(t)
 	state := h.create(h.vmConfig("1.1.0", nil))
 	f.reset()
 	f.set("dry-upgrade", reply{stdout: `{"format":1,"result":"nothing"}`})
-	p := h.plan(state, h.vmConfig("1.2.0", map[string]tftypes.Value{"plan_dry_run": boolean(true),
-		"inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@b", "NEW_KEY": "added"})}))
+	inputs := strMap(map[string]string{"ADMIN_EMAIL": "a@b", "NEW_KEY": "added"})
+	p := h.plan(state, h.vmConfig("1.2.0", map[string]tftypes.Value{"plan_dry_run": boolean(true), "inputs": inputs}))
+	dry := f.callsOf("dry-upgrade")
+	if d := errorsOf(p.Diagnostics); d != "" || len(dry) != 1 || !strings.Contains(untarAll(t, dry[0].stdin)["answers"], `NEW_KEY: "added"`) || strings.Contains(diagText(p.Diagnostics), "re-run") {
+		t.Fatalf("%s / %s, calls %q", d, diagText(p.Diagnostics), dry)
+	}
+	f.reset()
+	p = h.plan(state, h.vmConfig("1.2.0", map[string]tftypes.Value{"plan_dry_run": boolean(true), "inputs": inputs, "domains": strMap(map[string]string{"admin": "admin.lan"})}))
 	if d := errorsOf(p.Diagnostics); d != "" || len(f.callsOf("dry-upgrade")) != 1 || !strings.Contains(diagText(p.Diagnostics), "The dry run covers the upgrade alone") {
 		t.Fatalf("%s / %s, calls %q", d, diagText(p.Diagnostics), f.ops())
+	}
+	// updates failing: a plan error, and no dry run.
+	f.reset()
+	f.then("updates", reply{exit: 1, stderr: "error: the registry did not answer"})
+	p = h.plan(state, h.vmConfig("1.2.0", map[string]tftypes.Value{"plan_dry_run": boolean(true), "inputs": inputs}))
+	if d := errorsOf(p.Diagnostics); !strings.Contains(d, "Reading the VM's updates") || len(f.callsOf("dry-upgrade")) != 0 {
+		t.Fatalf("updates failing: %s, calls %q", d, f.ops())
+	}
+	f.reset()
+	f.then("updates", reply{exit: 3, stdout: `{"format":1,"result":"nothing","refused":{"reason":"1.2.0 is not on beta","fix":"name a version on beta"}}`})
+	p = h.plan(state, h.vmConfig("1.2.0", map[string]tftypes.Value{"plan_dry_run": boolean(true), "inputs": inputs}))
+	if d := errorsOf(p.Diagnostics); !strings.Contains(d, "1.2.0 is not on beta") || !strings.Contains(d, "name a version on beta") || len(f.callsOf("dry-upgrade")) != 0 {
+		t.Fatalf("updates refused: %s, calls %q", d, f.ops())
+	}
+	// A release whose boot takes no input (updates says so): dry-run without them, the warning.
+	f.reset()
+	f.then("updates", reply{stdout: `{"channel":"stable"}`})
+	p = h.plan(state, h.vmConfig("1.2.0", map[string]tftypes.Value{"plan_dry_run": boolean(true), "inputs": inputs}))
+	dry = f.callsOf("dry-upgrade")
+	if d := errorsOf(p.Diagnostics); d != "" || len(dry) != 1 || len(dry[0].stdin) != 0 || !strings.Contains(diagText(p.Diagnostics), "The VM's upgrade takes no input") {
+		t.Fatalf("a release taking no input: %s / %s, calls %q", d, diagText(p.Diagnostics), dry)
+	}
+	f.reset()
+	f.then("dry-upgrade", reply{exit: 1, stderr: "Error: unknown flag: --answers\n"})
+	p = h.plan(state, h.vmConfig("1.2.0", map[string]tftypes.Value{"plan_dry_run": boolean(true), "inputs": inputs}))
+	dry = f.callsOf("dry-upgrade")
+	if d := errorsOf(p.Diagnostics); d != "" || len(dry) != 2 || len(dry[1].stdin) != 0 || !strings.Contains(diagText(p.Diagnostics), "The VM's upgrade takes no input") {
+		t.Fatalf("older OS: %s / %s, calls %q", d, diagText(p.Diagnostics), dry)
 	}
 }
 
@@ -503,9 +539,10 @@ func TestVMPlanDryRunOnAnOlderOS(t *testing.T) {
 	if d := errorsOf(p.Diagnostics); d != "" || !strings.Contains(diagText(p.Diagnostics), "without --dry-run (built with Stowage before 0.38.0)") {
 		t.Fatalf("%s / %s", d, diagText(p.Diagnostics))
 	}
-	// What only the new release declares is still said to go unchecked.
+	// It takes no input on upgrade either: what only the new release declares is said to go
+	// unchecked, after the reboot.
 	p = h.plan(state, h.vmConfig("1.2.0", map[string]tftypes.Value{"plan_dry_run": boolean(true), "inputs": strMap(map[string]string{"ADMIN_EMAIL": "a@b", "NEW_KEY": "x"})}))
-	if !strings.Contains(diagText(p.Diagnostics), "The dry run covers the upgrade alone") {
+	if !strings.Contains(diagText(p.Diagnostics), "The VM's upgrade takes no input") {
 		t.Fatalf("older OS, a later re-run: %s", diagText(p.Diagnostics))
 	}
 	// Any other failure stays a plan error.

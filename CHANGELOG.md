@@ -3,6 +3,27 @@
 The provider's releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.4.0]
+
+### Added
+
+- A VM upgrade gives the new release the inputs and secret inputs only it declares, with the
+  upgrade itself, so the boot into it takes them (Stowage 0.43.0 or later on the VM's OS): a
+  release adding a required input with no default is reached in one apply, where its boot used to
+  refuse and the VM went back. The plan's dry run is given them too. On an older OS the upgrade
+  runs without them and the re-run after its reboot gives them, as before, with a plan warning
+  naming the way on.
+
+### Fixed
+
+- An update of a VM that a resource of the same apply restarts (a TrueNAS VM's memory changed by
+  its power resource) waits, within the update timeout, while ssh fails as a VM down or booting
+  fails it, its host daemon is not up yet or its boot is not settled, where it failed at once
+  (`No route to host`, or the boot still bringing the install up); so does the plan's dry run of a
+  release change, within its bound. A VM that is off, or a host or port nothing answers on, now
+  waits out the timeout; a host that does not resolve, a refused login or another host key still
+  fail at once.
+
 ## [0.3.0] - 2026-11-16
 
 For Stowage 0.40.0, which leaves VM creation to OpenTofu: the provider makes no VM, and every

@@ -222,6 +222,11 @@ func sshFailed(err error) bool {
 	return errors.As(err, &f) && f.Exit == installer.SSHFailure || errors.Is(err, installer.ErrCut)
 }
 
+// waitRanOut is a wait whose bound ran out: what it waited for, and its last attempt's error.
+type waitRanOut string
+
+func (e waitRanOut) Error() string { return string(e) }
+
 // wait runs step every Poll until it says done, within ctx's deadline; what, said when the
 // deadline ends, names what was waited for, with the step's last error, and bound the deadline.
 func (r *installResource) wait(ctx context.Context, what, bound string, step func() (bool, error)) error {
@@ -231,7 +236,7 @@ func (r *installResource) wait(ctx context.Context, what, bound string, step fun
 		if last != nil {
 			msg += "; the last attempt: " + last.Error()
 		}
-		return errors.New(msg)
+		return waitRanOut(msg)
 	}
 	for {
 		done, err := step()
@@ -961,8 +966,11 @@ type vmUpdate struct {
 }
 
 // release moves the VM from st to desired — by `rollback` when back is set, else `upgrade
-// --version` — then gives later to the new release's re-run, and saves final (the plan's) filled
-// from the VM's status; on a failure it saves was, the state before, with the VM's status.
+// --version` given the inputs and secret inputs of later, which the boot into desired takes when
+// the VM's `updates` says it does (takes_inputs: neither the VM's OS nor desired built before
+// Stowage 0.43.0; else they stay in later) — then gives what later still holds
+// to the new release's re-run, and saves final (the plan's) filled from the VM's status; on a
+// failure it saves was, the state before, with the VM's status.
 func (u *vmUpdate) release(ctx context.Context, final, was *installModel, st *installer.VMStatus, desired string, later installer.Change, back bool) {
 	verb := "Upgrading the VM to " + desired
 	if back {
@@ -970,10 +978,29 @@ func (u *vmUpdate) release(ctx context.Context, final, was *installModel, st *in
 	}
 	var res *installer.Result
 	var err error
+	given := later.Inputs // checked against desired once it runs
 	if back {
 		res, err = u.v.Rollback(ctx)
 	} else {
-		res, err = u.v.Upgrade(ctx, desired)
+		added := installer.Change{Inputs: later.Inputs, SecretInputs: later.SecretInputs}
+		if len(added.Inputs)+len(added.SecretInputs) > 0 {
+			takes, err := u.v.TakesInputs(ctx, desired)
+			if err != nil {
+				addInstallerError(u.diags, "Reading the VM's updates", err)
+				return
+			}
+			if !takes {
+				added = installer.Change{}
+			}
+		}
+		res, err = u.v.Upgrade(ctx, desired, added)
+		if errors.Is(err, installer.ErrNoUpgradeInputs) {
+			added = installer.Change{}
+			res, err = u.v.Upgrade(ctx, desired, added)
+		}
+		if len(added.Inputs)+len(added.SecretInputs) > 0 {
+			later.Inputs, later.SecretInputs = nil, nil // the upgrade gave them
+		}
 	}
 	if err != nil && !errors.Is(err, installer.ErrCut) {
 		addInstallerError(u.diags, verb, err)
@@ -1028,20 +1055,23 @@ func (u *vmUpdate) release(ctx context.Context, final, was *installModel, st *in
 		u.failed(was, now, verb, desired, verdict, !later.Empty())
 		return
 	}
-	if !later.Empty() {
-		// What the new release adds is checked against it before it reaches a command line:
-		// an input it declares secret goes in secret_inputs_wo.
+	if len(given) > 0 || !later.Empty() {
+		// An input the new release declares secret goes in secret_inputs_wo: refused before the
+		// re-run puts it on a command line, and after an upgrade that gave it, so the next plan
+		// moves it.
 		next, err := u.v.Describe(ctx)
 		if err != nil {
 			addInstallerError(u.diags, "Reading the VM's installer of "+desired, err)
 			u.failed(was, now, "", desired, nil, false)
 			return
 		}
-		refuseSecretInputs(u.diags, later.Inputs, next)
+		refuseSecretInputs(u.diags, given, next)
 		if u.diags.HasError() {
 			u.failed(was, now, "", desired, nil, false)
 			return
 		}
+	}
+	if !later.Empty() {
 		if _, err := u.v.Install(ctx, installer.VMInstall{Change: later}); err != nil {
 			addInstallerError(u.diags, "Giving the VM what "+desired+" adds", err)
 			u.failed(was, now, "", desired, nil, false)
@@ -1335,28 +1365,67 @@ type vmPrep struct {
 	running    *installer.Describe // the VM's installer, describe --json
 }
 
-// answers reads the VM's status (with its values when imported) until it answers over SSH: the
-// platform restarted the VM to give it a NIC (the root's power resource, which this one depends
-// on), and its SSH answers once it booted; an imported VM's too (every role configured is new to
-// state). A refused login or another host key stops the wait at once (sshRefused): no later try
-// answers otherwise. atPlan: plan_dry_run's read, bounded by planDryRunTimeout, which the timeout's
-// message names; else the resource's timeouts block's.
+// daemonGrace bounds the reads of a status run that fails (exit 1) with no sign of a boot before
+// it: about two minutes at the 10 s poll.
+const daemonGrace = 12
+
+// answers reads the VM's status (with its values when imported), again, within its bound, while it
+// shows what a restart in this apply leaves (the root's power resource,
+// which this one depends on, may restart the VM to give it a NIC or change its memory): ssh
+// failing as a VM down or booting fails (bootingSSH: no route, refused, timed out, reset), a
+// status run that fails (exit 1: early in a boot, sshd answers before the VM's daemon does; with no
+// ssh failure before it, for daemonGrace reads), a
+// boot not settled (boot_settled false: the install is the boot's until its unit and the health
+// gate ended; a status that does not say, from an OS built with an older Stowage, is taken as it
+// is). Anything else stops at once, as no later try answers otherwise: ssh's other failures (a
+// refused login, another host key, a host that does not resolve), a refusal, no installer (the
+// rename route), a status this provider cannot read. A VM that never answers — off, or a wrong
+// host or port — waits out the bound. atPlan: plan_dry_run's read, bounded by planDryRunTimeout,
+// which the timeout's message names; else the resource's timeouts block's.
 func (r *installResource) answers(ctx context.Context, v installer.VM, imported, atPlan bool) (*installer.VMStatus, error) {
-	what, bound := "the VM did not answer over SSH after its restart", resourceTimeout
+	what, bound := "the VM did not answer over SSH, or its boot did not settle,", resourceTimeout
 	if atPlan {
-		what, bound = "the VM did not answer over SSH", fmt.Sprintf("plan_dry_run's bound (%d minutes)", int(planDryRunTimeout.Minutes()))
+		bound = fmt.Sprintf("plan_dry_run's bound (%d minutes)", int(planDryRunTimeout.Minutes()))
 	}
 	var st *installer.VMStatus
+	booting, failures := false, 0
 	err := r.wait(ctx, what, bound, func() (bool, error) {
 		s, err := v.StatusOf(ctx, imported)
-		if err != nil {
-			return !sshFailed(err) || sshRefused(err), err
+		var failed *installer.FailedError
+		switch {
+		case err == nil:
+		case bootingSSH(err):
+			booting = true
+			return false, err
+		case errors.As(err, &failed) && failed.Exit == 1:
+			// Past a boot, until the daemon answers; else for daemonGrace reads, as one that never
+			// answers is no boot.
+			failures++
+			return !booting && failures > daemonGrace, err
+		default:
+			return true, err
 		}
 		st = s
+		if s.BootSettled != nil && !*s.BootSettled {
+			return false, errors.New("the VM's boot is not settled (boot_settled is false: its install unit or health gate still runs, or their state cannot be read; `systemctl status <name> <name>-health` on the VM tells)")
+		}
 		return true, nil
 	})
 	return st, err
 }
+
+// bootingSSH says whether err is ssh's own failure as a VM down or booting gives it: no route to
+// it, its port closed or not answering, the connection cut. A refused login, another host key or
+// a host name that does not resolve is never one.
+func bootingSSH(err error) bool {
+	if !sshFailed(err) || sshRefused(err) {
+		return false
+	}
+	return errors.Is(err, installer.ErrCut) || sshBooting.MatchString(err.Error())
+}
+
+// sshBooting matches ssh's messages of a host down or booting.
+var sshBooting = regexp.MustCompile(`(?i)no route to host|connection refused|connection timed out|operation timed out|connection reset|closed by remote host|connection closed|network is unreachable|host is down`)
 
 // sshRefused says whether err is ssh's own failure on a refused login or another host key served:
 // what unreachable tells apart, and no wait mends.
@@ -1395,16 +1464,16 @@ func (r *installResource) vmPrepare(ctx context.Context, plan, state *installMod
 		diags.AddError("Cannot reach the VM", err.Error())
 		return nil
 	}
-	var st *installer.VMStatus
-	if len(attachments(plan.VM.Interfaces, state.VM.Interfaces)) > 0 {
-		st, err = r.answers(ctx, v, imported(state), atPlan)
-		if sshRefused(err) {
-			unreachable(diags, "VM", plan.VM.Host.ValueString(), vmKeyWay(state), err)
-			return nil
-		}
-		err = consoleHint(err, plan.VM.Platform)
-	} else {
-		st, err = v.StatusOf(ctx, imported(state))
+	// The read waits for a VM another resource of the apply restarts, or that a boot still brings
+	// up; at plan too (plan_dry_run's, of a release change, which the host daemon refuses until the
+	// boot settled; OpenTofu plans again at apply, perhaps right after such a restart).
+	st, err := r.answers(ctx, v, imported(state), atPlan)
+	if sshRefused(err) {
+		unreachable(diags, "VM", plan.VM.Host.ValueString(), vmKeyWay(state), err)
+		return nil
+	}
+	if errors.As(err, new(waitRanOut)) {
+		err = consoleHint(err, plan.VM.Platform) // the boot it waited for shows there
 	}
 	if err != nil {
 		addInstallerError(diags, "Reading the VM", renamed(ctx, v, err))
@@ -1558,11 +1627,12 @@ func planConn(s, p *vmModel) vmModel {
 	return v
 }
 
-// vmSplit sorts an update's changes between the re-run of the running release (now) and the re-run
-// after the upgrade (later): the VM's upgrade takes no input, so an input or a secret input the
-// running release does not declare waits for the release that adds it, and so does the port or
-// domain of a route state does not record; everything else goes now, where the installer
-// refuses what it does not take.
+// vmSplit sorts an update's changes between the re-run of the running release (now) and what goes
+// with the release that adds it (later): an input or a secret input the running release does not
+// declare, which the upgrade gives the boot into the new release (the re-run after its reboot on
+// an OS whose upgrade takes no input), and the port or domain of a route state does not record,
+// which the re-run after the reboot gives; everything else goes now, where the installer refuses
+// what it does not take.
 func vmSplit(ctx context.Context, u *update, running *installer.Describe, upgrading bool) (now, later installer.Change) {
 	plan, state := u.plan, u.was()
 	now = installer.Change{Inputs: map[string]string{}, SecretInputs: map[string]string{}, Domains: map[string]string{}, Ports: map[string]string{}}

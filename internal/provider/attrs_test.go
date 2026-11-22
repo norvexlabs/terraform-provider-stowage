@@ -935,12 +935,82 @@ func TestImportedVMWaitNamesItsBound(t *testing.T) {
 	cancel()
 	v := installer.VM{Runner: newFake(), Short: "notes"}
 	_, err := r.answers(ctx, v, true, true)
-	if err == nil || !strings.Contains(err.Error(), "the VM did not answer over SSH when plan_dry_run's bound (10 minutes) ran out") || strings.Contains(err.Error(), "restart") {
+	const what = "the VM did not answer over SSH, or its boot did not settle, when "
+	if err == nil || !strings.Contains(err.Error(), what+"plan_dry_run's bound (10 minutes) ran out") {
 		t.Fatalf("at plan: %v", err)
 	}
 	_, err = r.answers(ctx, v, true, false)
-	if err == nil || !strings.Contains(err.Error(), "the VM did not answer over SSH after its restart when "+resourceTimeout+" ran out") {
+	if err == nil || !strings.Contains(err.Error(), what+resourceTimeout+" ran out") {
 		t.Fatalf("at apply: %v", err)
+	}
+}
+
+// A VM going down for a restart in the same apply, then booting: the read waits through ssh's
+// own failures and a boot still bringing the install up, then takes the settled status; a VM
+// whose status does not say is taken as it answers.
+func TestVMReadWaitsForTheBootToSettle(t *testing.T) {
+	t.Parallel()
+	r := &installResource{data: &Data{Poll: time.Millisecond}}
+	f := newVMFake()
+	settled := func(v string) reply {
+		return reply{stdout: strings.Replace(vmStatusJSON("1.1.0", "boot-1", ""), `"boot_id"`, `"boot_settled":`+v+`,"boot_id"`, 1)}
+	}
+	f.then("status", reply{exit: 255, stderr: "ssh: connect to host vm port 22: No route to host"},
+		reply{exit: 1, stderr: "error: the host daemon is not reachable"}, settled("false"), settled("true"))
+	run := func(f *vmFake) installer.VM {
+		r, _ := f.factory(Connection{KnownHostsLine: "vm ssh-ed25519 " + edKey})
+		return installer.VM{Runner: r, Short: "notes"}
+	}
+	v := run(f)
+	st, err := r.answers(context.Background(), v, false, false)
+	if err != nil || st == nil || st.BootSettled == nil || !*st.BootSettled || len(f.callsOf("status")) != 4 {
+		t.Fatalf("%v %+v, %d reads", err, st, len(f.callsOf("status")))
+	}
+	f = newVMFake()
+	f.set("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", "")})
+	if st, err := r.answers(context.Background(), run(f), false, false); err != nil || st.BootSettled != nil || len(f.callsOf("status")) != 1 {
+		t.Fatalf("no boot_settled: %v %+v", err, st)
+	}
+	// What no later read mends stops the wait at once: a refusal, no installer, a status this
+	// provider cannot read, and ssh's failures no boot gives (a refused login, a host that does not
+	// resolve).
+	for _, rep := range []reply{{exit: 3, stdout: `{"format":1,"result":"nothing","refused":{"reason":"no"}}`}, {exit: 127, stderr: "sudo: notes-stow: command not found"},
+		{stdout: "not json"}, {exit: 255, stderr: "ops@vm: Permission denied (publickey)."}, {exit: 255, stderr: "ssh: Could not resolve hostname vm: Name or service not known"}} {
+		f = newVMFake()
+		f.set("status", rep)
+		if _, err := r.answers(context.Background(), run(f), false, false); err == nil || len(f.callsOf("status")) != 1 {
+			t.Errorf("exit %d: %v, %d reads", rep.exit, err, len(f.callsOf("status")))
+		}
+	}
+	// A status run that always fails with no sign of a boot is no boot: the wait stops past
+	// daemonGrace reads; after an ssh failure (a boot) it waits on past them.
+	f = newVMFake()
+	f.set("status", reply{exit: 1, stderr: "error: cannot read the install"})
+	if _, err := r.answers(context.Background(), run(f), false, false); err == nil || len(f.callsOf("status")) != daemonGrace+1 {
+		t.Errorf("exit 1, no boot: %v, %d reads", err, len(f.callsOf("status")))
+	}
+	f = newVMFake()
+	daemonDown := make([]reply, daemonGrace+3)
+	for i := range daemonDown {
+		daemonDown[i] = reply{exit: 1, stderr: "error: the host daemon is not reachable"}
+	}
+	f.then("status", append(append([]reply{{exit: 255, stderr: "ssh: connect to host vm port 22: Connection refused"}}, daemonDown...), settled("true"))...)
+	if _, err := r.answers(context.Background(), run(f), false, false); err != nil || len(f.callsOf("status")) != daemonGrace+5 {
+		t.Errorf("exit 1 past a boot: %v, %d reads", err, len(f.callsOf("status")))
+	}
+	// A status run that fails (exit 1) first is waited past: the daemon comes up after sshd.
+	f = newVMFake()
+	f.then("status", reply{exit: 1, stderr: "error: the host daemon is not reachable"}, settled("true"))
+	if _, err := r.answers(context.Background(), run(f), false, false); err != nil || len(f.callsOf("status")) != 2 {
+		t.Errorf("exit 1 first: %v, %d reads", err, len(f.callsOf("status")))
+	}
+	// Still unsettled at the bound: the last reason is said.
+	f = newVMFake()
+	f.set("status", settled("false"))
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := r.answers(ctx, run(f), false, false); err == nil || !strings.Contains(err.Error(), "the VM's boot is not settled") {
+		t.Fatalf("unsettled: %v", err)
 	}
 }
 
