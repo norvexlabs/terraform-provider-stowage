@@ -59,6 +59,8 @@ func (c call) op() string {
 	case installer.K8sScript:
 		// sh -c K8sScript sh <dir> <kubeconfig> <files> <host> <user> sh ./<name>.sh <args…>
 		switch {
+		case len(c.argv) > 13 && c.argv[11] == "k8s" && c.argv[12] == "kit":
+			return "k8s-kit-" + c.argv[13]
 		case len(c.argv) > 12 && c.argv[11] == "k8s" && contains(c.argv, "--dry-run"):
 			return "k8s-dry-" + c.argv[12]
 		case len(c.argv) > 12 && c.argv[11] == "k8s":
@@ -85,6 +87,8 @@ func (c call) op() string {
 			return "rerun"
 		case verb == "describe":
 			return "kept-describe"
+		case verb == "kit" && len(c.argv) > 10:
+			return "kit-" + c.argv[10]
 		case verb == "rollback" && contains(c.argv, "--dry-run"):
 			return "dry-rollback"
 		default:

@@ -54,15 +54,15 @@ func TestShapeSchemas(t *testing.T) {
 			}
 		}
 	}
-	has("docker", "installer", "host", "work_dir", "known_hosts_line", "tls", "acme_ca", "acme_ca_root", "registry_login_wo", "kit_file", "kit_code_wo", "delete_data", "version", "short_name")
+	has("docker", "installer", "host", "work_dir", "known_hosts_line", "tls", "acme_ca", "acme_ca_root", "registry_login_wo", "kit_wo", "kit_code_wo", "kit_wo_version", "delete_data", "version", "short_name")
 	hasNot("docker", "docker", "vm", "kubernetes", "namespace", "interfaces", "platform")
-	has("kubernetes", "installer", "namespace", "release", "values", "image_pull_login", "registry_login_wo", "kit_file", "delete_data")
+	has("kubernetes", "installer", "namespace", "release", "values", "image_pull_login", "registry_login_wo", "kit_wo", "kit_wo_version", "delete_data")
 	hasNot("kubernetes", "tls", "domains", "ports", "address", "secrets_wo", "acme_ca", "host")
-	has("vm", "host", "user", "version", "short_name", "channel", "host_key_line", "seed_boot_id", "platform", "interfaces", "acme_ca", "registry_login_wo", "kit_file")
+	has("vm", "host", "user", "version", "short_name", "channel", "host_key_line", "seed_boot_id", "platform", "interfaces", "acme_ca", "registry_login_wo", "kit_wo", "kit_wo_version")
 	hasNot("vm", "installer", "delete_data", "address", "work_dir", "vm")
 	for kind, o := range h.outers {
 		for _, a := range o.schema.Block.Attributes {
-			if a.Name == "registry_login_wo" || a.Name == "kit_code_wo" || a.Name == "secret_inputs_wo" || a.Name == "given_wo" {
+			if a.Name == "registry_login_wo" || a.Name == "kit_wo" || a.Name == "kit_code_wo" || a.Name == "secret_inputs_wo" || a.Name == "given_wo" {
 				if !a.WriteOnly {
 					t.Errorf("%s.%s is not write-only", kind, a.Name)
 				}
@@ -211,27 +211,29 @@ func TestDockerAcmeCA(t *testing.T) {
 	}
 }
 
-// A kit and its code go to the first install as files on standard input; a later change of
-// kit_file runs nothing, with a warning; the settings it needs are refused at validation.
+// A kit and its code go to the first install as files on standard input, never in state; a later
+// change of kit_wo_version runs nothing, with a warning; a kit expected and absent (the
+// ephemeral stowage_kit null: lost) is refused before anything runs; the settings it needs are
+// refused at validation.
 func TestDockerKit(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t, nil)
-	kit := t.TempDir() + "/notes.kit"
-	writeTestFile(t, kit, "-----BEGIN AGE ENCRYPTED FILE-----\nx\n")
-	state := h.create(h.dockerConfig(map[string]tftypes.Value{"kit_file": str(kit), "kit_code_wo": str(kitCode)}))
+	kit := "-----BEGIN AGE ENCRYPTED FILE-----\nKIT-NEVER-IN-STATE\n"
+	state := h.create(h.dockerConfig(map[string]tftypes.Value{"kit_wo": str(kit), "kit_code_wo": str(kitCode), "kit_wo_version": str("k1")}))
 	in := h.fake.callsOf("install")[0]
 	files := untarAll(t, in.stdin)
 	if strings.Contains(strings.Join(in.argv, " "), kitCode) || files["kit-code-file"] != kitCode || !strings.HasPrefix(files["kit"], "-----BEGIN AGE") {
 		t.Fatalf("install %q %v", in.argv, files)
 	}
 	stateHolds(t, h, state, kitCode)
+	stateHolds(t, h, state, "KIT-NEVER-IN-STATE")
 	h.fake.reset()
-	other := t.TempDir() + "/other.kit"
-	p := h.plan(state, h.dockerConfig(map[string]tftypes.Value{"kit_file": str(other), "kit_code_wo": str(kitCode)}))
-	if !strings.Contains(diagText(p.Diagnostics), "kit_file is first-install only") {
+	other := h.dockerConfig(map[string]tftypes.Value{"kit_wo": str("other kit"), "kit_code_wo": str(kitCode), "kit_wo_version": str("k2")})
+	p := h.plan(state, other)
+	if !strings.Contains(diagText(p.Diagnostics), "kit_wo is first-install only") {
 		t.Fatalf("plan %s", diagText(p.Diagnostics))
 	}
-	a := h.update(state, h.dockerConfig(map[string]tftypes.Value{"kit_file": str(other), "kit_code_wo": str(kitCode)}))
+	a := h.update(state, other)
 	if d := errorsOf(a.Diagnostics); d != "" || len(h.fake.calls) != 0 {
 		t.Fatalf("%s %q", d, h.fake.ops())
 	}
@@ -239,29 +241,37 @@ func TestDockerKit(t *testing.T) {
 		extra map[string]tftypes.Value
 		want  string
 	}{
-		"no kit":       {map[string]tftypes.Value{"kit_code_wo": str(kitCode)}, "kit_code_wo without kit_file"},
-		"with given":   {map[string]tftypes.Value{"kit_file": str(kit), "kit_code_wo": str(kitCode), "given_wo": str("project: notes\n")}, "kit_file with given_wo"},
-		"root not PEM": {map[string]tftypes.Value{"acme_ca_root": str("root")}, "acme_ca_root is not PEM"},
+		"no kit":            {map[string]tftypes.Value{"kit_code_wo": str(kitCode)}, "kit_code_wo without kit_wo"},
+		"with given":        {map[string]tftypes.Value{"kit_wo": str(kit), "kit_code_wo": str(kitCode), "given_wo": str("project: notes\n")}, "kit_wo with given_wo"},
+		"version and given": {map[string]tftypes.Value{"kit_wo_version": str("k1"), "given_wo": str("project: notes\n")}, "kit_wo with given_wo"},
+		"root not PEM":      {map[string]tftypes.Value{"acme_ca_root": str("root")}, "acme_ca_root is not PEM"},
 	} {
 		if got := diagText(h.validate(h.dockerConfig(c.extra))); !strings.Contains(got, c.want) {
 			t.Errorf("%s: %q", name, got)
 		}
 	}
 	h2 := newHarness(t, nil)
-	cfg := h2.dockerConfig(map[string]tftypes.Value{"kit_file": str(t.TempDir() + "/missing.kit"), "kit_code_wo": str(kitCode)})
-	if got := errorsOf(h2.apply(nil, h2.plan(nil, cfg).PlannedState, cfg).Diagnostics); !strings.Contains(got, "kit_file cannot be read") || len(h2.fake.callsOf("install")) != 0 {
-		t.Fatalf("a kit not there: %q", got)
+	cfg := h2.dockerConfig(map[string]tftypes.Value{"kit_wo_version": str("k1")})
+	if got := errorsOf(h2.apply(nil, h2.plan(nil, cfg).PlannedState, cfg).Diagnostics); !strings.Contains(got, "The kit is not here") || !strings.Contains(got, "Bump the stowage_kit's version") || len(h2.fake.callsOf("install")) != 0 {
+		t.Fatalf("a kit lost: %q %q", got, h2.fake.ops())
 	}
-	cfg = h2.dockerConfig(map[string]tftypes.Value{"kit_file": str(kit)})
+	// A retried create finding the install made (the kit taken then) needs no kit: none is given.
+	hr := newHarness(t, nil)
+	hr.fake.set("new-status", reply{stdout: `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1},"address":"127.0.0.1"}`})
+	ar := hr.apply(nil, hr.plan(nil, cfg).PlannedState, cfg)
+	if got := diagText(ar.Diagnostics); errorsOf(ar.Diagnostics) != "" || !strings.Contains(got, "kit_wo with kit_code_wo, as an install exists") || len(hr.fake.callsOf("install")) != 1 {
+		t.Fatalf("a retried create: %s %q", got, hr.fake.ops())
+	}
+	cfg = h2.dockerConfig(map[string]tftypes.Value{"kit_wo": str(kit)})
 	if got := errorsOf(h2.apply(nil, h2.plan(nil, cfg).PlannedState, cfg).Diagnostics); !strings.Contains(got, "kit_code_wo is not given") || len(h2.fake.callsOf("install")) != 0 {
 		t.Fatalf("a kit without its code at create: %q", got)
 	}
 	// A create finding an install there re-runs it: the kit, a first install's, is not given.
 	h3 := newHarness(t, nil)
 	h3.fake.set("new-status", reply{stdout: `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1},"address":"127.0.0.1"}`})
-	cfg = h3.dockerConfig(map[string]tftypes.Value{"kit_file": str(kit), "kit_code_wo": str(kitCode)})
+	cfg = h3.dockerConfig(map[string]tftypes.Value{"kit_wo": str(kit), "kit_code_wo": str(kitCode)})
 	a3 := h3.apply(nil, h3.plan(nil, cfg).PlannedState, cfg)
-	if d := errorsOf(a3.Diagnostics); d != "" || !strings.Contains(diagText(a3.Diagnostics), "(describe's first_install_only: address, the provider's registry and registry_ca; secrets_wo; kit_file with kit_code_wo, as an install exists) are not given: the install keeps the ones it recorded, which the configuration's match.") ||
+	if d := errorsOf(a3.Diagnostics); d != "" || !strings.Contains(diagText(a3.Diagnostics), "(describe's first_install_only: address, the provider's registry and registry_ca; secrets_wo; kit_wo with kit_code_wo, as an install exists (stowage_kit_take gives a kit to it)) are not given: the install keeps the ones it recorded, which the configuration's match.") ||
 		strings.Contains(diagText(a3.Diagnostics), "is given, as nothing is installed yet") {
 		t.Fatalf("%s", diagText(a3.Diagnostics))
 	}
@@ -273,14 +283,14 @@ func TestDockerKit(t *testing.T) {
 	h4 := newHarness(t, nil)
 	h4.fake.set("new-status", reply{stdout: `{"format":1,"name":"notes","installed":null,"install_failed":"the hook failed","address":"127.0.0.1"}`})
 	a4 := h4.apply(nil, h4.plan(nil, cfg).PlannedState, cfg)
-	if d := errorsOf(a4.Diagnostics); d != "" || !strings.Contains(diagText(a4.Diagnostics), "(describe's first_install_only: address, the provider's registry and registry_ca; secrets_wo) are not given: the install keeps the ones it recorded, which the configuration's match. kit_file with kit_code_wo is given, as nothing is installed yet.") {
+	if d := errorsOf(a4.Diagnostics); d != "" || !strings.Contains(diagText(a4.Diagnostics), "(describe's first_install_only: address, the provider's registry and registry_ca; secrets_wo) are not given: the install keeps the ones it recorded, which the configuration's match. kit_wo with kit_code_wo is given, as nothing is installed yet.") {
 		t.Fatalf("%s", diagText(a4.Diagnostics))
 	}
 	in = h4.fake.callsOf("install")[0]
 	if files := untarAll(t, in.stdin); strings.Contains(strings.Join(in.argv, " "), kitCode) || files["kit-code-file"] != kitCode || !strings.HasPrefix(files["kit"], "-----BEGIN AGE") {
 		t.Fatalf("an unfinished install's re-run without the kit: %q %v", in.argv, files)
 	}
-	// Without kit_file, the warning names no kit, whether an install exists or not.
+	// Without kit_wo, the warning names no kit, whether an install exists or not.
 	for name, status := range map[string]string{
 		"installed":  `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1},"address":"127.0.0.1"}`,
 		"unfinished": `{"format":1,"name":"notes","installed":null,"install_failed":"the hook failed","address":"127.0.0.1"}`,
@@ -290,8 +300,8 @@ func TestDockerKit(t *testing.T) {
 		plain := h5.dockerConfig(nil)
 		a5 := h5.apply(nil, h5.plan(nil, plain).PlannedState, plain)
 		if got := diagText(a5.Diagnostics); errorsOf(a5.Diagnostics) != "" || !strings.Contains(got, "(describe's first_install_only: address, the provider's registry and registry_ca; secrets_wo) are not given: the install keeps the ones it recorded, which the configuration's match.") ||
-			strings.Contains(got, "kit_file") {
-			t.Errorf("%s, no kit_file: %s", name, got)
+			strings.Contains(got, "kit_wo") {
+			t.Errorf("%s, no kit_wo: %s", name, got)
 		}
 	}
 }
@@ -302,9 +312,7 @@ func TestK8sRegistryLoginAndKit(t *testing.T) {
 	t.Parallel()
 	h := k8sHarness(t, nil)
 	h.fake.then("k8s-status", reply{exit: 3, stdout: noReleaseJSON, stderr: noRelease})
-	kit := t.TempDir() + "/notes.kit"
-	writeTestFile(t, kit, "kit")
-	state := h.create(h.k8sConfig(map[string]tftypes.Value{"registry_login_wo": str(loginJSON), "registry_login_wo_version": num(1), "kit_file": str(kit), "kit_code_wo": str(kitCode)}))
+	state := h.create(h.k8sConfig(map[string]tftypes.Value{"registry_login_wo": str(loginJSON), "registry_login_wo_version": num(1), "kit_wo": str("kit"), "kit_code_wo": str(kitCode)}))
 	in := h.fake.callsOf("k8s-install")[0]
 	files := untarAll(t, in.stdin)
 	if files["registry-login-file"] != loginJSON || files["kit-code-file"] != kitCode || files["kit"] != "kit" || strings.Contains(strings.Join(in.argv, " "), loginAuth) || contains(in.argv, "--image-pull-login") {
@@ -312,7 +320,7 @@ func TestK8sRegistryLoginAndKit(t *testing.T) {
 	}
 	stateHolds(t, h, state, loginAuth)
 	h.fake.reset()
-	a := h.update(state, h.k8sConfig(map[string]tftypes.Value{"registry_login_wo": str(loginJSON), "registry_login_wo_version": num(2), "kit_file": str(kit)}))
+	a := h.update(state, h.k8sConfig(map[string]tftypes.Value{"registry_login_wo": str(loginJSON), "registry_login_wo_version": num(2)}))
 	up := h.fake.callsOf("k8s-upgrade")
 	if d := errorsOf(a.Diagnostics); d != "" || len(up) != 1 || untarAll(t, up[0].stdin)["registry-login-file"] != loginJSON {
 		t.Fatalf("%s %q", d, h.fake.ops())
@@ -330,10 +338,8 @@ func TestVMRegistryLoginAcmeKit(t *testing.T) {
 	t.Parallel()
 	h, f := newVMHarness(t)
 	f.set("registry-login", reply{})
-	kit := t.TempDir() + "/notes.kit"
-	writeTestFile(t, kit, "kit")
 	state := h.create(h.vmConfig("1.1.0", map[string]tftypes.Value{"registry_login_wo": str(loginJSON), "registry_login_wo_version": num(1),
-		"tls": str("acme"), "acme_ca": str("https://acme.example/dir"), "kit_file": str(kit), "kit_code_wo": str(kitCode)}))
+		"tls": str("acme"), "acme_ca": str("https://acme.example/dir"), "kit_wo": str("kit"), "kit_code_wo": str(kitCode)}))
 	ops := f.ops()
 	li, ii := slices.Index(ops, "registry-login"), slices.Index(ops, "install")
 	if li < 0 || ii < li {
@@ -352,7 +358,7 @@ func TestVMRegistryLoginAcmeKit(t *testing.T) {
 	f.reset()
 	f.set("registry-login", reply{exit: 3, stderr: "error: the login is for registry.example.com, and the VM reads mirror.lan\n"})
 	a := h.update(state, h.vmConfig("1.1.0", map[string]tftypes.Value{"registry_login_wo": str(loginJSON), "registry_login_wo_version": num(2),
-		"tls": str("acme"), "acme_ca": str("https://acme.example/dir"), "kit_file": str(kit)}))
+		"tls": str("acme"), "acme_ca": str("https://acme.example/dir")}))
 	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "the VM reads mirror.lan") || len(f.callsOf("install")) != 0 {
 		t.Fatalf("a refused login: %q %q", got, f.ops())
 	}

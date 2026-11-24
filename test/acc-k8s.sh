@@ -14,7 +14,10 @@
 # plan shows no change → ship 3.0.0, upgraded to with changed chart values → 1.0.0's installer (not
 # the previous release): its upgrade refused by the installer, state kept → back to 2.0.0's
 # installer with allow_rollback (k8s rollback, then the values given again) → the state forgotten, the release imported and its first apply → a destroy
-# refused by deletion_protection → destroy (k8s uninstall --data).
+# refused by deletion_protection → destroy (k8s uninstall --data) → a handoff chain across two
+# provider aliases (A's kit to B's first install, B's back to A by k8s upgrade --kit, both proven,
+# in one apply; a plan after it plans nothing; a kit given back with another value taken, then
+# shown by A's refresh and given back; destroyed).
 # Needs tofu, Docker, network access, a linux/amd64 host.
 set -euo pipefail
 
@@ -257,5 +260,156 @@ tf destroy -auto-approve -no-color >"$WORK/destroy.log" 2>&1 || { cat "$WORK/des
 ! helm status notes -n "$NS" >/dev/null 2>&1 || { helm status notes -n "$NS"; fail "the release is still there"; }
 ! kubectl get -n "$NS" secret notes-stowage >/dev/null 2>&1 || fail "the release's Secret is still there"
 [[ $(kubectl get pvc -n "$NS" -o json | jq '.items | length') == 0 ]] || fail "the release's claims are still there (delete_data)"
+
+# The handoff chain across two provider configurations (two aliases: two provider processes, as two
+# clusters would have), each release in its namespace: A's kit to B's first install, B's back to A
+# by `k8s upgrade --kit`, both proven, in one apply; a plan after it plans nothing.
+step "handoff chain on Kubernetes: two provider aliases, one apply"
+CH=$WORK/chain
+mkdir -p "$CH"
+chain_config() {
+	local provider=
+	for a in a b; do
+		provider+="
+provider \"stowage\" {
+  alias       = \"$a\"
+  username    = \"pull\"
+  password    = \"$PULL_TOKEN\"
+  public_keys = [file(\"$P/keys/release.pub\")]
+  kubernetes {
+    host                   = \"$K8S_HOST\"
+    cluster_ca_certificate = file(\"$WORK/k8s-ca.pem\")
+    client_certificate     = file(\"$WORK/k8s-cert.pem\")
+    client_key             = file(\"$WORK/k8s-key.pem\")
+  }
+}"
+	done
+	cat >"$CH/main.tf" <<HCL
+terraform {
+  required_providers {
+    stowage = { source = "norvexlabs/stowage" }
+  }
+}
+variable "returned_admin" {
+  type    = string
+  default = "a@notes.test"
+}
+$provider
+resource "stowage_kubernetes_install" "a" {
+  provider    = stowage.a
+  installer   = "$I3"
+  inputs      = { ADMIN_EMAIL = "a@notes.test" }
+  namespace   = "chain-a"
+  delete_data = true
+  deletion_protection = false
+}
+resource "stowage_kit" "a_to_b" {
+  provider = stowage.a
+  handoff  = "second-site"
+  instance = "site-b"
+  answers  = { SITE_ADMIN = "b@notes.test" }
+  kubernetes {
+    installer = stowage_kubernetes_install.a.installer
+    namespace = stowage_kubernetes_install.a.namespace
+  }
+}
+ephemeral "stowage_kit" "a_to_b" {
+  provider = stowage.a
+  id       = stowage_kit.a_to_b.id
+}
+resource "stowage_kubernetes_install" "b" {
+  provider       = stowage.b
+  installer      = "$I3"
+  kit_wo         = ephemeral.stowage_kit.a_to_b.kit
+  kit_code_wo    = ephemeral.stowage_kit.a_to_b.code
+  kit_wo_version = stowage_kit.a_to_b.id
+  namespace      = "chain-b"
+  delete_data    = true
+  deletion_protection = false
+}
+resource "stowage_kit_check" "a_to_b" {
+  provider = stowage.a
+  handoff  = stowage_kit.a_to_b.handoff
+  instance = stowage_kit.a_to_b.instance
+  triggers = { b = stowage_kubernetes_install.b.id }
+  kubernetes {
+    installer = stowage_kubernetes_install.a.installer
+    namespace = stowage_kubernetes_install.a.namespace
+  }
+}
+resource "stowage_kit" "b_to_a" {
+  provider = stowage.b
+  handoff  = "second-site"
+  instance = "site-a"
+  answers  = { SITE_ADMIN = var.returned_admin }
+  kubernetes {
+    installer = stowage_kubernetes_install.b.installer
+    namespace = stowage_kubernetes_install.b.namespace
+  }
+}
+ephemeral "stowage_kit" "b_to_a" {
+  provider = stowage.b
+  id       = stowage_kit.b_to_a.id
+}
+resource "stowage_kit_take" "a" {
+  depends_on     = [stowage_kit_check.a_to_b]
+  provider       = stowage.a
+  kit_wo         = ephemeral.stowage_kit.b_to_a.kit
+  kit_code_wo    = ephemeral.stowage_kit.b_to_a.code
+  kit_wo_version = stowage_kit.b_to_a.id
+  kubernetes {
+    installer = stowage_kubernetes_install.a.installer
+    namespace = stowage_kubernetes_install.a.namespace
+  }
+}
+resource "stowage_kit_check" "b_to_a" {
+  provider = stowage.b
+  handoff  = stowage_kit.b_to_a.handoff
+  instance = stowage_kit.b_to_a.instance
+  triggers = { take = stowage_kit_take.a.id }
+  kubernetes {
+    installer = stowage_kubernetes_install.b.installer
+    namespace = stowage_kubernetes_install.b.namespace
+  }
+}
+output "proven" {
+  value = [stowage_kit_check.a_to_b.proven, stowage_kit_check.b_to_a.proven]
+}
+HCL
+}
+# ctf [VAR=VALUE…] <tofu args…>: tofu in the chain's root, as tf, with those variables besides.
+ctf() {
+	local envs=()
+	while [[ $1 == *=* ]]; do envs+=("$1"); shift; done
+	(cd "$CH" && "${TF_ENV[@]}" "${envs[@]}" "$TOFU" "$@")
+}
+capply() { ctf "${@:2}" apply -auto-approve -no-color >"$WORK/$1.log" 2>&1 || { cat "$WORK/$1.log"; cluster_logs >&2; fail "tofu apply ($1)"; }; }
+cplan() {
+	local rc=0
+	ctf "${@:3}" plan -detailed-exitcode -no-color >"$WORK/$1.log" 2>&1 || rc=$?
+	[[ $rc == "$2" ]] || { cat "$WORK/$1.log"; fail "$1: the plan exited $rc, not $2"; }
+}
+admin_in() { kubectl rollout status -n "$1" deploy/notes-web --timeout 180s >/dev/null && kubectl exec -n "$1" deploy/notes-web -- printenv ADMIN_EMAIL; }
+chain_config
+capply chain-apply
+[[ $(admin_in chain-b) == b@notes.test ]] || fail "B's ADMIN_EMAIL is not the one A's kit gave"
+[[ $(admin_in chain-a) == a@notes.test ]] || fail "A's ADMIN_EMAIL is not its own"
+proven=$(ctf output -json proven | jq -c .)
+[[ $proven == "[true,true]" ]] || fail "a kit is not proven: $proven"
+! grep -rqF -- 'BEGIN AGE ENCRYPTED' "$CH" || fail "a kit is in the chain root's files"
+[[ -z $(ls -A "$WORK/tmp") ]] || fail "a run's private directory is left: $(ls -A "$WORK/tmp")"
+cplan chain-again 0
+
+step "handoff chain on Kubernetes: B gives A back another value, taken by k8s upgrade --kit, shown by A's refresh"
+capply chain-returned TF_VAR_returned_admin=other@notes.test
+[[ $(admin_in chain-a) == other@notes.test ]] || fail "A did not take B's kit"
+cplan chain-drift 2 TF_VAR_returned_admin=other@notes.test
+capply chain-restored
+[[ $(admin_in chain-a) == a@notes.test ]] || fail "A's ADMIN_EMAIL was not given back"
+cplan chain-settled 0
+
+step "handoff chain on Kubernetes: destroy"
+ctf destroy -auto-approve -no-color >"$WORK/chain-destroy.log" 2>&1 || { cat "$WORK/chain-destroy.log"; fail "tofu destroy (the chain)"; }
+helm_absent chain-a notes && helm_absent chain-b notes || fail "a release of the chain is still there"
 
 echo PASS

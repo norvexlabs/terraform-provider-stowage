@@ -123,8 +123,11 @@ Generated from the schema, the templates and the examples (`make docs`) into [do
 | [`stowage_kubernetes_install`](docs/resources/kubernetes_install.md) | a helm release on a cluster |
 | [`stowage_vm_install`](docs/resources/vm_install.md) | the install on a Kairos VM: its keys, `interfaces`, `platform` |
 | [`stowage_vm_seed`](docs/resources/vm_seed.md) | a Kairos VM's first-boot material, generated once: `ctl_path`, `size`, `firewall` |
+| [`stowage_kit`](docs/resources/kit.md) and the [ephemeral `stowage_kit`](docs/ephemeral-resources/kit.md) | a handoff kit issued by an install (`kit create --json`), kept in the provider's process and handed to `kit_wo` in the same apply: never in a file of the root, state or plan |
+| [`stowage_kit_take`](docs/resources/kit_take.md) | a kit taken by an install that exists (its re-run's `--kit`) |
+| [`stowage_kit_check`](docs/resources/kit_check.md) | the issuer's `kit check`, tried until it answers: `proven` |
 | Data sources: [Docker](docs/data-sources/docker_install.md), [Kubernetes](docs/data-sources/kubernetes_install.md), [VM](docs/data-sources/vm_install.md) | an install's status, read without managing it |
-| Guides: [a VM per platform](docs/guides/platforms.md), [without the internet](docs/guides/offline.md), [trust](docs/guides/trust.md) | complete roots per platform, with import IDs; a root on premises; what an installer is checked against |
+| Guides: [a VM per platform](docs/guides/platforms.md), [without the internet](docs/guides/offline.md), [trust](docs/guides/trust.md), [handoff kits](docs/guides/handoff-kits.md) | complete roots per platform, with import IDs; a root on premises; what an installer is checked against; a kit issued, taken, taken back and proven in one apply (`examples/guides/handoff-chain`) |
 
 ## How it works
 

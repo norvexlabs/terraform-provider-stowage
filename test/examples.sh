@@ -3,7 +3,7 @@
 # providers) of every root in examples/guides/ and examples/quickstart/ (make examples-test). Each
 # root is copied into a work directory under ~/.cache (the example's own files and lock file stay
 # as they are), this repository's bin/terraform-provider-stowage installed from a filesystem
-# mirror of the run's own as norvexlabs/stowage 0.3.0, the other providers from the registry at
+# mirror of the run's own as norvexlabs/stowage at CHANGELOG.md's top version, the other providers from the registry at
 # the versions each root pins (network access). EXAMPLES=<dir …> narrows the roots; PROVIDER_BIN
 # runs another provider binary. Prints PASS.
 set -euo pipefail
@@ -16,8 +16,10 @@ BIN=${PROVIDER_BIN:-$PROV/bin/terraform-provider-stowage}
 [[ -x $BIN ]] || { echo "FAIL: no $BIN: make build" >&2; exit 1; }
 WORK=$(mktemp -d "${XDG_CACHE_HOME:-$HOME/.cache}/tps-examples.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
-mkdir -p "$WORK/mirror/registry.opentofu.org/norvexlabs/stowage/0.3.0/linux_amd64"
-cp "$BIN" "$WORK/mirror/registry.opentofu.org/norvexlabs/stowage/0.3.0/linux_amd64/terraform-provider-stowage_v0.3.0"
+V=$(sed -n 's/^## \[\([^]]*\)\].*/\1/p' "$PROV/CHANGELOG.md" | head -n1)
+[[ $V =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]] || { echo "FAIL: CHANGELOG.md's top version: $V" >&2; exit 1; }
+mkdir -p "$WORK/mirror/registry.opentofu.org/norvexlabs/stowage/$V/linux_amd64"
+cp "$BIN" "$WORK/mirror/registry.opentofu.org/norvexlabs/stowage/$V/linux_amd64/terraform-provider-stowage_v$V"
 cat >"$WORK/tofurc" <<EOT
 provider_installation {
   filesystem_mirror {

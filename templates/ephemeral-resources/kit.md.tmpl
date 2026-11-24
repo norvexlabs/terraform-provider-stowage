@@ -1,0 +1,24 @@
+---
+page_title: "{{.Name}} {{.Type}} - {{.ProviderName}}"
+subcategory: ""
+description: |-
+{{ .Description | plainmarkdown | trimspace | prefixlines "  " }}
+---
+
+# {{.Name}} ({{.Type}})
+
+{{ .Description | trimspace }}
+
+## Example Usage
+
+{{ tffile .ExampleFile }}
+
+{{ .SchemaMarkdown | trimspace }}
+
+## Details
+
+Open runs nothing remote: it reads the kit `stowage_kit` kept in the provider's process under `id`.
+OpenTofu opens it on every plan and apply that reaches it, and skips it while `id` is unknown (a
+plan creating the kit): in the apply that issues the kit, the kit and its code; anywhere else
+(a later plan, a later apply, another provider configuration's process), null. Its values are
+sensitive and ephemeral: they reach write-only attributes alone (`kit_wo`, `kit_code_wo`).

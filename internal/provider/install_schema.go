@@ -54,7 +54,8 @@ type installModel struct {
 	RegistryLoginWOVersion types.Int64    `tfsdk:"registry_login_wo_version"`
 	AcmeCA                 types.String   `tfsdk:"acme_ca"`
 	AcmeCARoot             types.String   `tfsdk:"acme_ca_root"`
-	KitFile                types.String   `tfsdk:"kit_file"`
+	KitWO                  types.String   `tfsdk:"kit_wo"`
+	KitWOVersion           types.String   `tfsdk:"kit_wo_version"`
 	KitCodeWO              types.String   `tfsdk:"kit_code_wo"`
 	Docker                 *dockerModel   `tfsdk:"docker"`
 	Kubernetes             *k8sModel      `tfsdk:"kubernetes"`
@@ -209,13 +210,17 @@ func installSchema(ctx context.Context) schema.Schema {
 				Optional:            true,
 				MarkdownDescription: "PEM of the root `acme_ca`'s certificates chain to (`--acme-ca-root`, a file on standard input), e.g. `file(\"acme-root.pem\")`; taken out, none (`--acme-ca-root none`). A change re-runs the install. A refresh compares its `sha256` with the one the install holds (`status --json --values` `acme_ca_root`): another puts that digest in state, so the next plan gives the root again.",
 			},
-			"kit_file": schema.StringAttribute{
-				Optional:            true,
-				MarkdownDescription: "A handoff kit, the file's path on the machine running OpenTofu, given to the first install (`--kit`, read at create and sent on standard input), with `kit_code_wo`. First-install only: a later change is not applied (a plan warning says so). Refused with `given_wo`.",
+			"kit_wo": schema.StringAttribute{
+				Optional: true, WriteOnly: true,
+				MarkdownDescription: "A handoff kit, write-only, given to the first install (`--kit`, sent on standard input at create) with `kit_code_wo`: the ephemeral `stowage_kit`'s `kit`, issued in the same apply, or a kit made by hand (`file(\"x.kit\")`). Refused with `given_wo`. A kit for an install that exists is `stowage_kit_take`'s.",
 			},
 			"kit_code_wo": schema.StringAttribute{
 				Optional: true, WriteOnly: true,
-				MarkdownDescription: "The kit's code (`--kit-code-file`), write-only, sent on standard input with the kit at create; required with `kit_file`.",
+				MarkdownDescription: "The kit's code (`--kit-code-file`), write-only, sent on standard input with the kit at create: the ephemeral `stowage_kit`'s `code`; required with `kit_wo`.",
+			},
+			"kit_wo_version": schema.StringAttribute{
+				Optional:            true,
+				MarkdownDescription: "Says a kit is given at create: `stowage_kit`'s `id`, or any value for a kit made by hand. With it, a create whose `kit_wo` is null (the ephemeral `stowage_kit` is null outside the apply that issued the kit: an apply that failed after issuing it lost it) is an error naming the fix, never an install without the kit. First-install only: a later change gives nothing (a plan warning says so).",
 			},
 			"registry":           computedString("The provider's `registry` at the install, which a later plan compares; null in an imported state until its first apply."),
 			"registry_ca_digest": computedString("`sha256:<hex>` of the registry CA the install keeps (the provider's `registry_ca` at its first install), as `status --json` reports it; null when it keeps none. A later plan compares it with the provider's `registry_ca`: first-install only on Docker and the VM. Null in an imported state until its first apply, which records it."),

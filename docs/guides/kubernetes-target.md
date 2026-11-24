@@ -65,7 +65,7 @@ operation first names the programs missing from `PATH` among `helm` and `kubectl
   registry>] [--image-pull-login]`, with `--answers` (the secret inputs), `--given`
   (`given_wo`), `--registry-ca`, `--values` (`values`), `--registry-login-file`
   (`registry_login_wo`, in `--image-pull-login`'s place) and `--kit` with `--kit-code-file`
-  (`kit_file`, `kit_code_wo`) on standard input; then `k8s status --json`, read again every 10
+  (`kit_wo`, `kit_code_wo`) on standard input; then `k8s status --json`, read again every 10
   seconds while it reports `installing` (helm's `pending-install`), within the create timeout. A
   release of another project is an error; one recording an installer the provider does not run
   (as at update) is refused, not taken over (`The release records another installer`: `k8s

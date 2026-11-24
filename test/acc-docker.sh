@@ -10,7 +10,10 @@
 # re-run (an input changed) → an upgrade adding an input → a rollback (allow_rollback; refused at
 # plan without it) → an upgrade across the barrier → a refused upgrade after a re-run (the
 # re-run's state saved, the refusal's reason and fix shown) → a refused rollback (the barrier) →
-# import → a destroy refused by deletion_protection, then one deleting the data. Prints PASS.
+# import → a destroy refused by deletion_protection, then one deleting the data → the handoff
+# chain of examples/guides/handoff-chain on the same host (A's kit to B's first install, B's back
+# to A by its re-run, both proven, in one apply; a plan after it plans nothing; a kit given back
+# with another value taken, then shown by A's refresh and given back; destroyed). Prints PASS.
 #
 # Needs Docker, curl, jq, python3, ssh, ssh-keygen and network access (images, OpenTofu).
 set -euo pipefail
@@ -388,5 +391,58 @@ tf destroy -auto-approve -input=false >"$WORK/destroy.log" 2>&1 || { cat "$WORK/
 [[ -z $(on_target docker ps -aq --filter "label=com.docker.compose.project=$project") ]] || fail "containers of the install are left"
 [[ -z $(on_target docker volume ls -q --filter "label=com.docker.compose.project=$project") ]] || fail "volumes of the install are left (delete_data)"
 [[ $(tf state list 2>/dev/null) == "" ]] || fail "the state still holds the resource"
+
+# The handoff chain: examples/guides/handoff-chain as it is, on the same host. Install A issues a
+# kit B's first install takes; B issues one back, which A takes by its re-run; each proves its kit
+# was taken. One apply, no verb by hand; a plan after it plans nothing; the kits nowhere on disk.
+step "handoff chain: A's kit to B's first install, B's back to A, both proven, in one apply"
+mkdir -p "$WORK/chain"
+cp "$REPO/examples/guides/handoff-chain/"*.tf "$WORK/chain/"
+on_target su ops -c 'mkdir -p /home/ops/a /home/ops/b'
+export TF_VAR_installer=$I3 TF_VAR_pull_username=pull TF_VAR_pull_password=$PULL_TOKEN TF_VAR_host=127.0.0.1 TF_VAR_port=$SP \
+	TF_VAR_user=ops TF_VAR_private_key_file=$WORK/user_key TF_VAR_known_hosts_line=$KNOWN \
+	TF_VAR_work_dirs='{ a = "/home/ops/a", b = "/home/ops/b" }' \
+	TF_VAR_ports='{ a = { app = 18080, api = 18000 }, b = { app = 18081, api = 18001 } }' \
+	TF_VAR_site_a_admin=a@notes.test TF_VAR_site_b_admin=b@notes.test
+TF_VAR_release_public_key=$(cat "$P/keys/release.pub")
+export TF_VAR_release_public_key
+ctf() { (cd "$WORK/chain" && "$TOFU" "$@" -no-color); }
+capply() { ctf apply -auto-approve -input=false >"$WORK/$1.log" 2>&1 || { cat "$WORK/$1.log"; fail "apply: $1"; }; }
+cplan() {
+	local rc=0
+	ctf plan -detailed-exitcode -input=false >"$WORK/$1.log" 2>&1 || rc=$?
+	[[ $rc == "$2" ]] || { cat "$WORK/$1.log"; fail "$1: the plan exited $rc, not $2"; }
+}
+env_at() {
+	local v
+	v=$(on_target sed -n "s/^$2='\{0,1\}\([^']*\)'\{0,1\}\$/\1/p" "/home/ops/$1/notes/.env")
+	[[ $v == "$3" ]] || fail "the install in /home/ops/$1 records $2=$v, not $3"
+}
+# no_kit <when>: no kit (its armor), and so no code beside it, in any file of the root.
+no_kit() { ! grep -rqF -- 'BEGIN AGE ENCRYPTED' "$WORK/chain" || fail "a kit is in the root's files ($1)"; }
+capply chain
+env_at a ADMIN_EMAIL a@notes.test
+env_at b ADMIN_EMAIL b@notes.test
+ctf output -json proven >"$WORK/proven.json" 2>&1 || { cat "$WORK/proven.json"; fail "tofu output proven"; }
+jq -e '.a_to_b == true and .b_to_a == true' "$WORK/proven.json" >/dev/null || { cat "$WORK/proven.json"; fail "a kit is not proven"; }
+no_kit "after the chain's apply"
+cplan chain-again 0
+
+step "handoff chain: B gives A back another value: taken by A's re-run, then A's refresh shows it"
+TF_VAR_returned_admin=other@notes.test capply chain-returned
+env_at a ADMIN_EMAIL other@notes.test
+TF_VAR_returned_admin=other@notes.test cplan chain-drift 2
+grep -q 'other@notes.test' "$WORK/chain-drift.log" || { cat "$WORK/chain-drift.log"; fail "the plan does not show the value the kit gave A"; }
+capply chain-restored
+env_at a ADMIN_EMAIL a@notes.test
+cplan chain-settled 0
+no_kit "after the chain's re-runs"
+
+step "handoff chain: destroy"
+TF_VAR_destroyable=true capply chain-destroyable
+ctf destroy -auto-approve -input=false >"$WORK/chain-destroy.log" 2>&1 || { cat "$WORK/chain-destroy.log"; fail "tofu destroy (the chain)"; }
+! on_target test -e /home/ops/a/notes || fail "A is left after the destroy"
+! on_target test -e /home/ops/b/notes || fail "B is left after the destroy"
+[[ $(ctf state list 2>/dev/null) == "" ]] || fail "the chain's state still holds resources"
 
 echo PASS

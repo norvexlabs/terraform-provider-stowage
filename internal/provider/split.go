@@ -44,7 +44,7 @@ type shape struct {
 // common are the model's attributes every type takes, by the same name.
 var common = []string{"id", "inputs", "secret_inputs_wo", "secret_inputs_wo_version", "given_wo", "allow_rollback",
 	"deletion_protection", "plan_dry_run", "registry", "registry_ca_digest", "status", "previous", "revision",
-	"registry_login_wo", "registry_login_wo_version", "kit_file", "kit_code_wo", "timeouts"}
+	"registry_login_wo", "registry_login_wo_version", "kit_wo", "kit_code_wo", "kit_wo_version", "timeouts"}
 
 func top(names ...string) []field {
 	out := make([]field, 0, len(names))

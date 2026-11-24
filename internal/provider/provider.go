@@ -12,6 +12,7 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/ephemeral"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
@@ -91,6 +92,9 @@ type Data struct {
 	PublicKeys map[string][]byte
 	// PublicKeysKnown is false while public_keys is not known yet.
 	PublicKeysKnown bool
+	// Kits are the kits stowage_kit issued in this process, which the ephemeral stowage_kit
+	// hands on. Nil in a Data no provider made.
+	Kits *kitStash
 }
 
 // publicKeysName names the provider's keys in an error.
@@ -177,6 +181,8 @@ type stowageProvider struct {
 	tmp        string
 	cache      string
 	installers InstallerSource
+	// kits are the process's: the kits stowage_kit issued.
+	kits kitStash
 }
 
 type providerModel struct {
@@ -325,9 +331,11 @@ func (p *stowageProvider) Configure(ctx context.Context, req provider.ConfigureR
 		Installers:      p.installers,
 		PublicKeys:      keys,
 		PublicKeysKnown: wholyKnown(m.PublicKeys),
+		Kits:            &p.kits,
 	}
 	resp.ResourceData = d
 	resp.DataSourceData = d
+	resp.EphemeralResourceData = d
 }
 
 // publicKeys are public_keys by name (`public_keys[i]`), each refused (in diags) unless it is a
@@ -358,7 +366,12 @@ func publicKeys(ctx context.Context, l types.List, diags *diag.Diagnostics) map[
 }
 
 func (p *stowageProvider) Resources(context.Context) []func() resource.Resource {
-	return []func() resource.Resource{newShapeResource("docker"), newShapeResource("kubernetes"), newShapeResource("vm"), newSeedResource}
+	return []func() resource.Resource{newShapeResource("docker"), newShapeResource("kubernetes"), newShapeResource("vm"), newSeedResource,
+		newKitResource, newKitTakeResource, newKitCheckResource}
+}
+
+func (p *stowageProvider) EphemeralResources(context.Context) []func() ephemeral.EphemeralResource {
+	return []func() ephemeral.EphemeralResource{newKitEphemeral}
 }
 
 func (p *stowageProvider) DataSources(context.Context) []func() datasource.DataSource {

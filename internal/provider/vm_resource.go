@@ -262,13 +262,16 @@ func (r *installResource) wait(ctx context.Context, what, bound string, step fun
 func (r *installResource) settleVM(ctx context.Context, v installer.VM) (*installer.VMStatus, error) {
 	var st *installer.VMStatus
 	err := r.wait(ctx, "the VM's first install was still running, or its status could not be read,", resourceTimeout, func() (bool, error) {
-		s, err := v.Status(ctx)
+		s, err := v.StatusOf(ctx, true)
 		if err != nil {
 			return false, err
 		}
 		st = s
 		return !s.Installing || s.InstallFailed != "", nil
 	})
+	if err == nil && st != nil {
+		r.noteRecorded(st.Values)
+	}
 	return st, err
 }
 
@@ -474,6 +477,28 @@ func (r *installResource) createVM(ctx context.Context, req resource.CreateReque
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	if r.kitLost {
+		// A kit expected and absent: refused. The VM's install takes a kit whether it is its first
+		// or the re-run of the one its first boot made, so an install there (or one that failed)
+		// may have taken it: the refusal then also names going on without one. While an earlier
+		// create's first install is marked as running, the create is refused too, naming the ways
+		// on.
+		st, err := v.Status(ctx)
+		if err != nil {
+			addInstallerError(&resp.Diagnostics, "Reading the VM", err)
+			return
+		}
+		if st != nil && stillInstalling(&st.Status, "remove kit_wo_version (and kit_wo) if it took the kit, then apply again; else (or if no run is under way: one cut by a timeout leaves it marked installing) bump the stowage_kit's version to issue a kit again.", &resp.Diagnostics) {
+			return
+		}
+		detail := kitLost("kit_wo")
+		if st != nil && (st.Installed != nil || st.InstallFailed != "") {
+			detail += " If the VM's install took this kit in an earlier apply that failed after it, remove kit_wo_version (and kit_wo) instead: the create goes on without a kit (once that apply's run has ended: the installer refuses a run beside another)."
+		}
+		resp.Diagnostics.AddAttributeError(path.Root("kit_wo"), "The kit is not here", detail)
+		return
+	}
+
 	// The VM's own login first: its install reads the registry with it.
 	if r.wo.login != "" {
 		if err := v.RegistryLogin(ctx, r.wo.login); err != nil {
@@ -1010,7 +1035,7 @@ func (u *vmUpdate) release(ctx context.Context, final, was *installModel, st *in
 	var verdict *bootVerdict
 	reboots := !(res != nil && res.Result == "nothing")
 	if !reboots {
-		if now, err = u.v.Status(ctx); err != nil {
+		if now, err = u.v.StatusOf(ctx, true); err != nil {
 			addInstallerError(u.diags, "Reading the VM", err)
 			return // state stays as before the upgrade
 		}
@@ -1079,13 +1104,16 @@ func (u *vmUpdate) release(ctx context.Context, final, was *installModel, st *in
 		}
 		// A status that cannot be read now keeps the one read after the reboot: the release the
 		// VM runs, and the re-run's inputs, which state then records.
-		if after, err := u.v.Status(ctx); err != nil {
+		if after, err := u.v.StatusOf(ctx, true); err != nil {
 			addInstallerError(u.diags, "Reading the VM", err)
 		} else {
 			now = after
 		}
 	}
 	u.r.vmFill(final, was)
+	if now != nil {
+		u.r.noteRecorded(now.Values)
+	}
 	applyVMStatus(final, now, false)
 	vm := *final.VM
 	vm.SeedBootID = was.VM.SeedBootID // null once a followed reboot retired the one-time key
@@ -1189,7 +1217,7 @@ func (r *installResource) readVM(ctx context.Context, m *installModel, resp *res
 	}
 	applyVMStatus(m, st, true)
 	retireSeed(m, st)
-	readBack(m, st.Values)
+	r.readBack(m, st.Values)
 	resp.Diagnostics.Append(dropUnrecorded(ctx, m, &st.Status)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, m)...)
 }
@@ -1306,11 +1334,12 @@ func (r *installResource) updateVM(ctx context.Context, req resource.UpdateReque
 	final := *plan
 	final.VM = withKeys(*plan.VM, own, seed) // whatever the plan held (planVM)
 	if step == stay {
-		after, err := v.Status(ctx)
+		after, err := v.StatusOf(ctx, true)
 		if err != nil {
 			addInstallerError(&resp.Diagnostics, "Reading the VM", err)
 			return
 		}
+		r.noteRecorded(after.Values)
 		var sick *unhealthyAttach // the NICs attached, the VM's boot unhealthy
 		if len(attach) == 0 {
 			resp.Diagnostics.Append(setPending(ctx, resp.Private, nil)...)

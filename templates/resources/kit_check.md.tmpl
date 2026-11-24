@@ -1,0 +1,42 @@
+---
+page_title: "{{.Name}} {{.Type}} - {{.ProviderName}}"
+subcategory: ""
+description: |-
+{{ .Description | plainmarkdown | trimspace | prefixlines "  " }}
+---
+
+# {{.Name}} ({{.Type}})
+
+{{ .Description | trimspace }}
+
+## Example Usage
+
+{{ tffile .ExampleFile }}
+
+{{ .SchemaMarkdown | trimspace }}
+
+## Details
+
+The install that issued the kit is named by one block, as `stowage_kit`'s. `handoff`, `instance`,
+`triggers` and what names the install replace the resource; `timeout`, `fail_if_not_proven` and how
+the install is reached change in place, running nothing.
+
+**Create**: the issuing release's `describe --json` (as `stowage_kit`'s, with its refusals: `No install there`, `No release there`, `The release runs another installer`) must list `handoff` (`No
+such handoff`) with a check (`A handoff without a check`: its `kit check` would answer unknown every
+time), else an error before any check runs. Then each run: Docker, the kept installer's `kit check HANDOFF
+INSTANCE --dir`; Kubernetes, `<name>.sh k8s kit check HANDOFF INSTANCE --namespace …` by the release's
+own installer (as `stowage_kit`'s); VM, `sudo -n <short_name>-stow kit check HANDOFF INSTANCE` over
+SSH. Exit 0 with its line `HANDOFF INSTANCE: proven` is proven; exit 1 with `…: not proven (…)` is not
+proven; exit 2, and any other answer (ssh, sudo or the installer failing, a status without its
+verdict line), is no verdict: tried again every 10 seconds until `timeout` (a duration, default
+`10m`) runs out. Not proven, or no verdict by then (the last run's error named), is an apply error
+with `fail_if_not_proven` (the default): the state is saved tainted, so the next apply checks again.
+With `fail_if_not_proven = false` it is a warning and `proven` false, for a `postcondition` or an
+output.
+
+**Refresh**: while `proven` is false, one run (no retry): a verdict is recorded; no verdict, or an
+install that does not answer, keeps state as it is, with a warning. Once proven, nothing runs.
+**Destroy** runs nothing.
+
+A replaced target install keeps its `id` (`<work_dir>/<name>`, `<namespace>/<release>`): give the
+check `replace_triggered_by` on it, so a new target is checked again.

@@ -35,7 +35,7 @@ another name reaches the installer unchanged. Over ssh no environment is carried
   without `--secrets`, without `--kit` and `--kit-code-file` once an install exists (with them
   while nothing is installed yet: a first install left unfinished, which the re-run finishes,
   and which the installer's re-run takes `--kit` for; the warning names the kit only when
-  `kit_file` is given), and without those of `--address`,
+  `kit_wo` is given), and without those of `--address`,
   `--registry` and `--registry-ca` that `describe` lists in `first_install_only`, which the
   installer's re-run refuses: the install
   keeps the ones it recorded, which must be the configuration's — an `address` given, the
@@ -46,7 +46,7 @@ another name reaches the installer unchanged. Over ssh no environment is carried
   `sh <name>.sh --no-input --json --dir ./<name> [--set K=V]… [--tls] [--domains] [--ports]
   [--address] [--registry] [--acme-ca URL]`, with `--answers`, `--given`, `--secrets`,
   `--registry-ca`, `--acme-ca-root` (`acme_ca_root`), `--registry-login-file`
-  (`registry_login_wo`) and `--kit` with `--kit-code-file` (`kit_file`, `kit_code_wo`) files sent on
+  (`registry_login_wo`) and `--kit` with `--kit-code-file` (`kit_wo`, `kit_code_wo`) files sent on
   standard input as a tar into a private (0700) temporary directory removed afterwards;
   then `status --json`, read again every 10 seconds while it reports `installing` (the first
   install not finished) until it no longer does, within the create timeout. A failed or refused

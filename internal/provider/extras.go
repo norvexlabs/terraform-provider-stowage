@@ -2,9 +2,9 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"maps"
-	"os"
 	"slices"
 	"strings"
 
@@ -21,15 +21,16 @@ import (
 // at its start (installResource.wo): never in a model, so never in state.
 type writeOnly struct {
 	login   string // registry_login_wo
+	kit     string // kit_wo
 	kitCode string // kit_code_wo
 }
 
 // readWriteOnly reads them from cfg.
 func readWriteOnly(ctx context.Context, cfg tfsdk.Config, diags *diag.Diagnostics) writeOnly {
-	var login, code types.String
+	var login types.String
 	diags.Append(cfg.GetAttribute(ctx, path.Root("registry_login_wo"), &login)...)
-	diags.Append(cfg.GetAttribute(ctx, path.Root("kit_code_wo"), &code)...)
-	return writeOnly{login: login.ValueString(), kitCode: code.ValueString()}
+	kit, code := readKitWO(ctx, cfg, diags)
+	return writeOnly{login: login.ValueString(), kit: kit, kitCode: code}
 }
 
 // loginChanged says whether an update sends registry_login_wo: its version changed (an imported
@@ -69,38 +70,59 @@ func acmeChange(plan, was *installModel) (ca, root string) {
 	return pick(plan.AcmeCA, was.AcmeCA), pick(plan.AcmeCARoot, was.AcmeCARoot)
 }
 
-// kit is the kit kit_file names, read on the machine running OpenTofu, with its code: "" for
-// none; an error in diags when it cannot be read or has no code.
+// kit is the kit kit_wo gives the first install, with its code: "" for none (neither kit_wo nor
+// kit_wo_version given); an error in diags for a kit without its code. A kit expected and absent
+// sets r.kitLost, which refuseLostKit refuses where the kit would be given: a create finding an
+// install there gives none, so a retry of one needs no kit.
 func (r *installResource) kit(m *installModel, diags *diag.Diagnostics) (string, string) {
-	if !known(m.KitFile) || m.KitFile.ValueString() == "" {
+	if r.wo.kit == "" && !known(m.KitWOVersion) {
+		if r.wo.kitCode != "" {
+			diags.AddAttributeError(path.Root("kit_code_wo"), "kit_code_wo without kit_wo", "The code opens a kit: give kit_wo, or remove kit_code_wo.")
+		}
 		return "", ""
 	}
-	p, err := expandHome(m.KitFile.ValueString())
-	if err == nil {
-		var b []byte
-		if b, err = os.ReadFile(p); err == nil {
-			if len(b) == 0 {
-				err = fmt.Errorf("%s is empty", p)
-			} else {
-				if r.wo.kitCode == "" {
-					diags.AddAttributeError(path.Root("kit_code_wo"), "kit_code_wo is not given", "A kit opens with its code: give kit_code_wo with kit_file.")
-				}
-				return string(b), r.wo.kitCode
-			}
-		}
+	if r.wo.kit == "" {
+		r.kitLost = true
+		return "", ""
 	}
-	diags.AddAttributeError(path.Root("kit_file"), "kit_file cannot be read", err.Error())
-	return "", ""
+	if needKit(r.wo.kit, r.wo.kitCode, diags); diags.HasError() {
+		return "", ""
+	}
+	return r.wo.kit, r.wo.kitCode
+}
+
+// stillInstalling refuses a create retried while the first install a create before it began is
+// marked as running (st: installing, not failed): that install may be taking the kit. then is
+// the shape's way on: apply again once it ends, or, when no run is under way (a run cut by a
+// timeout leaves the mark), issue a new kit.
+func stillInstalling(st *installer.Status, then string, diags *diag.Diagnostics) bool {
+	if st == nil || st.Installed != nil || !st.Installing || st.InstallFailed != "" {
+		return false
+	}
+	diags.AddError("The first install is still running",
+		"An earlier create's first install runs on (status --json installing), perhaps with the kit: once it has finished, "+then)
+	return true
+}
+
+// refuseLostKit adds the refusal of a kit expected and absent (r.kitLost) to diags, and says
+// whether it did.
+func (r *installResource) refuseLostKit(diags *diag.Diagnostics) bool {
+	if r.kitLost {
+		diags.AddAttributeError(path.Root("kit_wo"), "The kit is not here", kitLost("kit_wo"))
+	}
+	return r.kitLost
 }
 
 // readBack puts into m what the install records of the settings a configuration gives that no
 // field of state reads otherwise (status --json --values): a login the install no longer holds
 // takes registry_login_wo_version out, so the next plan sends it again; the ACME directory and
 // its root, in the modes that take them. Nothing without the values.
-func readBack(m *installModel, v *installer.Values) {
+func (r *installResource) readBack(m *installModel, v *installer.Values) {
 	if v == nil {
 		return
 	}
+	m.Inputs = inputsChanged(m.Inputs, r.recorded, v.Inputs)
+	r.nowRecorded = v.Inputs
 	if v.PullLogin != nil && !*v.PullLogin && v.PullLoginError == "" && known(m.RegistryLoginWOVersion) {
 		m.RegistryLoginWOVersion = types.Int64Null()
 	}
@@ -124,16 +146,92 @@ func readBack(m *installModel, v *installer.Values) {
 	}
 }
 
+// inputsChanged is inputs with the value the install records now for each key it gives whose
+// record changed since the refresh before (was: a kit taken, a re-run by hand) and differs from
+// inputs': the next plan then gives the configuration's again, never leaving the install apart
+// from it unseen. A value the installer records otherwise than given (an empty value as its
+// default) records the same at every refresh, so it is never a change; nor is anything at the
+// first refresh after an apply (was empty: the baseline). A file input is recorded by its digest.
+func inputsChanged(inputs types.Map, was, now map[string]string) types.Map {
+	if !known(inputs) || now == nil || was == nil {
+		return inputs
+	}
+	out := maps.Clone(inputs.Elements())
+	changed := false
+	for _, k := range slices.Sorted(maps.Keys(inputs.Elements())) {
+		s, ok := inputs.Elements()[k].(types.String)
+		rec, has := now[k]
+		before, had := was[k]
+		if !ok || !known(s) || !has || !had || rec == before || rec == s.ValueString() || rec == caDigest(s.ValueString()) {
+			continue
+		}
+		out[k], changed = types.StringValue(rec), true
+	}
+	if !changed {
+		return inputs
+	}
+	return types.MapValueMust(types.StringType, out)
+}
+
+// recordedKey is the private state's key of the input values the last refresh read.
+const recordedKey = "recorded_inputs"
+
+// getRecorded is the input values the last refresh read; nil for none (the first refresh after
+// an apply).
+func getRecorded(ctx context.Context, p interface {
+	GetKey(context.Context, string) ([]byte, diag.Diagnostics)
+}, diags *diag.Diagnostics) map[string]string {
+	if p == nil {
+		return nil
+	}
+	b, d := p.GetKey(ctx, recordedKey)
+	diags.Append(d...)
+	var out map[string]string
+	if len(b) == 0 || json.Unmarshal(b, &out) != nil {
+		return nil
+	}
+	return out
+}
+
+// setRecorded keeps v as the input values this refresh read.
+func setRecorded(ctx context.Context, p interface {
+	SetKey(context.Context, string, []byte) diag.Diagnostics
+}, v map[string]string, diags *diag.Diagnostics) {
+	b, err := json.Marshal(v)
+	if err != nil || p == nil {
+		return
+	}
+	diags.Append(p.SetKey(ctx, recordedKey, b)...)
+}
+
+// noteRecorded keeps v's inputs as what the install records now (nowRecorded), when it tells.
+func (r *installResource) noteRecorded(v *installer.Values) {
+	if v != nil && v.Inputs != nil {
+		r.nowRecorded = v.Inputs
+	}
+}
+
+// keepRecorded keeps, after a create or an update that read the install at its end (settle), what
+// it recorded then as the baseline of the next refresh: a change after it (a kit taken later in
+// the apply, a run by hand) shows there. Without that read, the private state is left as it is.
+func (r *installResource) keepRecorded(ctx context.Context, p interface {
+	SetKey(context.Context, string, []byte) diag.Diagnostics
+}, diags *diag.Diagnostics) {
+	if r.nowRecorded != nil && !diags.HasError() {
+		setRecorded(ctx, p, r.nowRecorded, diags)
+	}
+}
+
 // validateExtras checks the settings every type takes beside its own: the kit's code with its kit,
 // the kit without given_wo, the ACME root's form, the login with its version and the version with
 // its login. The kit's code is
 // the create's to require (kit): a configuration may leave it out once the install took the kit.
 func validateExtras(m *installModel, diags *diag.Diagnostics) {
-	if m.KitFile.IsNull() && known(m.KitCodeWO) {
-		diags.AddAttributeError(path.Root("kit_code_wo"), "kit_code_wo without kit_file", "The code opens a kit: give kit_file, or remove kit_code_wo.")
+	if m.KitWO.IsNull() && m.KitWOVersion.IsNull() && known(m.KitCodeWO) {
+		diags.AddAttributeError(path.Root("kit_code_wo"), "kit_code_wo without kit_wo", "The code opens a kit: give kit_wo, or remove kit_code_wo.")
 	}
-	if !m.KitFile.IsNull() && !m.GivenWO.IsNull() {
-		diags.AddAttributeError(path.Root("kit_file"), "kit_file with given_wo", "A kit gives what given_wo gives: give one of them.")
+	if (!m.KitWO.IsNull() || !m.KitWOVersion.IsNull()) && !m.GivenWO.IsNull() {
+		diags.AddAttributeError(path.Root("kit_wo"), "kit_wo with given_wo", "A kit gives what given_wo gives: give one of them.")
 	}
 	if r := m.AcmeCARoot.ValueString(); known(m.AcmeCARoot) && !strings.Contains(r, "-----BEGIN CERTIFICATE-----") {
 		diags.AddAttributeError(path.Root("acme_ca_root"), "acme_ca_root is not PEM",

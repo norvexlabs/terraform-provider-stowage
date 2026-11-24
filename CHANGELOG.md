@@ -3,6 +3,31 @@
 The provider's releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.5.0]
+
+For Stowage 0.44.0 or later on the installs that issue a kit (`kit create --json --request` on
+every shape, `describe --json`'s `handoffs`).
+
+### Added
+
+- Handoff kits, the whole cycle in one apply with no verb run by hand: `stowage_kit` issues a kit
+  on an install (the request, a secret answer included, never on a command line), the ephemeral
+  `stowage_kit` hands it, in the same apply, to the new `kit_wo` of an install resource (its first
+  install) or to `stowage_kit_take` (an install that exists takes it by its re-run, as a kit going
+  back to the install that issued the first one), and `stowage_kit_check` proves it, tried until the
+  issuer's check answers. The kit and its code are kept in the provider's process alone: never in a
+  file of the root, the state, a plan or a log (the runs that issue and take one pass it through a
+  private temporary directory, removed when they end). A guide and a whole root, `examples/guides/handoff-chain`.
+- A refresh of an install reads the value it records for each input the configuration gives: one
+  whose record a kit (or a run by hand) changed since the refresh before shows in the next plan,
+  which gives the configuration's back, where it stayed apart unseen.
+
+### Changed
+
+- **Breaking**: `kit_file` is gone from the install resources. A kit is given by `kit_wo` (write-only)
+  with `kit_code_wo`, and `kit_wo_version`, which says a kit is expected: a kit made by hand is
+  `kit_wo = file("x.kit")`, with `kit_wo_version` set to any value naming it.
+
 ## [0.4.0] - 2026-11-23
 
 ### Added

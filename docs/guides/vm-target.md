@@ -41,7 +41,7 @@ argument.
      naming its reason, and nothing else runs). Then `sudo -n <short>-stow install --no-input
      --json [--set K=V]… [--tls] [--domains] [--ports] [--acme-ca URL]`, with
      `secret_inputs_wo` as `--answers`, `given_wo` as `--given`, `secrets_wo` as `--secrets`,
-     `acme_ca_root` as `--acme-ca-root`, and `kit_file` and `kit_code_wo` as `--kit` and
+     `acme_ca_root` as `--acme-ca-root`, and `kit_wo` and `kit_code_wo` as `--kit` and
      `--kit-code-file` on standard input: the
      first install (from the settings the seed's cloud-config wrote), or the re-run of the one the
      first boot made — the installer decides, and refuses what a re-run does not take (exit 3,

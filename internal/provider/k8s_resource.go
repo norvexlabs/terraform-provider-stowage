@@ -415,6 +415,14 @@ func connKnown(b *k8sConnModel) bool {
 	return e == nil || !e.APIVersion.IsUnknown() && !e.Command.IsUnknown() && wholyKnown(e.Args) && wholyKnown(e.Env)
 }
 
+// kitNotGiven names the kit among the settings a take-over gives not, when one is configured.
+func kitNotGiven(configured bool) string {
+	if !configured {
+		return ""
+	}
+	return "; kit_wo with kit_code_wo, as a release is there (stowage_kit_take gives a kit to it)"
+}
+
 // k8sID is the resource's ID on Kubernetes.
 func k8sID(k installer.K8s) string { return k.Namespace + "/" + k.ReleaseName() }
 
@@ -528,6 +536,9 @@ func (r *installResource) k8sCreate(ctx context.Context, m *installModel, in ins
 	}
 	switch {
 	case existing == nil:
+		if r.refuseLostKit(diags) {
+			return
+		}
 		if _, err := k.Install(ctx, in); err != nil {
 			addInstallerError(diags, "Installing "+desc.Name, err)
 			return
@@ -556,6 +567,9 @@ func (r *installResource) k8sCreate(ctx context.Context, m *installModel, in ins
 		return
 	case existing.Installed == nil:
 		// Uninstalled with its history kept: the installer's install decides.
+		if r.refuseLostKit(diags) {
+			return
+		}
 		if _, err := k.Install(ctx, in); err != nil {
 			addInstallerError(diags, "Installing "+desc.Name, err)
 			return
@@ -564,7 +578,7 @@ func (r *installResource) k8sCreate(ctx context.Context, m *installModel, in ins
 		diags.AddWarning("A release is already there",
 			fmt.Sprintf("The release %s already runs %s: the create takes it over, giving it given_wo, then inputs and secret_inputs_wo, again (k8s upgrade --given), which replace the values it records; "+
 				"with nothing to give, a release whose latest helm revision failed, or with values, is applied again (k8s upgrade). "+
-				"The settings only a first install takes (the provider's registry, registry_ca) are not given: the release keeps what it recorded.", k8sID(k), name))
+				"The settings only a first install takes (the provider's registry, registry_ca%s) are not given: the release keeps what it recorded.", k8sID(k), name, kitNotGiven(in.Kit != "" || r.kitLost)))
 		if in.Given != "" {
 			if _, err := k.Give(ctx, in.Given, r.registryCA()); err != nil {
 				addInstallerError(diags, "Giving "+desc.Name+" given_wo", err)
@@ -615,7 +629,7 @@ func (r *installResource) k8sCreate(ctx context.Context, m *installModel, in ins
 // within ctx's deadline.
 func (r *installResource) k8sSettle(ctx context.Context, k installer.K8s) (*installer.Status, error) {
 	for {
-		st, err := k.Status(ctx)
+		st, err := k.StatusOf(ctx, true)
 		if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			return nil, fmt.Errorf("the release %s is still installing when the timeout ran out (the read: %w): apply again once status --json no longer reports installing", k8sID(k), err)
 		}
@@ -626,6 +640,7 @@ func (r *installResource) k8sSettle(ctx context.Context, k installer.K8s) (*inst
 			return nil, fmt.Errorf("the install succeeded but the namespace holds no release %s", k8sID(k))
 		}
 		if !st.Installing {
+			r.noteRecorded(st.Values)
 			return st, nil
 		}
 		select {
@@ -666,7 +681,7 @@ func (r *installResource) k8sRead(ctx context.Context, m *installModel, state *t
 		state.RemoveResource(ctx)
 		return
 	}
-	readBack(m, st.Values)
+	r.readBack(m, st.Values)
 	if st.Name != name {
 		diags.AddError("Another project's release", fmt.Sprintf("The release %s holds %q, not %q.", k8sID(run.k), st.Name, name))
 		return
@@ -1181,7 +1196,10 @@ func (r *installResource) k8sUpdate(ctx context.Context, plan, state *installMod
 // base's, with the error; a release still running an installer not trusted (against configured)
 // keeps the drift status, with an error.
 func (r *installResource) k8sFinal(ctx context.Context, k installer.K8s, m, base *installModel, name string, diags *diag.Diagnostics, configured ...types.String) {
-	st, err := k.Status(ctx)
+	st, err := k.StatusOf(ctx, true)
+	if err == nil && st != nil {
+		r.noteRecorded(st.Values)
+	}
 	if err == nil && st == nil {
 		err = fmt.Errorf("the namespace holds no release %s any more", k8sID(k))
 	}

@@ -41,6 +41,12 @@ type installResource struct {
 	// wo are the write-only values of the create or update this instance runs (the framework
 	// makes an instance per request), read from its configuration.
 	wo writeOnly
+	// recorded are the input values the install recorded at the refresh before this one (the
+	// private state's), and nowRecorded those this refresh read (readBack): a change between
+	// two refreshes is one made outside the resource (inputsChanged).
+	recorded, nowRecorded map[string]string
+	// kitLost: kit_wo_version is given and kit_wo is not (kit).
+	kitLost bool
 }
 
 var (
@@ -330,9 +336,14 @@ func (r *installResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 			firstInstallOnly(&resp.Diagnostics, path.Root("installer"), "the installer's project", was, now)
 		}
 	}
-	if !imported(&state) && !plan.KitFile.IsUnknown() && !plan.KitFile.Equal(state.KitFile) {
-		resp.Diagnostics.AddAttributeWarning(path.Root("kit_file"), "kit_file is first-install only",
-			"A kit is given to the first install alone: the change is recorded, and nothing is given to the install.")
+	switch {
+	case imported(&state):
+	case plan.KitWOVersion.IsUnknown():
+		resp.Diagnostics.AddAttributeWarning(path.Root("kit_wo_version"), "kit_wo is first-install only",
+			"kit_wo_version is not known yet (its stowage_kit issues a kit in this apply): a kit is given to the first install alone, so this install takes nothing unless the plan replaces it. stowage_kit_take gives a kit to an install that exists.")
+	case !plan.KitWOVersion.IsUnknown() && !plan.KitWOVersion.Equal(state.KitWOVersion):
+		resp.Diagnostics.AddAttributeWarning(path.Root("kit_wo_version"), "kit_wo is first-install only",
+			"A kit is given to the first install alone: the change is recorded, and nothing is given to the install unless the plan replaces it. stowage_kit_take gives a kit to an install that exists.")
 	}
 	r.k8sModifyPlan(ctx, &plan, &state, resp)
 	r.planPullLogin(&plan, &state, &resp.Diagnostics)
@@ -551,6 +562,7 @@ func (r *installResource) Create(ctx context.Context, req resource.CreateRequest
 	if r.wo = readWriteOnly(ctx, req.Config, &resp.Diagnostics); resp.Diagnostics.HasError() {
 		return
 	}
+	defer r.keepRecorded(ctx, resp.Private, &resp.Diagnostics)
 	if targetKind(&m) == "vm" {
 		r.createVM(ctx, req, resp)
 		return
@@ -640,16 +652,27 @@ func (r *installResource) Create(ctx context.Context, req resource.CreateRequest
 				fmt.Sprintf("%s/%s already holds an install of %s whose first install recorded other settings, which a re-run cannot change: %s. Give the settings the install holds (status --json), or another work_dir.", d.WorkDir, d.Name, d.Name, strings.Join(bad, "; ")))
 			return
 		}
+	}
+	// A kit lost is refused once the install there is known to be this one, before the take-over
+	// is said: where the kit would be given (nothing installed), and while an earlier create's
+	// first install is marked as running.
+	if r.kitLost && stillInstalling(existing, "apply again: once it succeeded, the create goes on from it, needing no kit; once it failed, the create asks for a kit again. If no run is under way (one cut by a timeout leaves it marked installing), bump the stowage_kit's version instead: the re-run finishes the first install with the new kit.", &resp.Diagnostics) {
+		return
+	}
+	if (existing == nil || existing.Installed == nil) && r.refuseLostKit(&resp.Diagnostics) {
+		return
+	}
+	if existing != nil {
 		// A kit goes with the re-run of a first install left unfinished (nothing installed yet):
-		// the installer's re-run takes --kit; once an install exists, kit_file is first-install
-		// only, as at an update. Said only when kit_file is given.
+		// the installer's re-run takes --kit; once an install exists, kit_wo is first-install
+		// only, as at an update. Said only when a kit is given.
 		notGiven, kit := "", ""
 		switch {
-		case !known(m.KitFile):
+		case in.Kit == "" && !r.kitLost:
 		case existing.Installed != nil:
-			notGiven = "; kit_file with kit_code_wo, as an install exists"
+			notGiven = "; kit_wo with kit_code_wo, as an install exists (stowage_kit_take gives a kit to it)"
 		default:
-			kit = " kit_file with kit_code_wo is given, as nothing is installed yet."
+			kit = " kit_wo with kit_code_wo is given, as nothing is installed yet."
 		}
 		resp.Diagnostics.AddWarning("An install is already there",
 			fmt.Sprintf("%s/%s already holds an install of %s: the create runs the installer again on it (its re-run), which finishes a first install left unfinished; "+
@@ -778,7 +801,7 @@ const defaultAddress = "127.0.0.1"
 
 // withoutFirstInstallOnly leaves out of in the settings a re-run refuses: those describe names
 // first-install only that the provider gives and the secrets export (a re-run keeps the install's
-// secrets); and, once an install exists (installed), the kit and its code: kit_file is given to
+// secrets); and, once an install exists (installed), the kit and its code: kit_wo is given to
 // the first install alone, which a re-run finishing it is.
 func withoutFirstInstallOnly(in *installer.Install, names []string, installed bool) {
 	in.Secrets = ""
@@ -833,7 +856,7 @@ func (r *installResource) fetchDescribe(ctx context.Context, d installer.Docker,
 // ctx's deadline (the create timeout).
 func (r *installResource) settle(ctx context.Context, d installer.Docker) (*installer.Status, error) {
 	for {
-		st, err := d.Status(ctx)
+		st, err := d.StatusOf(ctx, true)
 		if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			// The read was cut by the create timeout: the install is still installing.
 			return nil, fmt.Errorf("%s/%s is still installing when the create timeout ran out (timeouts.create; the read: %w): apply again once status --json no longer reports installing", d.WorkDir, d.Name, err)
@@ -845,6 +868,7 @@ func (r *installResource) settle(ctx context.Context, d installer.Docker) (*inst
 			return nil, fmt.Errorf("the install succeeded but its directory is not there: %s/%s", d.WorkDir, d.Name)
 		}
 		if !st.Installing || st.InstallFailed != "" {
+			r.noteRecorded(st.Values)
 			return st, nil
 		}
 		select {
@@ -915,6 +939,12 @@ func (r *installResource) Read(ctx context.Context, req resource.ReadRequest, re
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	r.recorded = getRecorded(ctx, req.Private, &resp.Diagnostics)
+	defer func() {
+		if r.nowRecorded != nil && !resp.Diagnostics.HasError() {
+			setRecorded(ctx, resp.Private, r.nowRecorded, &resp.Diagnostics)
+		}
+	}()
 	if m.VM != nil {
 		r.readVM(ctx, &m, resp)
 		return
@@ -965,7 +995,7 @@ func (r *installResource) Read(ctx context.Context, req resource.ReadRequest, re
 	}
 	applyStatus(&m, st, true)
 	applyHeld(&m, st, true)
-	readBack(&m, st.Values)
+	r.readBack(&m, st.Values)
 	resp.Diagnostics.Append(dropUnrecorded(ctx, &m, st)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }
@@ -1085,6 +1115,7 @@ func (r *installResource) Update(ctx context.Context, req resource.UpdateRequest
 	if r.wo = readWriteOnly(ctx, req.Config, &resp.Diagnostics); resp.Diagnostics.HasError() {
 		return
 	}
+	defer r.keepRecorded(ctx, resp.Private, &resp.Diagnostics)
 	if len(remoteChange(&plan, &state)) == 0 && !imported(&state) && (plan.VM == nil || len(pendingRoles(ctx, req.Private)) == 0) {
 		// Only the provider's own settings changed (the connection, deletion_protection,
 		// delete_data, allow_rollback, timeouts), and no interface is pending: the target has
@@ -1601,7 +1632,7 @@ func mapOrNull(ctx context.Context, was, now types.Map, vals map[string]string, 
 // state's values, and the error.
 func (u *update) settled(ctx context.Context, d installer.Docker, m *installModel, short string) {
 	fillUpdate(m, d, short)
-	st, err := d.Status(ctx)
+	st, err := d.StatusOf(ctx, true)
 	if err == nil && st == nil {
 		err = fmt.Errorf("%s/%s holds no install any more", d.WorkDir, d.Name)
 	}
@@ -1610,6 +1641,7 @@ func (u *update) settled(ctx context.Context, d installer.Docker, m *installMode
 		keepComputed(m, u.state)
 		return
 	}
+	u.r.noteRecorded(st.Values)
 	applyStatus(m, st, false)
 	applyHeld(m, st, false)
 }

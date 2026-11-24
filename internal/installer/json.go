@@ -114,6 +114,8 @@ type Describe struct {
 	// moves.
 	Routes   []Route   `json:"routes"`
 	L4Routes []L4Route `json:"l4_routes"`
+	// Handoffs are the kits the release issues (Stowage >= KitMinStowage; none before).
+	Handoffs []Handoff `json:"handoffs"`
 }
 
 // Route is a front route as describe lists it: its name, and the loopback port it binds when

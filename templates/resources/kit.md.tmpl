@@ -1,0 +1,72 @@
+---
+page_title: "{{.Name}} {{.Type}} - {{.ProviderName}}"
+subcategory: ""
+description: |-
+{{ .Description | plainmarkdown | trimspace | prefixlines "  " }}
+---
+
+# {{.Name}} ({{.Type}})
+
+{{ .Description | trimspace }}
+
+## Example Usage
+
+{{ tffile .ExampleFile }}
+
+{{ .SchemaMarkdown | trimspace }}
+
+## Details
+
+The install that issues the kit is named by one block, holding what its install resource exports:
+`docker` (its SSH settings, `install_id` = the install's `id`, `short_name`), `kubernetes`
+(`installer`, `namespace`, `release`: the cluster is the provider's `kubernetes` block) or `vm`
+(`host`, `user`, `known_hosts_line` = `stowage_vm_install`'s `host_key_line`, `short_name`). Exactly
+one is given, else a validation error (`One install, in one block`); an attribute the block needs
+left out is one too (`Missing docker.install_id`, …). Changing what names the install
+(`install_id`, `short_name`; `namespace`, `release`), `handoff` or `instance` replaces the resource; a
+change of how it is reached alone (`host`, `port`, `user`, `private_key_file`, `known_hosts_line`, the
+Kubernetes `installer`), as the install resources take a new host for the same install, is recorded
+in place, nothing issued, the `id` kept.
+
+**Create, and an update** (a change of `answers`, `expires` or `version`): the release's `describe --json` — Docker: the kept installer's
+`<install_id>/<short_name>-stow describe --json`; Kubernetes: the `installer` fetched and checked as
+the install resource's ([trust](../guides/trust.md)), whose release must be the one the cluster runs
+(`k8s status --json`: its recorded installer, else its version and revision; another is an error,
+`The release runs another installer`; none in the namespace, `No release there`); VM: `<short_name>-stow describe --json` over SSH. Its
+`handoffs` must list `handoff` (else `No such handoff`, naming those it issues; a release made before
+Stowage 0.44.0 lists none); a Docker `install_id` whose directory holds no install is `No install
+there`. Refused then, before anything is issued: a question `ask` marks `secret`
+answered in `answers`, which state holds (`A secret answer in answers`: give it in `answers_wo`), and a
+handoff whose `gives` lists a `KIT_TLS_*` key (`A handoff giving TLS material`): a kit's `tls` moves its
+target's front to `byo`, which the target's install resource's `tls` does not say — issue that one by
+hand. Then `kit create HANDOFF --json`: Docker, the kept installer with the request as the file
+`--request` reads, sent on standard input in a private directory; Kubernetes, `<name>.sh k8s kit create
+HANDOFF --json --request FILE --namespace … [--release …]` with the provider's `registry_ca`; VM, `sudo
+-n <short_name>-stow kit create HANDOFF --json` with the request on standard input. The request is
+`{instance, answers, expires}`: `answers` and `answers_wo` merged (a key in both is a validation error),
+`expires` in nanoseconds. The installer checks it (a question left unanswered, an instance the handoff
+asks, an expiry past its cap: its refusal, before the run; an exit 3 says `refused before the run:
+nothing was issued`). Its answer `{kit, code}` is kept in the
+provider's process memory under a new random `id`, and nowhere else: never state, a plan, a log or a
+file. A failure after the run may have started says so (`if the handoff's run started, what it issued
+is lost`): the project's script decides whether it can be issued again; bump `version` to try.
+
+A root orders the runs on one install: each kit resource after its install resource, by giving it
+that resource's attributes (`id`, `short_name`, `installer`, `namespace`, `host`: OpenTofu then
+runs it after the install's create or update), and the kit resources on one install after one
+another (`depends_on`), as `examples/guides/handoff-chain` does. The provider orders nothing
+itself. On Docker and the VM, the installer's own lock refuses a run while another holds the
+install (`a provision, upgrade, rollback or reset-db is already running for this install: wait
+for it to finish`, exit 3); on Kubernetes, helm refuses an upgrade (a take) while another is
+pending, and a kit's Job runs beside anything, so an issue or a check beside the release's
+upgrade is not refused.
+
+**Refresh** runs nothing. **Destroy** forgets the kit: what the handoff issued is the project's to
+revoke. **Import** is not supported.
+
+The kit reaches what takes it through the ephemeral `stowage_kit` (same provider configuration: a
+provider alias is another process, which holds nothing), into `kit_wo` and `kit_code_wo` of
+`stowage_*_install` (a first install) or `stowage_kit_take` (an install that exists). In any later
+plan or apply the ephemeral is null; what takes the kit sets `kit_wo_version` to this resource's
+`id`, so a null kit where one is expected is an error naming the fix (bump `version`), never an
+install without it. See the guide [Handoff kits](../guides/handoff-kits.md).
