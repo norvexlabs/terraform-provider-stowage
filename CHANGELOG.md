@@ -3,7 +3,7 @@
 The provider's releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.5.0]
+## [0.5.0] - 2026-11-24
 
 For Stowage 0.44.0 or later on the installs that issue a kit (`kit create --json --request` on
 every shape, `describe --json`'s `handoffs`).
