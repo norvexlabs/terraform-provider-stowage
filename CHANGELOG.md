@@ -3,7 +3,7 @@
 The provider's releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.6.0]
+## [0.6.0] - 2026-11-25
 
 For Stowage 0.46.0 or later on the installs that rotate a secret (`describe --json`'s `secrets`).
 
