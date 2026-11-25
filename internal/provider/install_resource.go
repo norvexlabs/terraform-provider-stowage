@@ -123,7 +123,7 @@ func (r *installResource) ValidateConfig(ctx context.Context, req resource.Valid
 	for _, c := range []struct {
 		name string
 		m    types.Map
-	}{{"inputs", m.Inputs}, {"secret_inputs_wo", m.SecretInputsWO}, {"domains", m.Domains}, {"ports", m.Ports}} {
+	}{{"inputs", m.Inputs}, {"secret_inputs_wo", m.SecretInputsWO}, {"domains", m.Domains}, {"ports", m.Ports}, {"secret_rotations", m.SecretRotations}} {
 		for _, k := range mapKeys(c.m) {
 			if c.m.Elements()[k].IsNull() {
 				p := path.Root(c.name).AtMapKey(k)
@@ -154,6 +154,12 @@ func (r *installResource) ValidateConfig(ctx context.Context, req resource.Valid
 	if known(m.SecretInputsWO) && m.SecretInputsWOVersion.IsNull() {
 		resp.Diagnostics.AddAttributeWarning(path.Root("secret_inputs_wo_version"), "secret_inputs_wo_version is not set",
 			"A write-only value is never compared: without a version to bump, a later change of secret_inputs_wo is never applied.")
+	}
+	for _, k := range mapKeys(m.SecretRotations) {
+		if !installer.ValidInputKey(k) {
+			resp.Diagnostics.AddAttributeError(path.Root("secret_rotations").AtMapKey(k), "not a secret's key",
+				fmt.Sprintf("%q: a secret's key is a letter or _, then letters, digits or _.", k))
+		}
 	}
 	for _, k := range mapKeys(m.Domains) {
 		if !installer.ValidRoute(k) {
@@ -351,6 +357,7 @@ func (r *installResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 	r.planRollback(ctx, &plan, &state, &resp.Diagnostics)
 	planVM(ctx, &plan, &state, resp)
 	planRemovals(ctx, &plan, &state, &resp.Diagnostics)
+	planRotations(ctx, req.Private, &plan, &state, &resp.Diagnostics)
 	if r.data != nil && r.data.RegistryCAKnown && !imported(&state) && plan.Kubernetes == nil {
 		firstInstallOnlyFix(&resp.Diagnostics, path.Root("registry_ca_digest"), "the provider's registry_ca", state.RegistryCADigest.ValueString(), caDigest(r.data.RegistryCA),
 			"The install keeps the registry CA its first install was given (status --json registry_ca), which a re-run cannot change: give the provider that CA again (an empty one for none).")
@@ -615,6 +622,7 @@ func (r *installResource) Create(ctx context.Context, req resource.CreateRequest
 		return
 	}
 	refuseSecretInputs(&resp.Diagnostics, in.Inputs, desc)
+	createRotations(ctx, resp.Private, m.SecretRotations, desc, installer.ShapeDocker, &resp.Diagnostics)
 	if d.Local() {
 		refuseRunEnvInputs(&resp.Diagnostics, nil, in.Given, in.Inputs, in.SecretInputs)
 	}
@@ -1115,7 +1123,35 @@ func (r *installResource) Update(ctx context.Context, req resource.UpdateRequest
 	if r.wo = readWriteOnly(ctx, req.Config, &resp.Diagnostics); resp.Diagnostics.HasError() {
 		return
 	}
-	defer r.keepRecorded(ctx, resp.Private, &resp.Diagnostics)
+	// One update timeout bounds the target's steps and the rotations after them.
+	timeout, diags := plan.Timeouts.Update(ctx, updateTimeout)
+	if resp.Diagnostics.Append(diags...); resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	want := plan.SecretRotations
+	plan.SecretRotations = keptRotations(want, state.SecretRotations)
+	forgetPending(ctx, resp.Private, want, state.SecretRotations, &resp.Diagnostics)
+	// The response starts as the prior state (the framework's): an error before a step saves
+	// keeps state's numbers.
+	if r.updateTarget(ctx, req, resp, &plan, &state); resp.Diagnostics.HasError() {
+		return
+	}
+	// What the install records now is the next refresh's baseline, whatever the rotations do.
+	r.keepRecorded(ctx, resp.Private, &resp.Diagnostics)
+	r.rotateSecrets(ctx, resp.Private, want, &state, func(m *installModel) bool {
+		resp.Diagnostics.Append(resp.State.Get(ctx, m)...)
+		return !resp.Diagnostics.HasError()
+	}, func(m *installModel) bool {
+		resp.Diagnostics.Append(resp.State.Set(ctx, m)...)
+		return !resp.Diagnostics.HasError()
+	}, &resp.Diagnostics)
+}
+
+// updateTarget applies a plan's changes but its rotations (rotateSecrets) to the target.
+func (r *installResource) updateTarget(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse, planP, stateP *installModel) {
+	plan, state := *planP, *stateP
 	if len(remoteChange(&plan, &state)) == 0 && !imported(&state) && (plan.VM == nil || len(pendingRoles(ctx, req.Private)) == 0) {
 		// Only the provider's own settings changed (the connection, deletion_protection,
 		// delete_data, allow_rollback, timeouts), and no interface is pending: the target has
@@ -1130,16 +1166,12 @@ func (r *installResource) Update(ctx context.Context, req resource.UpdateRequest
 		r.updateVM(ctx, req, resp, &plan, &state)
 		return
 	}
-	timeout, diags := plan.Timeouts.Update(ctx, updateTimeout)
-	resp.Diagnostics.Append(diags...)
 	var secretsWO types.Map
 	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("secret_inputs_wo"), &secretsWO)...)
 	secrets := stringMap(ctx, secretsWO, &resp.Diagnostics)
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 	save := func(m *installModel) bool {
 		resp.Diagnostics.Append(resp.State.Set(ctx, m)...)
 		return !resp.Diagnostics.HasError()

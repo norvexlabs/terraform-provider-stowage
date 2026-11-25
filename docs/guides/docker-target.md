@@ -159,6 +159,16 @@ another name reaches the installer unchanged. Over ssh no environment is carried
      so the next plan shows the release change alone.
   5. `status --json` fills the computed attributes; one that cannot be read keeps state's, with
      the error.
+  6. The **rotations**, when `secret_rotations` adds a key or changes a number (alone, the steps before
+     are skipped): the kept
+     installer's `describe --json` (its `secrets`, the ways kept in the resource's private state
+     for the next plans), every key added or changed checked against it (none rotated if one is
+     refused), the added recorded, then for each changed key, in key order, `<short>-stow secrets
+     rotate KEY --yes --no-input --dir ./<name>` (`replace`) or `… --stage`, `…` and `… --finish`
+     (`passes`), its number saved once it rotated. Steps 1–5 run first and are saved: a rotation
+     that fails leaves their state, its number not recorded. With nothing to rotate, `secret_rotations` set, an
+     update after which the ways kept are not the running release's (it changed the release, or
+     none were kept) reads its `describe` for those ways alone; a read that fails is a warning.
 - **Import**: `tofu import stowage_docker_install.x '[<host>:]<work_dir>/<name>/<short>-stow'`, the
   installer the install keeps (`ls <work_dir>/<name>/*-stow`), `<work_dir>` an absolute, clean
   path, or left out (`<name>/<short>-stow`, or `./<name>/…`) for the SSH user's home (another

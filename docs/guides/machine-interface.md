@@ -54,6 +54,11 @@ description: |-
   update or destroy, naming the hand upgrade that moves it on (its kept `<short>-stow upgrade
   --version V`; on Kubernetes the release's own `k8s upgrade --version V`, on a VM `sudo
   <short>-stow upgrade --version V`), after which the provider drives it.
+- **Stowage 0.46.0 or later**: `describe --json` `secrets` (each generated secret's key and its
+  `rotate` way per shape: `passes`, `replace` or `none`) is what `secret_rotations` is checked
+  against; a `describe` without it (`null`) takes no `secret_rotations`. `secrets rotate` has no
+  `--json`: its exit status alone is read (0 done, 3 refused, its reason the last line of standard
+  error; any other a failure, its standard error's tail in the diagnostic).
 - **Stowage 0.40.0 or later**: `status --json --values` (a refresh reads it) adds `pull_login`
   and `pull_login_error` (whether the install holds its own registry login), and in the ACME modes
   `acme_ca` and `acme_ca_root` (`sha256:<hex>`) with `acme_ca_root_error`; `vm seed --json` adds

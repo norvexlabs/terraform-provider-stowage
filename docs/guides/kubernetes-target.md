@@ -181,6 +181,16 @@ operation first names the programs missing from `PATH` among `helm` and `kubectl
      taken over first). The registry is the one the release was installed from: `--image-registry`
      is never given again.
   5. `k8s status --json` by the installer that now runs fills the computed attributes.
+  6. The **rotations**, when `secret_rotations` adds a key or changes a number (alone, the steps before
+     are skipped): state's installer
+     fetched again into the run's private directory and described (its `secrets`, the ways kept
+     in the resource's private state for the next plans), every key added or changed checked
+     against it, the added recorded, then for each changed key, in key order, `<short>-stow k8s
+     secrets rotate KEY --stage`, `…` and `… --finish` with the release's flags (no
+     `--registry-ca`: the verb reads no registry), its number saved once it rotated. Steps 1–5 run
+     first and are saved. With nothing to rotate, `secret_rotations` set, an
+     update after which the ways kept are not the running release's (it changed the release, or
+     none were kept) reads its `describe` for those ways alone; a read that fails is a warning.
 - **Import**: `tofu import stowage_kubernetes_install.x '<namespace>/<release>'`. State records
   the namespace and the release, `deletion_protection = true`; the first apply, with the
   configuration's cluster and installer, compares the configuration's inputs with those the

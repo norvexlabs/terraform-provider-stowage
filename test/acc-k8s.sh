@@ -8,7 +8,8 @@
 #   make acc-k8s     (or: PROVIDER_BIN=… bash test/acc-k8s.sh)
 #
 # Walks: create (1.0.0, a secret input added to the example's copy, the cluster reached by host and
-# client certificate, a kubeconfig written for each run) → a plan shows no change → a changed input
+# client certificate, a kubeconfig written for each run) → a plan shows no change →
+# secret_rotations of a replace: true secret refused at plan (none on Kubernetes) → a changed input
 # (k8s upgrade --given, the pod's environment changed) → chart values (kubernetes.values: k8s
 # upgrade --values, in helm's values) → ship 2.0.0, its installer upgrades (the values kept) → a
 # plan shows no change → ship 3.0.0, upgraded to with changed chart values → 1.0.0's installer (not
@@ -107,6 +108,9 @@ s = open(path).read()
 old = '  - { key: ADMIN_EMAIL, prompt: "Administrator email", required: true }\n'
 assert s.count(old) == 1, old
 s = s.replace(old, old + '  - { key: E2E_TOKEN, prompt: "A token", secret: true, optional: true }\n')
+old = '  - { key: SESSION_SECRET,    gen: hex32 }\n'
+assert s.count(old) == 1, old
+s = s.replace(old, '  - { key: SESSION_SECRET,    gen: hex32, replace: true }\n')
 open(path, "w").write(s)
 PY
 E2E_TOKEN=tok-$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')
@@ -156,6 +160,12 @@ kubectl get -n "$NS" secrets -o json | jq -r '.items[].data.E2E_TOKEN // empty' 
 step "a plan after the create shows no change"
 rc=0; tf plan -detailed-exitcode -no-color >"$WORK/plan1.log" 2>&1 || rc=$?
 [[ $rc == 0 ]] || { cat "$WORK/plan1.log"; fail "tofu plan after the create exited $rc, not 0 (no change)"; }
+
+step "secret_rotations: SESSION_SECRET (replace: true) refused at plan, by the ways the create read"
+config "$I1" admin@notes.test 'secret_rotations = { SESSION_SECRET = 1 }'
+rc=0; tf plan -no-color >"$WORK/plan-rotations.log" 2>&1 || rc=$?
+[[ $rc != 0 ]] && tr -s ' \n' ' ' <"$WORK/plan-rotations.log" | grep -q 'SESSION_SECRET does not rotate on kubernetes' ||
+	{ cat "$WORK/plan-rotations.log"; fail "secret_rotations of a replace: true secret planned on Kubernetes"; }
 
 step "a changed input: the running release applied again, given it (k8s upgrade --given)"
 config "$I1" ops@notes.test

@@ -3,6 +3,21 @@
 The provider's releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.6.0]
+
+For Stowage 0.46.0 or later on the installs that rotate a secret (`describe --json`'s `secrets`).
+
+### Added
+
+- `secret_rotations` on every install resource: a number per generated secret (`{ SESSION_SECRET = 1 }`),
+  as `random_password`'s `keepers`. Changing a key's number rotates that secret in the apply, after
+  the update's other steps: in one pass for a secret its release marks `replace: true` (Docker and
+  the VM), in its three passes for one marked `rotation: true` (every target). A key's first number
+  rotates nothing. A key the release cannot rotate on the target is refused at plan once the
+  provider has read the release's ways (at the create, or a rotation), and by the apply, before any
+  rotation, otherwise; a rotation whose passes stop part-way resumes at the failed pass in the
+  next apply.
+
 ## [0.5.0] - 2026-11-24
 
 For Stowage 0.44.0 or later on the installs that issue a kit (`kit create --json --request` on

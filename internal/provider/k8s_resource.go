@@ -517,6 +517,7 @@ func (r *installResource) k8sCreate(ctx context.Context, m *installModel, in ins
 		return
 	}
 	refuseSecretInputs(diags, in.Inputs, desc)
+	createRotations(ctx, resp.Private, m.SecretRotations, desc, installer.ShapeKubernetes, diags)
 	refuseRunEnvInputs(diags, []string{"KUBECONFIG"}, in.Given, in.Inputs, in.SecretInputs)
 	if diags.HasError() {
 		return

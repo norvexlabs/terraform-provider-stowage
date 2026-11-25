@@ -28,14 +28,17 @@ Docker is the only requirement.
 | `make acc-libvirt` | `examples/guides/libvirt-vm`'s domain against libvirtd and QEMU in a container (`test/libvirtd`), in the runner; prints PASS |
 | `make examples-test` | `tofu validate` and `tofu test` (every run at `command = plan`, mocked providers) of each root of `examples/guides/` (a cloud's `image/` root too) and `examples/quickstart/` (`test/examples.sh`: a copy of each root, this build from a filesystem mirror as norvexlabs/stowage 0.3.0, the other providers from the registry at their pins; network access); prints PASS |
 
-**`make acc-docker`** (`STOWAGE_REPO=<a Stowage checkout ≥ 0.38.0, its ./bin/stowage built>`, default `~/stowage`)
+**`make acc-docker`** (`STOWAGE_REPO=<a Stowage checkout ≥ 0.46.0, its ./bin/stowage built>`, default `~/stowage`)
 runs `test/acc-docker.sh`, the Docker target's acceptance test against a real installer through
 OpenTofu: a registry (zot) and a Docker host — sshd beside Docker-in-Docker, its host key pinned
-by `known_hosts_line` — share one network namespace; Stowage's `examples/minimal` is shipped there
-as 1.0.0, 2.0.0 (an input added) and 3.0.0 (a rollback barrier); OpenTofu (1.13.9, its archive's
+by `known_hosts_line` — share one network namespace; Stowage's `examples/minimal` (its
+`SESSION_SECRET` given `replace: true`) is shipped there as 1.0.0, 2.0.0 (an input added) and
+3.0.0 (a rollback barrier); OpenTofu (1.13.9, its archive's
 checksum checked, kept in `~/.cache/terraform-provider-stowage-tools`) loads the provider built
 from this tree (`dev_overrides`). It walks a create (inputs, a secret input, ports, the pull
-account), a refresh planning nothing, a re-run, an upgrade adding an input, a rollback (a plan
+account), a refresh planning nothing, a re-run, `secret_rotations` (a first number recorded,
+`SESSION_SECRET` replaced on the host by a bump, a key that does not rotate refused at plan), an
+upgrade adding an input, a rollback (a plan
 error without `allow_rollback`), an upgrade across the barrier, a refused upgrade after a re-run
 (the re-run's state saved, the reason and the fix shown), a refused rollback, an import and its
 first apply, and a destroy refused by `deletion_protection`, then one with `delete_data`; it
@@ -54,9 +57,11 @@ capped at 4 GiB, driving the host's Docker through its socket, with Stowage's te
 `STOWAGE_REPO` (default `~/stowage`) holds a built `bin/stowage` and its `test/lib.sh` (zot, a kind
 cluster `acc-k8s-<pid>` pulling from it, pinned kind, helm and kubectl). The runner mounts
 `~/.cache` (the work directory), `~/.docker` (the registry logins, buildx's state), this tree and
-Stowage's at their own paths, as the containers the suite starts are given host paths. It ships `examples/minimal`, a secret input added to its copy,
+Stowage's at their own paths, as the containers the suite starts are given host paths. It ships `examples/minimal`, a secret input added to its copy
+and its `SESSION_SECRET` given `replace: true`,
 as 1.0.0, 2.0.0 and 3.0.0, and walks create (the secret input in the release's Secret, in no file
-of the root), a plan with no change, a changed input, the upgrades to 2.0.0 and 3.0.0, a plan with
+of the root), a plan with no change, `secret_rotations` of that secret refused at plan (it does
+not rotate on Kubernetes), a changed input, the upgrades to 2.0.0 and 3.0.0, a plan with
 no change, 1.0.0's installer refused by the installer (state kept), the rollback to 2.0.0 (refused
 first without `allow_rollback`), the state forgotten and the release imported
 (`<namespace>/<release>`) with its first apply and a plan with no change, a destroy

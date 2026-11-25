@@ -237,6 +237,15 @@ argument.
      describe, its re-run — saves the release the VM runs and the inputs applied; a reboot not
      followed in time leaves state as step 3 saved it (the release before the upgrade), the next
      refresh reading the one the VM runs.
+  7. The **rotations**, when `secret_rotations` adds a key or changes a number (alone, the steps before
+     are skipped): `<short>-stow
+     describe --json` (its `secrets`, the ways kept in the resource's private state for the next
+     plans), every key added or changed checked against it, the added recorded, then for each
+     changed key, in key order, `sudo -n <short>-stow secrets rotate KEY --yes --no-input`
+     (`replace`) or `… --stage`, `…` and `… --finish` (`passes`), its number saved once it rotated.
+     The steps before run first and are saved. With nothing to rotate, `secret_rotations` set, an
+     update after which the ways kept are not the running release's (it changed the release, or
+     none were kept) reads its `describe` for those ways alone; a read that fails is a warning.
   `registry_login_wo_version` changed: `sudo -n <short>-stow registry-login FILE`, before the
   re-run (the login given again; refused with a release change's rollback, `a rollback goes
   alone`). `acme_ca` and `acme_ca_root` changed go to the re-run (`--acme-ca URL|none`,

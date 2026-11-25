@@ -467,6 +467,7 @@ func (r *installResource) createVM(ctx context.Context, req resource.CreateReque
 		return
 	}
 	refuseSecretInputs(&resp.Diagnostics, stringMap(ctx, m.Inputs, &resp.Diagnostics), desc)
+	createRotations(ctx, resp.Private, m.SecretRotations, desc, installer.ShapeVM, &resp.Diagnostics)
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -1222,17 +1223,14 @@ func (r *installResource) readVM(ctx context.Context, m *installModel, resp *res
 	resp.Diagnostics.Append(resp.State.Set(ctx, m)...)
 }
 
+// updateVM runs within ctx's deadline, the update's timeout (Update).
 func (r *installResource) updateVM(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse, plan, state *installModel) {
-	timeout, diags := plan.Timeouts.Update(ctx, updateTimeout)
-	resp.Diagnostics.Append(diags...)
 	var secretsWO types.Map
 	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("secret_inputs_wo"), &secretsWO)...)
 	secrets := stringMap(ctx, secretsWO, &resp.Diagnostics)
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 	save := func(m *installModel) bool {
 		resp.Diagnostics.Append(resp.State.Set(ctx, m)...)
 		return !resp.Diagnostics.HasError()

@@ -37,16 +37,6 @@ finished item is deleted, not ticked.
 2. **TrueNAS without the stopgap**: once `truenas/truenas` writes a file to the host, converts an
    image into a zvol and stops a VM before deleting its devices, the TrueNAS root drops Stowage's
    `vm truenas` steps (they are Stowage's TODO too).
-3. **A generated secret rotated by a version** (Stowage 0.45.0's one-pass `secrets rotate KEY`, for a secret with `replace: true`):
-   the canonical way to rotate a value in OpenTofu is a number the root bumps (`random_password`'s
-   `keepers`, `time_rotating`, a `*_wo_version`). An install resource's `secret_rotations = {
-   SESSION_SECRET = 2 }` (key → version) runs `secrets rotate KEY --yes` on Docker and the VM for
-   each key whose version changed, in the update; the first version is recorded, never run. A key
-   with `rotation: true` runs its three passes in that one update (`--stage`, the swap,
-   `--finish`); a key with neither `rotation: true` nor `replace: true` (Stowage 0.45.0's opt-in
-   for the one pass) fails the apply with its refusal (exit 3), the version not recorded — at plan
-   once `describe --json` says which secrets take which way (Stowage's TODO). Kubernetes once `k8s secrets rotate` takes the one pass.
-
 ## Could
 
 1. **A crossing to another schema baseline** (`reset-db --new-baseline`, on every shape; on the VM

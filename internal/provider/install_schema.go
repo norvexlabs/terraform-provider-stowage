@@ -57,6 +57,7 @@ type installModel struct {
 	KitWO                  types.String   `tfsdk:"kit_wo"`
 	KitWOVersion           types.String   `tfsdk:"kit_wo_version"`
 	KitCodeWO              types.String   `tfsdk:"kit_code_wo"`
+	SecretRotations        types.Map      `tfsdk:"secret_rotations"`
 	Docker                 *dockerModel   `tfsdk:"docker"`
 	Kubernetes             *k8sModel      `tfsdk:"kubernetes"`
 	VM                     *vmModel       `tfsdk:"vm"`
@@ -148,6 +149,14 @@ func installSchema(ctx context.Context) schema.Schema {
 			"secret_inputs_wo_version": schema.Int64Attribute{
 				Optional:            true,
 				MarkdownDescription: "Bump it to apply a change of `secret_inputs_wo`.",
+			},
+			"secret_rotations": schema.MapAttribute{
+				Optional:    true,
+				ElementType: types.Int64Type,
+				MarkdownDescription: "A number per generated secret of the release (`{ SESSION_SECRET = 1 }`): changing a key's number rotates that secret in the next apply, " +
+					"after the update's other steps, on the release the install runs then — `secrets rotate KEY --yes --no-input` for a secret whose spec has `replace: true` (Docker and the VM), " +
+					"its three passes (`--stage`, the swap, `--finish`) for one with `rotation: true` (every target). A key's first number, at the create or when the key is added, is recorded and rotates nothing. " +
+					"A key the release does not rotate on the target (describe's `secrets[].rotate`) is refused: at plan, when the plan keeps the release and the provider read its describe before; else by the apply, before any rotation. Needs a release built by Stowage 0.46.0 or later.",
 			},
 			"given_wo": schema.StringAttribute{
 				Optional:            true,

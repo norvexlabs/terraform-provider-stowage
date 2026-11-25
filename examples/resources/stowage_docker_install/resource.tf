@@ -23,6 +23,11 @@ resource "stowage_docker_install" "notes" {
   registry_login_wo         = var.registry_login
   registry_login_wo_version = 1
 
+  # Bump a number to rotate that generated secret in the next apply (its first is recorded alone).
+  secret_rotations = {
+    SESSION_SECRET = 1
+  }
+
   tls     = "internal"
   domains = { app = "notes.lan" }
 

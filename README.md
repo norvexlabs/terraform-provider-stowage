@@ -144,6 +144,7 @@ read](docs/guides/machine-interface.md). What runs where:
 | read | `<short>-stow status --json` | `k8s status --json` | `<short>-stow status --json` |
 | inputs | the running release's re-run | `k8s upgrade --given` | `install` (re-run) |
 | release | `upgrade` / `rollback` | `k8s upgrade` / `k8s rollback` | `upgrade --version V`, its reboot followed / `rollback` |
+| secret rotated (`secret_rotations`, a number bumped) | `secrets rotate KEY`: one pass (`replace: true`) or three (`rotation: true`) | `k8s secrets rotate KEY`, three passes (`rotation: true`) | `secrets rotate KEY`, as on Docker |
 | delete | `uninstall [--data]` | `k8s uninstall [--data]` | forgets it (the VM is its own resource's) |
 
 Secrets (`secret_inputs_wo`, `given_wo`, `secrets_wo`, `registry_login_wo`, `kit_code_wo`) are write-only: on standard input, never on

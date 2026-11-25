@@ -7,7 +7,9 @@
 # adds an input and a migration 1.0.0 reads; 3.0.0, a rollback barrier), and a Docker host reached
 # over SSH (sshd beside Docker-in-Docker, its host key pinned). The provider, built from this tree,
 # is loaded by a dev_overrides OpenTofu configuration. Walks: create → a refresh plans nothing → a
-# re-run (an input changed) → an upgrade adding an input → a rollback (allow_rollback; refused at
+# re-run (an input changed) → secret_rotations (a first number recorded, a bump replacing
+# SESSION_SECRET, given replace: true, in one pass; a key that does not rotate refused at plan) →
+# an upgrade adding an input → a rollback (allow_rollback; refused at
 # plan without it) → an upgrade across the barrier → a refused upgrade after a re-run (the
 # re-run's state saved, the refusal's reason and fix shown) → a refused rollback (the barrier) →
 # import → a destroy refused by deletion_protection, then one deleting the data → the handoff
@@ -134,6 +136,9 @@ s = "\n".join(lines) + "\n"
 old = '  - { key: ADMIN_EMAIL, prompt: "Administrator email", required: true }\n'
 assert s.count(old) == 1, old
 s = s.replace(old, old + '  - { key: E2E_TOKEN, prompt: "A token", secret: true, optional: true }\n')
+old = '  - { key: SESSION_SECRET,    gen: hex32 }\n'
+assert s.count(old) == 1, old
+s = s.replace(old, '  - { key: SESSION_SECRET,    gen: hex32, replace: true }\n')
 open(path, "w").write(s)
 PY
 # ship builds the example's images with buildx: a builder of its own, capped as the test's
@@ -212,12 +217,14 @@ done
 grep -qE '^[0-9]+[.]' "$WORK/ssh.log" || { cat "$WORK/ssh.log"; docker logs "$N-target" >&2; fail "ssh to the Docker host's daemon"; }
 
 # config: the root's main.tf. Every argument from the environment of the call: INST, ADMIN, NOTE
-# (empty: absent), ROLLBACK, PROTECT, DATA.
+# (empty: absent), ROT (secret_rotations' entries, empty: absent), ROLLBACK, PROTECT, DATA.
 E2E_TOKEN=$(token)
 export TF_VAR_e2e_token=$E2E_TOKEN TF_VAR_pull_token=$PULL_TOKEN
 config() {
 	local note=
 	[[ -z ${NOTE:-} ]] || note="E2E_NOTE = \"$NOTE\""
+	local rot=
+	[[ -z ${ROT:-} ]] || rot="secret_rotations = { $ROT }"
 	cat >"$WORK/root/main.tf" <<HCL
 terraform {
   required_providers {
@@ -246,6 +253,7 @@ resource "stowage_docker_install" "notes" {
   }
   secret_inputs_wo         = { E2E_TOKEN = var.e2e_token }
   secret_inputs_wo_version = 1
+  $rot
   ports                    = { app = 18080, api = 18000 }
   allow_rollback           = ${ROLLBACK:-false}
   plan_dry_run             = ${DRY:-false}
@@ -287,10 +295,12 @@ state() {
 	jq -e ".values.root_module.resources[] | select(.address == \"stowage_docker_install.notes\") | .values | $1" "$WORK/show.json" >/dev/null ||
 		{ jq '.values.root_module.resources[].values' "$WORK/show.json"; fail "the state does not satisfy: $1"; }
 }
+# env_of <KEY>: the value the install's .env on the Docker host records.
+env_of() { on_target sed -n "s/^$1='\{0,1\}\([^']*\)'\{0,1\}\$/\1/p" /home/ops/notes/.env; }
 # env_is <KEY> <value>: the install's .env on the Docker host records that value.
 env_is() {
 	local v
-	v=$(on_target sed -n "s/^$1='\{0,1\}\([^']*\)'\{0,1\}\$/\1/p" /home/ops/notes/.env)
+	v=$(env_of "$1")
 	[[ $v == "$2" ]] || fail "the install records $1=$v, not $2"
 }
 # no_secrets <when>: neither the secret input nor the pull account's token is in the state or any
@@ -320,6 +330,22 @@ apply rerun
 env_is ADMIN_EMAIL ops@notes.test
 state '.version == "1.0.0" and .inputs.ADMIN_EMAIL == "ops@notes.test"'
 plan_nothing after-rerun
+
+step "secret_rotations: a first number recorded, a bump replacing SESSION_SECRET in one pass, a key that does not rotate refused at plan"
+session=$(env_of SESSION_SECRET)
+[[ -n $session ]] || fail "the install records no SESSION_SECRET"
+INST=$I1 ADMIN=ops@notes.test ROT="SESSION_SECRET = 1" config
+apply rotations-first
+env_is SESSION_SECRET "$session"
+state '.secret_rotations.SESSION_SECRET == 1'
+INST=$I1 ADMIN=ops@notes.test ROT="SESSION_SECRET = 2" config
+apply rotations-bump
+[[ $(env_of SESSION_SECRET) != "$session" && -n $(env_of SESSION_SECRET) ]] || fail "SESSION_SECRET was not replaced"
+state '.secret_rotations.SESSION_SECRET == 2'
+ready "after the rotation"
+plan_nothing after-rotation
+INST=$I1 ADMIN=ops@notes.test ROT="SESSION_SECRET = 2, POSTGRES_PASSWORD = 1" config
+plan_fails rotations-refused 'POSTGRES_PASSWORD does not rotate on docker'
 
 step "an upgrade to 2.0.0, adding the input it declares"
 INST=$I2 ADMIN=ops@notes.test NOTE=hello config
