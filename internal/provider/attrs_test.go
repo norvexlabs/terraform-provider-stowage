@@ -271,29 +271,16 @@ func TestDockerKit(t *testing.T) {
 	h3.fake.set("new-status", reply{stdout: `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1},"address":"127.0.0.1"}`})
 	cfg = h3.dockerConfig(map[string]tftypes.Value{"kit_wo": str(kit), "kit_code_wo": str(kitCode)})
 	a3 := h3.apply(nil, h3.plan(nil, cfg).PlannedState, cfg)
-	if d := errorsOf(a3.Diagnostics); d != "" || !strings.Contains(diagText(a3.Diagnostics), "(describe's first_install_only: address, the provider's registry and registry_ca; secrets_wo; kit_wo with kit_code_wo, as an install exists (stowage_kit_take gives a kit to it)) are not given: the install keeps the ones it recorded, which the configuration's match.") ||
-		strings.Contains(diagText(a3.Diagnostics), "is given, as nothing is installed yet") {
+	if d := errorsOf(a3.Diagnostics); d != "" || !strings.Contains(diagText(a3.Diagnostics), "(describe's first_install_only: address, the provider's registry and registry_ca; secrets_wo; kit_wo with kit_code_wo, as an install exists (stowage_kit_take gives a kit to it)) are not given: the install keeps the ones it recorded, which the configuration's match.") {
 		t.Fatalf("%s", diagText(a3.Diagnostics))
 	}
 	if in := h3.fake.callsOf("install")[0]; strings.Contains(string(in.stdin), kitCode) || untarAll(t, in.stdin)["kit"] != "" {
 		t.Fatalf("a re-run given the kit: %q %v", in.argv, untarAll(t, in.stdin))
 	}
-	// A first install left unfinished there (nothing installed yet): its re-run, which finishes
-	// it, takes the kit and its code, as the installer's re-run takes --kit.
-	h4 := newHarness(t, nil)
-	h4.fake.set("new-status", reply{stdout: `{"format":1,"name":"notes","installed":null,"install_failed":"the hook failed","address":"127.0.0.1"}`})
-	a4 := h4.apply(nil, h4.plan(nil, cfg).PlannedState, cfg)
-	if d := errorsOf(a4.Diagnostics); d != "" || !strings.Contains(diagText(a4.Diagnostics), "(describe's first_install_only: address, the provider's registry and registry_ca; secrets_wo) are not given: the install keeps the ones it recorded, which the configuration's match. kit_wo with kit_code_wo is given, as nothing is installed yet.") {
-		t.Fatalf("%s", diagText(a4.Diagnostics))
-	}
-	in = h4.fake.callsOf("install")[0]
-	if files := untarAll(t, in.stdin); strings.Contains(strings.Join(in.argv, " "), kitCode) || files["kit-code-file"] != kitCode || !strings.HasPrefix(files["kit"], "-----BEGIN AGE") {
-		t.Fatalf("an unfinished install's re-run without the kit: %q %v", in.argv, files)
-	}
-	// Without kit_wo, the warning names no kit, whether an install exists or not.
+	// Without kit_wo, the warning names no kit, whether the first install finished or not.
 	for name, status := range map[string]string{
 		"installed":  `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1},"address":"127.0.0.1"}`,
-		"unfinished": `{"format":1,"name":"notes","installed":null,"install_failed":"the hook failed","address":"127.0.0.1"}`,
+		"unfinished": `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1},"installing":true,"install_failed":"the hook failed","address":"127.0.0.1"}`,
 	} {
 		h5 := newHarness(t, nil)
 		h5.fake.set("new-status", reply{stdout: status})

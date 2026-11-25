@@ -33,6 +33,9 @@ HTPASSWD=httpd:2.4-alpine@sha256:3440c39d8d6f54fa9ad2549e5a60c19ddd435faadc29c1a
 COSIGN=gcr.io/projectsigstore/cosign:v3.0.2@sha256:b29487e48205d875c324c79583e2806d9d269c0fa299e0861bbec023d8430c8b
 DIND=docker:29.9.3-dind@sha256:08a98015fce594af7c382883bea080ea206de74402a95da9dc52b6428c8cd121
 PG=postgres:18-alpine@sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395
+RCLONE=rclone/rclone:1.76.0@sha256:7cbeec24a44f206067597c0368be4de90ae19a64d5113c7d1938bd737a81e466
+AGE_URL=https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-linux-amd64.tar.gz
+AGE_SHA=cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10
 
 CACHE=${XDG_CACHE_HOME:-$HOME/.cache}
 mkdir -p "$CACHE"
@@ -41,7 +44,7 @@ N=acc-docker-$$                                    # every container, network an
 export XDG_CACHE_HOME=$WORK/cache
 
 cleanup() {
-	docker rm -f "$N-target" "$N-zot" "$N-net" >/dev/null 2>&1 || true
+	docker rm -f "$N-target" "$N-zot" "$N-dav" "$N-net" >/dev/null 2>&1 || true
 	docker buildx rm "$N-builder" >/dev/null 2>&1 || true
 	docker volume rm -f "$N-docker" >/dev/null 2>&1 || true
 	# The images ship built and pushed, kept by tag on this host's Docker.
@@ -225,6 +228,13 @@ config() {
 	[[ -z ${NOTE:-} ]] || note="E2E_NOTE = \"$NOTE\""
 	local rot=
 	[[ -z ${ROT:-} ]] || rot="secret_rotations = { $ROT }"
+	local backup= restore=
+	[[ -z ${BACKUP:-} ]] || backup="backup = { destination = \"dav:backups\", recipients = [\"$AGE_RECIPIENT\"] }
+  backup_rclone_config_wo         = file(\"$WORK/dav.conf\")
+  backup_rclone_config_wo_version = 1"
+	[[ -z ${RESTORE:-} ]] || restore="secrets_wo          = file(\"$WORK/secrets.yaml\")
+  restore             = { object = \"$RESTORE\", unrecorded = true }
+  restore_identity_wo = file(\"$WORK/age.key\")"
 	cat >"$WORK/root/main.tf" <<HCL
 terraform {
   required_providers {
@@ -254,6 +264,8 @@ resource "stowage_docker_install" "notes" {
   secret_inputs_wo         = { E2E_TOKEN = var.e2e_token }
   secret_inputs_wo_version = 1
   $rot
+  $backup
+  $restore
   ports                    = { app = 18080, api = 18000 }
   allow_rollback           = ${ROLLBACK:-false}
   plan_dry_run             = ${DRY:-false}
@@ -403,6 +415,65 @@ state ".version == \"3.0.0\" and .installer == \"$I3\" and .status == \"installe
 env_is E2E_TOKEN "$E2E_TOKEN"
 no_secrets "after the import's apply"
 plan_nothing after-import-plan
+
+# A machine made again: the backup settings declared and read back, a backup and the secrets
+# export taken on the host, the install destroyed with its data, then made again in one apply
+# (secrets_wo, backup, restore), its data back.
+step "backup settings declared: set, read back, a change on the host shown and undone"
+tool_dir=$CACHE/terraform-provider-stowage-tools/age-${AGE_SHA:0:12}
+if [[ ! -x $tool_dir/age/age ]]; then
+	mkdir -p "$tool_dir"
+	curl -fsSL "$AGE_URL" -o "$WORK/age.tgz" || fail "downloading age"
+	echo "$AGE_SHA  $WORK/age.tgz" | sha256sum -c - >/dev/null || fail "age's archive does not match its checksum"
+	tar -xzf "$WORK/age.tgz" -C "$tool_dir"
+fi
+AGE=$tool_dir/age/age
+"$tool_dir/age/age-keygen" -o "$WORK/age.key" 2>/dev/null || fail "age-keygen"
+AGE_RECIPIENT=$("$tool_dir/age/age-keygen" -y "$WORK/age.key")
+DAVPORT=$(free_port)
+mkdir -p "$WORK/dav"
+docker run -d --name "$N-dav" --user "$(id -u):$(id -g)" --network "container:$N-net" -v "$WORK/dav:/data" "$RCLONE" \
+	serve webdav /data --addr "127.0.0.1:$DAVPORT" >/dev/null
+printf '[dav]\ntype = webdav\nurl = http://127.0.0.1:%s\nvendor = other\n' "$DAVPORT" >"$WORK/dav.conf"
+# The logs are read whole before they are searched: grep -q ending at its match could stop
+# docker logs with SIGPIPE, failing the pipeline under pipefail.
+dav_up() { local logs; logs=$(docker logs "$N-dav" 2>&1) && grep -q 'WebDav Server started' <<<"$logs"; }
+for _ in $(seq 1 50); do dav_up && break; sleep 0.2; done
+dav_up || { docker logs "$N-dav"; fail "the WebDAV server did not start"; }
+as_ops() { docker exec -u ops "$N-target" /home/ops/notes/notes-stow "$@" --dir /home/ops/notes; }
+INST=$I3 ADMIN=refused@notes.test NOTE=hello BACKUP=1 config
+apply backup-config
+state '.backup.destination == "dav:backups" and .backup.recipients == ["'"$AGE_RECIPIENT"'"] and .backup.schedule != null and .backup_rclone_config_wo == null'
+as_ops backup config --json | jq -e '.configured and .destination == "dav:backups" and .rclone_config_from == "operator"' >/dev/null || fail "the install does not hold the settings"
+plan_nothing backup-refresh
+as_ops backup config --remove >/dev/null || fail "backup config --remove on the host"
+rc=0; tf plan -detailed-exitcode -input=false >"$WORK/backup-drift.log" 2>&1 || rc=$?
+[[ $rc == 2 ]] && grep -q 'destination' "$WORK/backup-drift.log" || { cat "$WORK/backup-drift.log"; fail "settings removed on the host do not show in the plan (exit $rc)"; }
+apply backup-again
+as_ops backup config --json | jq -e '.configured and .rclone_config_from == "operator"' >/dev/null || fail "the apply did not set the settings and the rclone config again"
+plan_nothing backup-again-plan
+
+step "a machine made again: a backup and the secrets export, the install destroyed with its data, then one apply (secrets_wo, backup, restore)"
+pg_target() { on_target docker ps -q --filter "label=com.docker.compose.project=$(on_target sed -n "s/^COMPOSE_PROJECT_NAME=['\"]\{0,1\}\([^'\"]*\).*/\1/p" /home/ops/notes/.env)" --filter label=com.docker.compose.service=postgres; }
+on_target docker exec "$(pg_target)" psql -U notes -d notes -c 'CREATE TABLE acc_backup (n int); INSERT INTO acc_backup VALUES (7)' >/dev/null || fail "a row to back up"
+as_ops backup run >"$WORK/backup-run.log" 2>&1 || { cat "$WORK/backup-run.log"; fail "backup run"; }
+object=$(as_ops backup list | awk '$1 ~ /^notes-.*[.]pgdump[.]age$/ {print $1}' | tail -n1)
+[[ -n $object && -s $WORK/dav/backups/$object ]] || { as_ops backup list; fail "no backup in the destination"; }
+as_ops secrets export --recipient "$AGE_RECIPIENT" --output - >"$WORK/secrets.age" 2>"$WORK/secrets-export.log" || { cat "$WORK/secrets-export.log"; fail "secrets export"; }
+"$AGE" -d -i "$WORK/age.key" -o "$WORK/secrets.yaml" "$WORK/secrets.age" || fail "the secrets export does not decrypt"
+INST=$I3 ADMIN=refused@notes.test NOTE=hello BACKUP=1 PROTECT=false DATA=true config
+apply made-again-unprotect
+tf destroy -auto-approve -input=false >"$WORK/made-again-destroy.log" 2>&1 || { cat "$WORK/made-again-destroy.log"; fail "tofu destroy before the machine is made again"; }
+! on_target test -e /home/ops/notes || fail "the install is left after the destroy"
+INST=$I3 ADMIN=refused@notes.test NOTE=hello BACKUP=1 RESTORE=$object config
+apply made-again
+[[ $(on_target docker exec "$(pg_target)" psql -U notes -d notes -tAc 'SELECT n FROM acc_backup') == 7 ]] || fail "the restore did not bring the backup's data back"
+docker exec -u ops "$N-target" /home/ops/notes/notes-stow status --dir /home/ops/notes --json | jq -e '.restore_awaited | not' >/dev/null || fail "the install still awaits a restore"
+state '.backup.destination == "dav:backups" and .restore.object == "'"$object"'" and .restore_identity_wo == null and .secrets_wo == null'
+! grep -rqF -- "$(grep -o 'AGE-SECRET-KEY-[A-Z0-9]*' "$WORK/age.key")" "$WORK/root" || fail "the age identity is in the root's files"
+ready "after the machine is made again"
+plan_nothing made-again-plan
+env_is E2E_TOKEN "$E2E_TOKEN"
 
 step "destroy: refused by deletion_protection, then with the data"
 if tf destroy -auto-approve -input=false >"$WORK/destroy-refused.log" 2>&1; then cat "$WORK/destroy-refused.log"; fail "a destroy ran with deletion_protection on"; fi

@@ -489,17 +489,57 @@ func (r *installResource) createVM(ctx context.Context, req resource.CreateReque
 			addInstallerError(&resp.Diagnostics, "Reading the VM", err)
 			return
 		}
-		if st != nil && stillInstalling(&st.Status, "remove kit_wo_version (and kit_wo) if it took the kit, then apply again; else (or if no run is under way: one cut by a timeout leaves it marked installing) bump the stowage_kit's version to issue a kit again.", &resp.Diagnostics) {
+		// Once the run has ended, the create names both ways on; a run cut short is finished
+		// first over SSH. Only an install whose .env is written reports installing.
+		kitThen := fmt.Sprintf("apply again: the create then names both ways on (issue a kit again, or go on without it if the install took it). A run cut by a timeout stays marked installing: finish it over SSH by `sudo %s-stow install`, then apply again.", v.Short)
+		if st != nil && stillInstalling(&st.Status, "an earlier create's, or the VM's first boot's", kitThen, &resp.Diagnostics) {
 			return
 		}
 		detail := kitLost("kit_wo")
 		if st != nil && (st.Installed != nil || st.InstallFailed != "") {
-			detail += " If the VM's install took this kit in an earlier apply that failed after it, remove kit_wo_version (and kit_wo) instead: the create goes on without a kit (once that apply's run has ended: the installer refuses a run beside another)."
+			detail += " If the VM's install took this kit in an earlier apply that failed after it, remove kit_wo_version, kit_wo and kit_code_wo instead: the create goes on without a kit (once that apply's run has ended: the installer refuses a run beside another)."
 		}
 		resp.Diagnostics.AddAttributeError(path.Root("kit_wo"), "The kit is not here", detail)
 		return
 	}
 
+	// An install on the VM before this create's (an earlier apply's) that awaits its data took a
+	// secrets export: it is not given again, as the installer refuses it once taken. One that does
+	// not await it holds its own data: refused here, naming the way on.
+	if exported.ValueString() != "" {
+		st, err := v.Status(ctx)
+		if err != nil {
+			addInstallerError(&resp.Diagnostics, "Reading the VM", err)
+			return
+		}
+		// The installer says whether its install took an export (made_again): the provider asks
+		// rather than guesses.
+		// Only an install whose .env is written reports installing: it took the export already.
+		finish := fmt.Sprintf("`sudo %s-stow install` over SSH finishes it", v.Short)
+		if st != nil && stillInstalling(&st.Status, "an earlier create's, or the VM's first boot's", "apply again. A run cut by a timeout stays marked installing: "+finish+".", &resp.Diagnostics) {
+			return
+		}
+		switch {
+		case st != nil && st.VolumesSplit:
+			// The installer's re-run refuses it: the restore finishes it, by hand.
+			resp.Diagnostics.AddError("A restore left the VM's volumes half restored",
+				"status --json volumes_split: an earlier apply's restore was cut, or failed while swapping the volumes in. "+restoreByHand(&m, restoreOf(ctx, m.Restore, &resp.Diagnostics), byHandCut)+
+					" finishes it (the services stay stopped until then); then apply again.")
+			return
+		case st != nil && (st.MadeAgain || st.RestoreAwaited):
+			// Read only once its .env is written: installed, and the installer refuses the export
+			// again. One with no .env (installed null) is a first install still to make: given the
+			// export again. restore_awaited: only an install made by --secrets is marked, whatever
+			// the installer's release (one before Stowage 0.48.0 says no made_again).
+			exported = types.StringNull()
+			resp.Diagnostics.AddAttributeWarning(path.Root("secrets_wo"), "The VM's install took the secrets export",
+				"An earlier apply's install took it (status --json made_again, or restore_awaited): the export is not given again (the installer refuses it once taken), and the install is run again with the configuration's settings, without it.")
+		case st != nil && st.Installed != nil:
+			resp.Diagnostics.AddAttributeError(path.Root("secrets_wo"), "The VM holds an install of its own",
+				"The VM is installed and its status says no secrets export made it (no made_again, nor restore_awaited): its seed did not await secrets — or, with an installer before Stowage 0.48.0, which says no made_again, an earlier apply's install took it and awaits nothing. Remove secrets_wo, restore and restore_identity_wo to take this install as it is (an install made from the export that way has none of its data loaded: "+restoreByHand(&m, restoreOf(ctx, m.Restore, &resp.Diagnostics), byHandMadeAgain)+" loads it, replacing the data the install holds now), or make the VM again from a seed with await_secrets.")
+			return
+		}
+	}
 	// The VM's own login first: its install reads the registry with it.
 	if r.wo.login != "" {
 		if err := v.RegistryLogin(ctx, r.wo.login); err != nil {
@@ -540,6 +580,7 @@ func (r *installResource) createVM(ctx context.Context, req resource.CreateReque
 	m.VM = &vmc
 	r.vmFill(&m, nil)
 	applyVMStatus(&m, st, false)
+	r.createBackup(ctx, &m, resp)
 	if attach := attachments(m.VM.Interfaces, types.MapNull(interfaceType)); len(attach) > 0 {
 		// The install is made: recorded as planned, its interfaces marked pending in private
 		// state until they are attached, so an attach that fails leaves a state consistent with
@@ -1219,6 +1260,7 @@ func (r *installResource) readVM(ctx context.Context, m *installModel, resp *res
 	applyVMStatus(m, st, true)
 	retireSeed(m, st)
 	r.readBack(m, st.Values)
+	r.readBackup(ctx, m, &resp.Diagnostics)
 	resp.Diagnostics.Append(dropUnrecorded(ctx, m, &st.Status)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, m)...)
 }

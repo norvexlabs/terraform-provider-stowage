@@ -28,7 +28,7 @@ Docker is the only requirement.
 | `make acc-libvirt` | `examples/guides/libvirt-vm`'s domain against libvirtd and QEMU in a container (`test/libvirtd`), in the runner; prints PASS |
 | `make examples-test` | `tofu validate` and `tofu test` (every run at `command = plan`, mocked providers) of each root of `examples/guides/` (a cloud's `image/` root too) and `examples/quickstart/` (`test/examples.sh`: a copy of each root, this build from a filesystem mirror as norvexlabs/stowage 0.3.0, the other providers from the registry at their pins; network access); prints PASS |
 
-**`make acc-docker`** (`STOWAGE_REPO=<a Stowage checkout ≥ 0.46.0, its ./bin/stowage built>`, default `~/stowage`)
+**`make acc-docker`** (`STOWAGE_REPO=<a Stowage checkout ≥ 0.48.0, its ./bin/stowage built>`, default `~/stowage`)
 runs `test/acc-docker.sh`, the Docker target's acceptance test against a real installer through
 OpenTofu: a registry (zot) and a Docker host — sshd beside Docker-in-Docker, its host key pinned
 by `known_hosts_line` — share one network namespace; Stowage's `examples/minimal` (its
@@ -41,12 +41,17 @@ account), a refresh planning nothing, a re-run, `secret_rotations` (a first numb
 upgrade adding an input, a rollback (a plan
 error without `allow_rollback`), an upgrade across the barrier, a refused upgrade after a re-run
 (the re-run's state saved, the reason and the fix shown), a refused rollback, an import and its
-first apply, and a destroy refused by `deletion_protection`, then one with `delete_data`; it
-prints `PASS`. `stowage ship` builds the example's images with a buildx builder of its own
+first apply, `backup` declared (to a WebDAV server, rclone pinned, sharing the host's network;
+the settings read back, removed on the host and shown by the next plan, set again by the apply),
+a machine made again (a backup and the `secrets export` taken on the host, the install destroyed
+with its data, then one apply giving `secrets_wo`, `backup` and `restore`, the age identity
+write-only, its data back and a plan after it planning nothing), and a destroy refused by
+`deletion_protection`, then one with `delete_data`; it prints `PASS`. `stowage ship` builds the example's images with a buildx builder of its own
 (`docker-container` driver, capped at 4 GiB, `BUILDX_BUILDER`). Everything it starts is named
 `acc-docker-<pid>` and removed at its exit; its work
 directory is under `~/.cache` (`ACC_LOGS=<dir>` keeps the logs). Needs Docker, curl, jq, python3,
-ssh, ssh-keygen and network access.
+ssh, ssh-keygen and network access (age, pinned by its checksum, is downloaded once into
+`~/.cache/terraform-provider-stowage-tools`).
 
 `make acc-k8s` (`test/acc-k8s.sh`) builds the provider and the acceptance runner
 (`test/acc.Dockerfile`: OpenTofu of `test/tofu.sh`'s pin, the Docker CLI, ssh, xorriso, oras,

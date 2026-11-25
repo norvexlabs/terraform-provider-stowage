@@ -180,8 +180,10 @@ type Status struct {
 	Installing     bool     `json:"installing"`
 	InstallFailed  string   `json:"install_failed"`
 	RestoreAwaited bool     `json:"restore_awaited"`
-	VolumesSplit   bool     `json:"volumes_split"`
-	Previous       *Release `json:"previous"`
+	// MadeAgain: the install was made by --secrets (Stowage 0.48.0 or later says it).
+	MadeAgain    bool     `json:"made_again"`
+	VolumesSplit bool     `json:"volumes_split"`
+	Previous     *Release `json:"previous"`
 	// Inputs are the recorded keys, never a value; sorted. Nil (absent, or null) is unknown: the
 	// installer run does not carry the installed release, whose spec tells them — never "none".
 	Inputs *Keys `json:"inputs"`

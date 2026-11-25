@@ -183,6 +183,53 @@ another name reaches the installer unchanged. Over ssh no environment is carried
   directory already gone is success, and runs nothing; so is the installer's refusal saying
   `absent`.
 
+## A machine made again
+
+A lost host's install is made again in one apply from its `secrets export` and a backup:
+`secrets_wo` (the decrypted export), `backup` (the settings its backups are written with) and
+`restore` (the backup to load), with `restore_identity_wo`.
+
+- **`backup`** declares the install's backup settings: `destination` with
+  `backup_rclone_config_wo` (the rclone config, write-only), or `keep_local` (the backups kept on
+  the host, which a tool reaching it over SSH pulls; Stowage 0.47.0 or later), with `recipients`,
+  and `retention_days`, `schedule`, `profile` and `locked` (left out, the install's). A create
+  sets them after the install, and an update whenever they or `backup_rclone_config_wo_version`
+  change, after the release's steps and before the rotations: `<short>-stow backup config … --json --dir ./<name>`, the flags given and the
+  rclone config a file on standard input. A refresh reads them back (`backup config --json`): one
+  changed on the target shows in the next plan, and an rclone config the install does not hold,
+  or holds from the app socket (which it never runs), takes `backup_rclone_config_wo_version` out
+  of state, so the next plan sends it again. Left out, the provider neither reads nor changes the
+  settings; taken out, it stops managing them and changes nothing. Refused at validate: neither
+  or both of `destination` and `keep_local` (both known only at apply: refused there, the step
+  left pending), a `keep_local` below 1, `backup_rclone_config_wo`
+  with `keep_local`, without `backup` or without its version (which sends it again), the version
+  without it. The provider runs no backup: the install's schedule
+  does, and an upgrade takes one first.
+- **`restore`** loads `object` (its name in the destination, `backup list`) in the create, after
+  the install and the settings: `<short>-stow restore OBJECT --yes [--unrecorded] --dir ./<name>`, the identity a file on standard input; the installer then
+  runs the provision hook on the restored data. **A restore never loads over an install's own
+  data**: it runs only while the install awaits its data — `status --json` `restore_awaited`
+  (from Stowage 0.48.0 every install made by `--secrets` whose release runs backups or whose
+  hook is given the export's provision values; before, only the latter) or `volumes_split` — read right before it; else it is dropped with a warning
+  (`Not restored: the install does not await its data`). An install already in the directory is run again without `secrets_wo` (its re-run), and restored only while it awaits its data. Refused at validate:
+  `restore_identity_wo` without `restore`, an `object` that could read as a flag (a leading `-`)
+  or holds a blank; at plan, a `restore` in a create without `secrets_wo` (`restore without
+  secrets_wo`), with an empty one, or without `restore_identity_wo`. The old install's records of
+  its backups' digests went with it: a backup it took needs `unrecorded = true`. The create's
+  timeout (`timeouts.create`) bounds the install and the restore together: raise it for a large
+  backup.
+- **A step that fails** in the create is a warning, not an error (an error would taint the
+  install, whose replacement is a destroy): the install is recorded, the steps left are kept in
+  the resource's private state, and the next plan shows an update (`status` unknown) that runs
+  them again — the settings, then the restore — with the configuration's values then, so a wrong
+  `object` or identity is fixed in between (`restore_identity_wo` missing then is refused at
+  plan). The restore again passes the same check right before it: one cut short may have
+  finished on the target, and is then dropped, never run over data since. In an update, a step
+  that fails is an error, still kept; settings it could not set keep state's, so the next plan
+  shows the change again. A pending restore taken out of the configuration is dropped, nothing
+  read. Once the restore succeeded it never runs again: a later change of `restore` is recorded
+  with a warning (`restore is taken at create alone`), and nothing is restored.
+
 ## SSH
 
 The system `ssh` runs with `BatchMode=yes`, `StrictHostKeyChecking=yes`, a private 0600

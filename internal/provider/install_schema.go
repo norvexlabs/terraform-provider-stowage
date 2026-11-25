@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"maps"
 
 	"github.com/hashicorp/terraform-plugin-framework-timeouts/resource/timeouts"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
@@ -27,41 +28,46 @@ var previousType = map[string]attr.Type{
 }
 
 type installModel struct {
-	ID                     types.String   `tfsdk:"id"`
-	Installer              types.String   `tfsdk:"installer"`
-	Inputs                 types.Map      `tfsdk:"inputs"`
-	SecretInputsWO         types.Map      `tfsdk:"secret_inputs_wo"`
-	SecretInputsWOVersion  types.Int64    `tfsdk:"secret_inputs_wo_version"`
-	GivenWO                types.String   `tfsdk:"given_wo"`
-	SecretsWO              types.String   `tfsdk:"secrets_wo"`
-	TLS                    types.String   `tfsdk:"tls"`
-	Domains                types.Map      `tfsdk:"domains"`
-	Ports                  types.Map      `tfsdk:"ports"`
-	Address                types.String   `tfsdk:"address"`
-	AllowRollback          types.Bool     `tfsdk:"allow_rollback"`
-	DeletionProtection     types.Bool     `tfsdk:"deletion_protection"`
-	DeleteData             types.Bool     `tfsdk:"delete_data"`
-	PlanDryRun             types.Bool     `tfsdk:"plan_dry_run"`
-	Registry               types.String   `tfsdk:"registry"`
-	RegistryCADigest       types.String   `tfsdk:"registry_ca_digest"`
-	ShortName              types.String   `tfsdk:"short_name"`
-	Version                types.String   `tfsdk:"version"`
-	Revision               types.Int64    `tfsdk:"revision"`
-	Channel                types.String   `tfsdk:"channel"`
-	Status                 types.String   `tfsdk:"status"`
-	Previous               types.Object   `tfsdk:"previous"`
-	RegistryLoginWO        types.String   `tfsdk:"registry_login_wo"`
-	RegistryLoginWOVersion types.Int64    `tfsdk:"registry_login_wo_version"`
-	AcmeCA                 types.String   `tfsdk:"acme_ca"`
-	AcmeCARoot             types.String   `tfsdk:"acme_ca_root"`
-	KitWO                  types.String   `tfsdk:"kit_wo"`
-	KitWOVersion           types.String   `tfsdk:"kit_wo_version"`
-	KitCodeWO              types.String   `tfsdk:"kit_code_wo"`
-	SecretRotations        types.Map      `tfsdk:"secret_rotations"`
-	Docker                 *dockerModel   `tfsdk:"docker"`
-	Kubernetes             *k8sModel      `tfsdk:"kubernetes"`
-	VM                     *vmModel       `tfsdk:"vm"`
-	Timeouts               timeouts.Value `tfsdk:"timeouts"`
+	ID                          types.String   `tfsdk:"id"`
+	Installer                   types.String   `tfsdk:"installer"`
+	Inputs                      types.Map      `tfsdk:"inputs"`
+	SecretInputsWO              types.Map      `tfsdk:"secret_inputs_wo"`
+	SecretInputsWOVersion       types.Int64    `tfsdk:"secret_inputs_wo_version"`
+	GivenWO                     types.String   `tfsdk:"given_wo"`
+	SecretsWO                   types.String   `tfsdk:"secrets_wo"`
+	TLS                         types.String   `tfsdk:"tls"`
+	Domains                     types.Map      `tfsdk:"domains"`
+	Ports                       types.Map      `tfsdk:"ports"`
+	Address                     types.String   `tfsdk:"address"`
+	AllowRollback               types.Bool     `tfsdk:"allow_rollback"`
+	DeletionProtection          types.Bool     `tfsdk:"deletion_protection"`
+	DeleteData                  types.Bool     `tfsdk:"delete_data"`
+	PlanDryRun                  types.Bool     `tfsdk:"plan_dry_run"`
+	Registry                    types.String   `tfsdk:"registry"`
+	RegistryCADigest            types.String   `tfsdk:"registry_ca_digest"`
+	ShortName                   types.String   `tfsdk:"short_name"`
+	Version                     types.String   `tfsdk:"version"`
+	Revision                    types.Int64    `tfsdk:"revision"`
+	Channel                     types.String   `tfsdk:"channel"`
+	Status                      types.String   `tfsdk:"status"`
+	Previous                    types.Object   `tfsdk:"previous"`
+	RegistryLoginWO             types.String   `tfsdk:"registry_login_wo"`
+	RegistryLoginWOVersion      types.Int64    `tfsdk:"registry_login_wo_version"`
+	AcmeCA                      types.String   `tfsdk:"acme_ca"`
+	AcmeCARoot                  types.String   `tfsdk:"acme_ca_root"`
+	KitWO                       types.String   `tfsdk:"kit_wo"`
+	KitWOVersion                types.String   `tfsdk:"kit_wo_version"`
+	KitCodeWO                   types.String   `tfsdk:"kit_code_wo"`
+	SecretRotations             types.Map      `tfsdk:"secret_rotations"`
+	Backup                      types.Object   `tfsdk:"backup"`
+	BackupRcloneConfigWO        types.String   `tfsdk:"backup_rclone_config_wo"`
+	BackupRcloneConfigWOVersion types.Int64    `tfsdk:"backup_rclone_config_wo_version"`
+	Restore                     types.Object   `tfsdk:"restore"`
+	RestoreIdentityWO           types.String   `tfsdk:"restore_identity_wo"`
+	Docker                      *dockerModel   `tfsdk:"docker"`
+	Kubernetes                  *k8sModel      `tfsdk:"kubernetes"`
+	VM                          *vmModel       `tfsdk:"vm"`
+	Timeouts                    timeouts.Value `tfsdk:"timeouts"`
 }
 
 type dockerModel struct {
@@ -126,7 +132,7 @@ func installSchema(ctx context.Context) schema.Schema {
 		return schema.StringAttribute{Computed: true, MarkdownDescription: desc,
 			PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()}}
 	}
-	return schema.Schema{
+	s := schema.Schema{
 		MarkdownDescription: "The install model the three install types are views of (split.go): one install on one target, its docker, kubernetes or vm block naming it.",
 		Attributes: map[string]schema.Attribute{
 			"id": computedString("`<work_dir>/<name>` on Docker; `<namespace>/<release>` on Kubernetes."),
@@ -166,7 +172,7 @@ func installSchema(ctx context.Context) schema.Schema {
 			"secrets_wo": schema.StringAttribute{
 				Optional:            true,
 				WriteOnly:           true,
-				MarkdownDescription: "A decrypted `secrets export` of a machine made again (the installer's `--secrets`), write-only, used at create, on standard input. On a VM, one seeded with `stowage_vm_seed`'s `await_secrets`, whose first install waits for it (the installer refuses it once that install ran).",
+				MarkdownDescription: "A decrypted `secrets export` of a machine made again (the installer's `--secrets`), write-only, used at create, on standard input. On a VM, one seeded with `stowage_vm_seed`'s `await_secrets`, whose first install waits for it: the create reads the VM's `status --json` first: while a first install runs on (`installing`, not `install_failed`: one that failed is run again), it stops (`The first install is still running`); an install a restore that was cut or failed left half restored (`volumes_split`) is refused (`A restore left the VM's volumes half restored`), naming the restore by hand that finishes it (`sudo <short>-stow restore <restore.object> --unrecorded --yes --identity -` over SSH, the identity on standard input; without `restore`, OBJECT the cut restore's, the first line of `/usr/local/<name>/.stowage-volumes-split`); an install an earlier apply made from the export (`made_again`, Stowage 0.48.0 or later, or `restore_awaited`) is not given it again (a warning) and is run again with the configuration's settings; a first install that wrote no install yet (`installed` null, failed or not) is given it again; any other install (`The VM holds an install of its own`) is refused before anything runs, naming the way on and the restore by hand that loads its data (an install an earlier apply made from the export, with an installer before Stowage 0.48.0).",
 			},
 			"tls": schema.StringAttribute{
 				Optional:            true,
@@ -258,6 +264,8 @@ func installSchema(ctx context.Context) schema.Schema {
 			"timeouts": timeouts.Block(ctx, timeouts.Opts{Create: true, Read: true, Update: true, Delete: true}),
 		},
 	}
+	maps.Copy(s.Attributes, backupAttributes())
+	return s
 }
 
 // installerValidator checks the installer reference's form: by digest, of an installer image.

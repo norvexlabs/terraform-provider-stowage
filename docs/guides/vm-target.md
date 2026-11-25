@@ -290,3 +290,66 @@ argument.
   given`), and the warning on addressing. A rollback of an imported install (`version` set to `previous.version`) is refused (`a
   rollback of an imported install`: apply first with the version it runs).
 - **Delete**: refused while `deletion_protection`; else the resource is forgotten, and nothing changes on the VM. The destroy's plan, before it is approved, asks — with `platform` and the VM's own key known — the VM's installer whether the registry still holds a disk set a VM of its release boots there: `sudo -n <short>-stow vm seed --json --platform P --ssh-key FILE [--registry <state's registry>]` (FILE the VM's own public key, on standard input; the output, a throwaway seed, discarded; two minutes at most, its SSH connection bounded to 10 seconds: `ConnectTimeout=10`). A VM that does not answer within them (stopped, gone) is not checked, a plan warning saying so (`Whether this VM can be made again was not checked`), a refusal is a warning naming its reason (`No disk set to make this VM again`: until the release publishes one, a VM destroyed is not made again), a failure another (`Whether this VM can be made again is not known`); none stops the destroy, whose apply forgets the install, asking nothing, and the VM's own resource's destroy follows.
+
+## A machine made again
+
+A lost VM is made again in one apply from its `secrets export` and a backup:
+`secrets_wo` (the decrypted export), `backup` (the settings its backups are written with) and
+`restore` (the backup to load), with `restore_identity_wo`.
+
+- **`backup`** declares the install's backup settings: `destination` with
+  `backup_rclone_config_wo` (the rclone config, write-only), or `keep_local` (the backups kept on
+  the host, which a tool reaching it over SSH pulls; Stowage 0.47.0 or later), with `recipients`,
+  and `retention_days`, `schedule`, `profile` and `locked` (left out, the install's). A create
+  sets them after the install, and an update whenever they or `backup_rclone_config_wo_version`
+  change, after the release's steps and before the rotations: `sudo -n <short>-stow backup config … --json` over SSH, the flags given and the
+  rclone config a file on standard input. A refresh reads them back (`backup config --json`): one
+  changed on the target shows in the next plan, and an rclone config the install does not hold,
+  or holds from the app socket (which it never runs), takes `backup_rclone_config_wo_version` out
+  of state, so the next plan sends it again. Left out, the provider neither reads nor changes the
+  settings; taken out, it stops managing them and changes nothing. Refused at validate: neither
+  or both of `destination` and `keep_local` (both known only at apply: refused there, the step
+  left pending), a `keep_local` below 1, `backup_rclone_config_wo`
+  with `keep_local`, without `backup` or without its version (which sends it again), the version
+  without it. The provider runs no backup: the install's schedule
+  does, and an upgrade takes one first.
+- **`restore`** loads `object` (its name in the destination, `backup list`) in the create, after
+  the install and the settings: `sudo -n <short>-stow restore OBJECT --yes [--unrecorded]`, a job of the VM's host daemon, the identity a file on standard input; the installer then
+  runs the provision hook on the restored data. **A restore never loads over an install's own
+  data**: it runs only while the install awaits its data — `status --json` `restore_awaited`
+  (from Stowage 0.48.0 every install made by `--secrets` whose release runs backups or whose
+  hook is given the export's provision values; before, only the latter) or `volumes_split` — read right before it; else it is dropped with a warning
+  (`Not restored: the install does not await its data`). Before its install, a create given `secrets_wo` reads the VM's `status --json`: while a first
+  install runs on (`installing`), it stops (`The first install is still running`: apply again once
+  it ended; one cut by a timeout stays marked, and `sudo <short>-stow install` over SSH finishes it;
+  only an install whose `.env` is written reports `installing`);
+  an install made by an earlier apply from the export (`made_again`, Stowage 0.48.0 or later, or
+  `restore_awaited`) is not given it again — the installer refuses it once taken (`The VM's install took the
+  secrets export`, a warning) — and is run again with the configuration's settings; a first install that
+  wrote no install yet (`installed` null, failed or not) is given the export again; an install a restore that was cut or failed left half
+  restored (`volumes_split`) is refused, naming the restore by hand that finishes it (`sudo <short>-stow
+  restore <restore.object> --unrecorded --yes --identity -` over SSH, the identity on standard
+  input — `--unrecorded`, as an install made again holds no records of the old machine's backups;
+  without `restore`, OBJECT the cut restore's, the first line of
+  `/usr/local/<name>/.stowage-volumes-split`); any other install (its seed did not await secrets — or, with an installer
+  before Stowage 0.48.0, which says no `made_again`, an earlier apply's that awaits nothing) is
+  refused before anything runs (`The VM holds an install of its own`), naming the way on (remove
+  `secrets_wo`, `restore` and `restore_identity_wo`; an install made from the export that way has
+  none of its data loaded, and the restore by hand it names loads it). Refused at validate:
+  `restore_identity_wo` without `restore`, an `object` that could read as a flag (a leading `-`)
+  or holds a blank; at plan, a `restore` in a create without `secrets_wo` (`restore without
+  secrets_wo`), with an empty one, or without `restore_identity_wo`. The old install's records of
+  its backups' digests went with it: a backup it took needs `unrecorded = true`. The create's
+  timeout (`timeouts.create`) bounds the install and the restore together: raise it for a large
+  backup.
+- **A step that fails** in the create is a warning, not an error (an error would taint the
+  install, whose replacement is a destroy): the install is recorded, the steps left are kept in
+  the resource's private state, and the next plan shows an update (`status` unknown) that runs
+  them again — the settings, then the restore — with the configuration's values then, so a wrong
+  `object` or identity is fixed in between (`restore_identity_wo` missing then is refused at
+  plan). The restore again passes the same check right before it: one cut short may have
+  finished on the target, and is then dropped, never run over data since. In an update, a step
+  that fails is an error, still kept; settings it could not set keep state's, so the next plan
+  shows the change again. A pending restore taken out of the configuration is dropped, nothing
+  read. Once the restore succeeded it never runs again: a later change of `restore` is recorded
+  with a warning (`restore is taken at create alone`), and nothing is restored.

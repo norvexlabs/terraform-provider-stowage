@@ -80,6 +80,8 @@ func vmOp(argv []string) string {
 		return "dry-upgrade" // given inputs on standard input
 	case len(argv) > 9 && argv[0] == "sh" && argv[2] == installer.RunScript && argv[9] == "upgrade":
 		return "upgrade"
+	case len(argv) > 9 && argv[0] == "sh" && argv[2] == installer.RunScript && (argv[9] == "backup" || argv[9] == "restore"):
+		return argv[9] // given its files on standard input
 	case len(argv) > 2 && argv[0] == "sh" && argv[2] == installer.RunScript:
 		return "install"
 	case len(argv) > 9 && argv[0] == "sh" && argv[2] == installer.PositionalScript:
@@ -981,6 +983,7 @@ func TestVMRerun(t *testing.T) {
 func TestVMCreateGivesTheSecretsExport(t *testing.T) {
 	t.Parallel()
 	h, f := newVMHarness(t)
+	f.then("status", reply{stdout: awaitingSecrets()}, reply{stdout: awaitingSecrets()})
 	state := h.create(h.vmConfig("1.1.0", map[string]tftypes.Value{"secrets_wo": str("export-" + secretVal)}))
 	in := f.callsOf("install")
 	if len(in) != 1 || !slices.Contains(in[0].argv, "secrets") || untarAll(t, in[0].stdin)["secrets"] != "export-"+secretVal ||

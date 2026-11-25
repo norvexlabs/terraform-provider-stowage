@@ -117,6 +117,7 @@ func (r *installResource) ValidateConfig(ctx context.Context, req resource.Valid
 		validateK8s(&m, &resp.Diagnostics)
 	}
 	validateExtras(&m, &resp.Diagnostics)
+	validateBackup(ctx, &m, &resp.Diagnostics)
 
 	// The configuration's maps are read by key: a value may not be known yet (a write-only one
 	// from an ephemeral variable, one computed from another resource); a null one is refused.
@@ -300,7 +301,10 @@ func (r *installResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 	if req.State.Raw.IsNull() {
 		var plan installModel
 		resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+		var cfg installModel
+		resp.Diagnostics.Append(req.Config.Get(ctx, &cfg)...)
 		if !resp.Diagnostics.HasError() {
+			planBackupCreate(&cfg, &resp.Diagnostics)
 			r.planPullLogin(&plan, nil, &resp.Diagnostics)
 			if plan.VM == nil {
 				digestTrustWarning(r.data, &resp.Diagnostics) // the VM's installer is its seed's
@@ -358,6 +362,13 @@ func (r *installResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 	planVM(ctx, &plan, &state, resp)
 	planRemovals(ctx, &plan, &state, &resp.Diagnostics)
 	planRotations(ctx, req.Private, &plan, &state, &resp.Diagnostics)
+	var identity types.String
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("restore_identity_wo"), &identity)...)
+	planned := plan.Backup
+	backupDue := planBackupUpdate(ctx, req.Private, &plan, &state, identity, &resp.Diagnostics)
+	if !plan.Backup.Equal(planned) {
+		resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("backup"), plan.Backup)...)
+	}
 	if r.data != nil && r.data.RegistryCAKnown && !imported(&state) && plan.Kubernetes == nil {
 		firstInstallOnlyFix(&resp.Diagnostics, path.Root("registry_ca_digest"), "the provider's registry_ca", state.RegistryCADigest.ValueString(), caDigest(r.data.RegistryCA),
 			"The install keeps the registry CA its first install was given (status --json registry_ca), which a re-run cannot change: give the provider that CA again (an empty one for none).")
@@ -383,6 +394,9 @@ func (r *installResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 	case plan.VM != nil && len(pendingRoles(ctx, resp.Private)) > 0:
 		// Interfaces a create recorded and could not attach: an update attaches them, and reads
 		// the VM after.
+		unknowns = []string{"status"}
+	case backupDue:
+		// The backup settings or the restore a create could not finish: an update runs them.
 		unknowns = []string{"status"}
 	}
 	if imported(&state) {
@@ -661,32 +675,24 @@ func (r *installResource) Create(ctx context.Context, req resource.CreateRequest
 			return
 		}
 	}
-	// A kit lost is refused once the install there is known to be this one, before the take-over
-	// is said: where the kit would be given (nothing installed), and while an earlier create's
-	// first install is marked as running.
-	if r.kitLost && stillInstalling(existing, "apply again: once it succeeded, the create goes on from it, needing no kit; once it failed, the create asks for a kit again. If no run is under way (one cut by a timeout leaves it marked installing), bump the stowage_kit's version instead: the re-run finishes the first install with the new kit.", &resp.Diagnostics) {
-		return
-	}
-	if (existing == nil || existing.Installed == nil) && r.refuseLostKit(&resp.Diagnostics) {
+	// A kit lost is refused where it would be given: nothing installed. Docker's status answers
+	// only once an install's .env is written, so an install there takes no kit (its re-run, even
+	// of a first install left unfinished, needs none; one running beside it is refused by the
+	// installer's lock).
+	if existing == nil && r.refuseLostKit(&resp.Diagnostics) {
 		return
 	}
 	if existing != nil {
-		// A kit goes with the re-run of a first install left unfinished (nothing installed yet):
-		// the installer's re-run takes --kit; once an install exists, kit_wo is first-install
-		// only, as at an update. Said only when a kit is given.
-		notGiven, kit := "", ""
-		switch {
-		case in.Kit == "" && !r.kitLost:
-		case existing.Installed != nil:
+		// kit_wo is first-install only, as at an update. Said only when a kit is given.
+		notGiven := ""
+		if in.Kit != "" || r.kitLost {
 			notGiven = "; kit_wo with kit_code_wo, as an install exists (stowage_kit_take gives a kit to it)"
-		default:
-			kit = " kit_wo with kit_code_wo is given, as nothing is installed yet."
 		}
 		resp.Diagnostics.AddWarning("An install is already there",
 			fmt.Sprintf("%s/%s already holds an install of %s: the create runs the installer again on it (its re-run), which finishes a first install left unfinished; "+
 				"an install of another release there is refused by the installer: set installer to the one it runs (status --json installed.installer), apply, then change installer to upgrade it. "+
-				"The settings only a first install takes (describe's first_install_only: address, the provider's registry and registry_ca; secrets_wo%s) are not given: the install keeps the ones it recorded, which the configuration's match.%s", d.WorkDir, d.Name, d.Name, notGiven, kit))
-		withoutFirstInstallOnly(&in, desc.FirstInstallOnly, existing.Installed != nil)
+				"The settings only a first install takes (describe's first_install_only: address, the provider's registry and registry_ca; secrets_wo%s) are not given: the install keeps the ones it recorded, which the configuration's match.", d.WorkDir, d.Name, d.Name, notGiven))
+		withoutFirstInstallOnly(&in, desc.FirstInstallOnly)
 	}
 	if _, err := d.Install(ctx, in); err != nil {
 		addInstallerError(&resp.Diagnostics, "Installing "+desc.Name, err)
@@ -707,6 +713,7 @@ func (r *installResource) Create(ctx context.Context, req resource.CreateRequest
 	m.ShortName = types.StringValue(desc.ShortName)
 	applyStatus(&m, st, false)
 	applyHeld(&m, st, false)
+	r.createBackup(ctx, &m, resp)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }
 
@@ -808,14 +815,10 @@ func applyHeld(m *installModel, st *installer.Status, read bool) {
 const defaultAddress = "127.0.0.1"
 
 // withoutFirstInstallOnly leaves out of in the settings a re-run refuses: those describe names
-// first-install only that the provider gives and the secrets export (a re-run keeps the install's
-// secrets); and, once an install exists (installed), the kit and its code: kit_wo is given to
-// the first install alone, which a re-run finishing it is.
-func withoutFirstInstallOnly(in *installer.Install, names []string, installed bool) {
-	in.Secrets = ""
-	if installed {
-		in.Kit, in.KitCode = "", ""
-	}
+// first-install only that the provider gives, the secrets export (a re-run keeps the install's
+// secrets), and the kit and its code (kit_wo is given to the first install alone).
+func withoutFirstInstallOnly(in *installer.Install, names []string) {
+	in.Secrets, in.Kit, in.KitCode = "", "", ""
 	for _, n := range names {
 		switch n {
 		case "address":
@@ -1004,6 +1007,7 @@ func (r *installResource) Read(ctx context.Context, req resource.ReadRequest, re
 	applyStatus(&m, st, true)
 	applyHeld(&m, st, true)
 	r.readBack(&m, st.Values)
+	r.readBackup(ctx, &m, &resp.Diagnostics)
 	resp.Diagnostics.Append(dropUnrecorded(ctx, &m, st)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }
@@ -1140,6 +1144,9 @@ func (r *installResource) Update(ctx context.Context, req resource.UpdateRequest
 	}
 	// What the install records now is the next refresh's baseline, whatever the rotations do.
 	r.keepRecorded(ctx, resp.Private, &resp.Diagnostics)
+	if r.updateBackup(ctx, req.Private, resp, &plan, &state); resp.Diagnostics.HasError() {
+		return
+	}
 	r.rotateSecrets(ctx, resp.Private, want, &state, func(m *installModel) bool {
 		resp.Diagnostics.Append(resp.State.Get(ctx, m)...)
 		return !resp.Diagnostics.HasError()

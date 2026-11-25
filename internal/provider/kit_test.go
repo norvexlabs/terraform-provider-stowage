@@ -611,11 +611,12 @@ func TestKitCheck(t *testing.T) {
 		t.Fatalf("a proving refresh: %s", diagText(r.Diagnostics))
 	}
 
-	// No verdict by the timeout: unknown, the last run's error said.
+	// No verdict by the timeout: unknown, the last run's error said. The window holds several
+	// polls even on a loaded machine (a first run slower than a short window would be the only one).
 	h4, k4 := checkHarness(t)
 	h4.fake.set("kit-check", reply{exit: 1, stderr: "sudo: a password is required"})
-	a4 := k4.planApply(nil, k4.checkConfig(map[string]tftypes.Value{"timeout": str("20ms")}))
-	if got := errorsOf(a4.Diagnostics); !strings.Contains(got, "gave no verdict in 20ms") || !strings.Contains(got, "a password is required") || len(h4.fake.callsOf("kit-check")) < 2 {
+	a4 := k4.planApply(nil, k4.checkConfig(map[string]tftypes.Value{"timeout": str("200ms")}))
+	if got := errorsOf(a4.Diagnostics); !strings.Contains(got, "gave no verdict in 200ms") || !strings.Contains(got, "a password is required") || len(h4.fake.callsOf("kit-check")) < 2 {
 		t.Fatalf("timeout: %q %d", got, len(h4.fake.callsOf("kit-check")))
 	}
 	// A handoff without a check: refused before any check runs.
@@ -779,7 +780,7 @@ func TestKitVMBeforeAndAfterInstall(t *testing.T) {
 	// whether it took this kit, so a kit lost is refused, naming both ways on.
 	h2, f2 := newVMHarness(t)
 	a := h2.apply(nil, h2.plan(nil, lost).PlannedState, lost)
-	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "Bump the stowage_kit's version") || !strings.Contains(got, "remove kit_wo_version") || len(f2.callsOf("install")) != 0 {
+	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "Bump the stowage_kit's version") || !strings.Contains(got, "remove kit_wo_version, kit_wo and kit_code_wo") || len(f2.callsOf("install")) != 0 {
 		t.Fatalf("a kit lost on an installed VM: %q %q", got, f2.ops())
 	}
 	// A first install that failed (perhaps after taking the kit): the remove hint too.
@@ -790,43 +791,51 @@ func TestKitVMBeforeAndAfterInstall(t *testing.T) {
 	}
 	// An earlier create's first install still running: apply again once it ends.
 	h3, f3 := newVMHarness(t)
-	f3.set("status", reply{stdout: strings.Replace(vmStatusJSON("1.1.0", "boot-1", ""), `"installed":{"version":"1.1.0","revision":1}`, `"installed":null,"installing":true`, 1)})
+	// Its .env written, so installed, as a first install's status is while its stack comes up.
+	f3.set("status", reply{stdout: vmStatusJSON("1.1.0", "boot-1", `,"installing":true`)})
 	a = h3.apply(nil, h3.plan(nil, lost).PlannedState, lost)
-	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "The first install is still running") || !strings.Contains(got, "remove kit_wo_version") || !strings.Contains(got, "if no run is under way") || strings.Contains(got, "needing no kit") || len(f3.callsOf("install")) != 0 {
+	if got := errorsOf(a.Diagnostics); !strings.Contains(got, "The first install is still running") || !strings.Contains(got, "names both ways on") || !strings.Contains(got, "`sudo notes-stow install`, then apply again") || len(f3.callsOf("install")) != 0 {
 		t.Fatalf("a first install running: %q %q", got, f3.ops())
 	}
 }
 
-// A Docker create retried while an earlier create's first install is marked as running is
-// refused, naming the ways on (apply again once it ends; a new kit when no run is under way); with an unfinished one (failed), a kit lost is refused, the warning not
-// saying a kit is given.
+// A Docker create retried with its kit lost: an install there (Docker's status answers only once
+// its .env is written), running, failed or done, is re-run with no kit, the warning saying why;
+// nothing there, the kit is issued again; another project's install, or one made otherwise, is
+// said first.
 func TestDockerRetryWithALostKit(t *testing.T) {
 	t.Parallel()
 	lost := func(h *harness) tftypes.Value {
 		return h.dockerConfig(map[string]tftypes.Value{"kit_wo_version": str("k1")})
 	}
 	h := newHarness(t, nil)
-	h.fake.set("new-status", reply{stdout: `{"format":1,"name":"notes","installed":null,"installing":true,"address":"127.0.0.1"}`})
-	if got := errorsOf(h.apply(nil, h.plan(nil, lost(h)).PlannedState, lost(h)).Diagnostics); !strings.Contains(got, "The first install is still running") || !strings.Contains(got, "needing no kit") ||
-		!strings.Contains(got, "If no run is under way") || strings.Contains(got, "remove kit_wo_version") || len(h.fake.callsOf("install")) != 0 {
-		t.Fatalf("running: %q %q", got, h.fake.ops())
+	h.fake.set("new-status", reply{stdout: `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1,"installer":"` + image + `"},"installing":true,"address":"127.0.0.1"}`})
+	// Marked running (perhaps a run cut by a timeout): the re-run goes on, needing no kit; one
+	// still running beside it is refused by the installer's lock.
+	if a := h.apply(nil, h.plan(nil, lost(h)).PlannedState, lost(h)); errorsOf(a.Diagnostics) != "" || !strings.Contains(diagText(a.Diagnostics), "as an install exists") || len(h.fake.callsOf("install")) != 1 {
+		t.Fatalf("running: %s %q", diagText(a.Diagnostics), h.fake.ops())
+	}
+	// Nothing installed there: the kit is issued again.
+	hn := newHarness(t, nil)
+	if got := errorsOf(hn.apply(nil, hn.plan(nil, lost(hn)).PlannedState, lost(hn)).Diagnostics); !strings.Contains(got, "The kit is not here") || len(hn.fake.callsOf("install")) != 0 {
+		t.Fatalf("nothing installed: %q %q", got, hn.fake.ops())
 	}
 	// Another project's install there: said first, never a new kit asked for.
 	h3 := newHarness(t, nil)
-	h3.fake.set("new-status", reply{stdout: `{"format":1,"name":"other","installed":null,"address":"127.0.0.1"}`})
+	h3.fake.set("new-status", reply{stdout: `{"format":1,"name":"other","installed":{"version":"1.2.0","revision":1},"address":"127.0.0.1"}`})
 	if got := errorsOf(h3.apply(nil, h3.plan(nil, lost(h3)).PlannedState, lost(h3)).Diagnostics); !strings.Contains(got, "Another project's install") || strings.Contains(got, "The kit is not here") {
 		t.Fatalf("another project: %q", got)
 	}
 	h4 := newHarness(t, nil)
-	h4.fake.set("new-status", reply{stdout: `{"format":1,"name":"notes","installed":null,"address":"10.0.0.9"}`})
+	h4.fake.set("new-status", reply{stdout: `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1},"address":"10.0.0.9"}`})
 	if got := errorsOf(h4.apply(nil, h4.plan(nil, lost(h4)).PlannedState, lost(h4)).Diagnostics); !strings.Contains(got, "The install there was made otherwise") || strings.Contains(got, "The kit is not here") {
 		t.Fatalf("made otherwise: %q", got)
 	}
 	h2 := newHarness(t, nil)
-	h2.fake.set("new-status", reply{stdout: `{"format":1,"name":"notes","installed":null,"install_failed":"the hook failed","address":"127.0.0.1"}`})
+	h2.fake.set("new-status", reply{stdout: `{"format":1,"name":"notes","installed":{"version":"1.2.0","revision":1,"installer":"` + image + `"},"installing":true,"install_failed":"the hook failed","address":"127.0.0.1"}`})
 	a := h2.apply(nil, h2.plan(nil, lost(h2)).PlannedState, lost(h2))
-	if got := diagText(a.Diagnostics); !strings.Contains(errorsOf(a.Diagnostics), "The kit is not here") || strings.Contains(got, "is given, as nothing is installed yet") || len(h2.fake.callsOf("install")) != 0 {
-		t.Fatalf("unfinished: %s %q", got, h2.fake.ops())
+	if got := diagText(a.Diagnostics); errorsOf(a.Diagnostics) != "" || !strings.Contains(got, "as an install exists") || len(h2.fake.callsOf("install")) != 1 {
+		t.Fatalf("failed: %s %q", got, h2.fake.ops())
 	}
 }
 

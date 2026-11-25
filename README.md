@@ -145,12 +145,14 @@ read](docs/guides/machine-interface.md). What runs where:
 | inputs | the running release's re-run | `k8s upgrade --given` | `install` (re-run) |
 | release | `upgrade` / `rollback` | `k8s upgrade` / `k8s rollback` | `upgrade --version V`, its reboot followed / `rollback` |
 | secret rotated (`secret_rotations`, a number bumped) | `secrets rotate KEY`: one pass (`replace: true`) or three (`rotation: true`) | `k8s secrets rotate KEY`, three passes (`rotation: true`) | `secrets rotate KEY`, as on Docker |
+| machine made again (`backup`, `restore`, after `secrets_wo`) | `backup config … --json`, read back by `backup config --json`; `restore OBJECT --yes` once, in the create | — | as on Docker, over SSH |
 | delete | `uninstall [--data]` | `k8s uninstall [--data]` | forgets it (the VM is its own resource's) |
 
-Secrets (`secret_inputs_wo`, `given_wo`, `secrets_wo`, `registry_login_wo`, `kit_code_wo`) are write-only: on standard input, never on
+Secrets (`secret_inputs_wo`, `given_wo`, `secrets_wo`, `registry_login_wo`, `kit_code_wo`, `backup_rclone_config_wo`, `restore_identity_wo`) are write-only: on standard input, never on
 a command line or in state. Every SSH connection accepts the pinned key alone. Each target in
 full: [Docker](docs/guides/docker-target.md), [Kubernetes](docs/guides/kubernetes-target.md),
-[VM](docs/guides/vm-target.md); a VM per platform: [guide](docs/guides/platforms.md).
+[VM](docs/guides/vm-target.md); a VM per platform: [guide](docs/guides/platforms.md); a lost machine made again in one
+apply: [Docker](docs/guides/docker-target.md#a-machine-made-again), [VM](docs/guides/vm-target.md#a-machine-made-again).
 
 ## Building and testing
 

@@ -3,6 +3,40 @@
 The provider's releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.7.0]
+
+For Stowage 0.48.0 or later with `restore` (from 0.48.0 every install made by `--secrets` awaits its
+data, which a restore requires) and 0.47.0 or later with `backup.keep_local`.
+
+### Added
+
+- A lost machine made again in one apply, on `stowage_docker_install` and `stowage_vm_install`:
+  `backup` declares the install's backup settings (a destination with the write-only
+  `backup_rclone_config_wo`, or `keep_local`; recipients, retention, schedule, profile, lock),
+  set at create and whenever they change, and read back by every refresh, so a change made on
+  the target shows in the plan; `restore` (with the write-only `restore_identity_wo`) loads a
+  backup into the install a create makes from `secrets_wo`, then runs its provision hook. A
+  restore is taken in that create alone: one that fails leaves the install created, with a
+  warning, and the next apply runs it again; a restore loads only while the install awaits its
+  data (`status --json`, read right before it), never over an install's own data.
+
+### Changed
+
+- A VM create given `secrets_wo` reads the VM's `status --json` first: an install an earlier apply
+  made from the export, which awaits its data, is not given it again (the installer would refuse
+  it), and an install of the VM's own is refused before anything runs, naming the way on.
+- **BREAKING — a Docker create retried with its kit lost no longer waits out a first install
+  marked as running**: an install there (Docker's status answers only once one is written)
+  needs no kit, so the create runs its re-run as for any install there — the installer refuses
+  one beside a run still going, and an apply once it ends goes on. Before, it was refused
+  (`The first install is still running`), and a mark a timeout left needed the kit attributes
+  taken out.
+
+### Security
+
+- The signature verifier's sigstore libraries are raised to the release that dropped the
+  unmaintained OpenPGP package flagged by GO-2026-5932, and `golang.org/x/crypto` to 0.59.0.
+
 ## [0.6.0] - 2026-11-25
 
 For Stowage 0.46.0 or later on the installs that rotate a secret (`describe --json`'s `secrets`).

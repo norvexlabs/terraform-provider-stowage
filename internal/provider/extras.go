@@ -20,9 +20,11 @@ import (
 // writeOnly are the write-only values a create or an update sends, read from the configuration
 // at its start (installResource.wo): never in a model, so never in state.
 type writeOnly struct {
-	login   string // registry_login_wo
-	kit     string // kit_wo
-	kitCode string // kit_code_wo
+	login    string // registry_login_wo
+	kit      string // kit_wo
+	kitCode  string // kit_code_wo
+	rclone   string // backup_rclone_config_wo
+	identity string // restore_identity_wo
 }
 
 // readWriteOnly reads them from cfg.
@@ -30,7 +32,10 @@ func readWriteOnly(ctx context.Context, cfg tfsdk.Config, diags *diag.Diagnostic
 	var login types.String
 	diags.Append(cfg.GetAttribute(ctx, path.Root("registry_login_wo"), &login)...)
 	kit, code := readKitWO(ctx, cfg, diags)
-	return writeOnly{login: login.ValueString(), kit: kit, kitCode: code}
+	var rclone, identity types.String
+	diags.Append(cfg.GetAttribute(ctx, path.Root("backup_rclone_config_wo"), &rclone)...)
+	diags.Append(cfg.GetAttribute(ctx, path.Root("restore_identity_wo"), &identity)...)
+	return writeOnly{login: login.ValueString(), kit: kit, kitCode: code, rclone: rclone.ValueString(), identity: identity.ValueString()}
 }
 
 // loginChanged says whether an update sends registry_login_wo: its version changed (an imported
@@ -92,15 +97,16 @@ func (r *installResource) kit(m *installModel, diags *diag.Diagnostics) (string,
 }
 
 // stillInstalling refuses a create retried while the first install a create before it began is
-// marked as running (st: installing, not failed): that install may be taking the kit. then is
-// the shape's way on: apply again once it ends, or, when no run is under way (a run cut by a
-// timeout leaves the mark), issue a new kit.
-func stillInstalling(st *installer.Status, then string, diags *diag.Diagnostics) bool {
-	if st == nil || st.Installed != nil || !st.Installing || st.InstallFailed != "" {
+// marked as running (st: installing, not failed — reported only once its .env is written; a
+// re-run of a finished install never marks it): that install may be taking
+// what this create gives. then is the way on: apply again once it ends, or what to do when no run
+// is under way (a run cut by a timeout leaves the mark).
+func stillInstalling(st *installer.Status, who, then string, diags *diag.Diagnostics) bool {
+	if st == nil || !st.Installing || st.InstallFailed != "" {
 		return false
 	}
 	diags.AddError("The first install is still running",
-		"An earlier create's first install runs on (status --json installing), perhaps with the kit: once it has finished, "+then)
+		"A first install runs on (status --json installing: "+who+"): once it has finished, "+then)
 	return true
 }
 

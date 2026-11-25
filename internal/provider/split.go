@@ -46,6 +46,9 @@ var common = []string{"id", "inputs", "secret_inputs_wo", "secret_inputs_wo_vers
 	"deletion_protection", "plan_dry_run", "registry", "registry_ca_digest", "status", "previous", "revision",
 	"registry_login_wo", "registry_login_wo_version", "kit_wo", "kit_code_wo", "kit_wo_version", "secret_rotations", "timeouts"}
 
+// backupFields are the model's attributes of a machine made again (backup.go): Docker's and the VM's.
+var backupFields = []string{"backup", "backup_rclone_config_wo", "backup_rclone_config_wo_version", "restore", "restore_identity_wo"}
+
 func top(names ...string) []field {
 	out := make([]field, 0, len(names))
 	for _, n := range names {
@@ -67,7 +70,7 @@ var shapes = map[string]*shape{
 		kind: "docker",
 		desc: "One install of a Stowage product on a Docker host, reached over SSH by the system `ssh` binary, or on the machine running OpenTofu (no `host`). " +
 			"The installer runs on the host: `docker run --rm <installer> > <name>.sh`, then `sh <name>.sh --no-input --json`; the install keeps its installer as `<work_dir>/<name>/<short_name>-stow`, which every later run uses.",
-		fields: append(append(top(append(common, "installer", "secrets_wo", "tls", "domains", "ports", "address", "delete_data",
+		fields: append(append(top(append(append(common, backupFields...), "installer", "secrets_wo", "tls", "domains", "ports", "address", "delete_data",
 			"acme_ca", "acme_ca_root", "short_name", "version", "channel")...),
 			block("docker", "port", "user", "private_key_file", "known_hosts_line", "work_dir")...),
 			field{outer: "host", inner: []string{"docker", "host"}, desc: "The Docker host, reached over SSH by the system `ssh` binary. Left out, the install is on the machine running OpenTofu (its own Docker)."}),
@@ -84,7 +87,7 @@ var shapes = map[string]*shape{
 		kind: "vm",
 		desc: "The install of a Stowage product on a Kairos VM, reached over SSH: a VM its hypervisor's or cloud's resource made from `stowage_vm_seed`. " +
 			"`sudo -n <short_name>-stow install|upgrade|rollback --json` and `<short_name>-stow status|describe --json` run on it; destroying the resource forgets the install, removing the VM is its own resource's job.",
-		fields: append(append(top(append(common, "secrets_wo", "tls", "domains", "ports", "acme_ca", "acme_ca_root")...),
+		fields: append(append(top(append(append(common, backupFields...), "secrets_wo", "tls", "domains", "ports", "acme_ca", "acme_ca_root")...),
 			block("vm", "port", "private_key_file", "known_hosts_line", "channel", "host_key_line", "seed_boot_id", "platform", "interfaces")...),
 			field{outer: "host", inner: []string{"vm", "host"}, required: true, desc: "The VM's address, reached over SSH by the system `ssh` binary (the VM's own resource's address output)."},
 			field{outer: "user", inner: []string{"vm", "user"}, required: true, desc: "The SSH user: the seed's `user`, in the VM's admin group (`sudo` without a password)."},
