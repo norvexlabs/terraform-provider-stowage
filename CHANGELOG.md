@@ -3,7 +3,7 @@
 The provider's releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.9.0]
+## [0.9.0] - 2026-11-27
 
 For Stowage 0.50.0 or later with `ssh_allow` on `stowage_vm_install`.
 
