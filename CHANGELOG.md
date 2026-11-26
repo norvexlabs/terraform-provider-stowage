@@ -3,7 +3,7 @@
 The provider's releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.8.0]
+## [0.8.0] - 2026-11-26
 
 For Stowage 0.49.0 or later with `restore`: only an export (`export: true`) makes an install made
 again; a secrets file without it seeds a plain install.
