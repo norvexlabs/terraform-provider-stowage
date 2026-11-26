@@ -3,7 +3,7 @@
 The provider's releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.7.0]
+## [0.7.0] - 2026-11-26
 
 For Stowage 0.48.0 or later with `restore` (from 0.48.0 every install made by `--secrets` awaits its
 data, which a restore requires) and 0.47.0 or later with `backup.keep_local`.
