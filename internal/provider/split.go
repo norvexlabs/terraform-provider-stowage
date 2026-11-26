@@ -88,7 +88,7 @@ var shapes = map[string]*shape{
 		desc: "The install of a Stowage product on a Kairos VM, reached over SSH: a VM its hypervisor's or cloud's resource made from `stowage_vm_seed`. " +
 			"`sudo -n <short_name>-stow install|upgrade|rollback --json` and `<short_name>-stow status|describe --json` run on it; destroying the resource forgets the install, removing the VM is its own resource's job.",
 		fields: append(append(top(append(append(common, backupFields...), "secrets_wo", "tls", "domains", "ports", "acme_ca", "acme_ca_root")...),
-			block("vm", "port", "private_key_file", "known_hosts_line", "channel", "host_key_line", "seed_boot_id", "platform", "interfaces")...),
+			block("vm", "port", "private_key_file", "known_hosts_line", "channel", "host_key_line", "seed_boot_id", "platform", "interfaces", "ssh_allow")...),
 			field{outer: "host", inner: []string{"vm", "host"}, required: true, desc: "The VM's address, reached over SSH by the system `ssh` binary (the VM's own resource's address output)."},
 			field{outer: "user", inner: []string{"vm", "user"}, required: true, desc: "The SSH user: the seed's `user`, in the VM's admin group (`sudo` without a password)."},
 			field{outer: "short_name", inner: []string{"vm", "short_name"}, required: true, desc: "The installer's short name, `stowage_vm_seed`'s `short_name`: the VM runs `<short_name>-stow`."},

@@ -3,6 +3,20 @@
 The provider's releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.9.0]
+
+For Stowage 0.50.0 or later with `ssh_allow` on `stowage_vm_install`.
+
+### Added
+
+- `stowage_vm_install` takes `ssh_allow`, the sources SSH accepts on the VM, changed in place after
+  its first boot (the seed's `ssh_allow` is the first boot's alone): the apply sets them last, after
+  any reboot, then confirms them over a new SSH connection, so a list that leaves out the address
+  OpenTofu runs from fails the apply and the VM undoes it within its window. A refresh reads them
+  back, so a change made on the VM shows in the plan. Each source must be a CIDR written masked,
+  an IPv4 network written as IPv4 (an IPv4-mapped one is refused, naming its IPv4 form). Left out,
+  the provider never reads nor changes them.
+
 ## [0.8.0] - 2026-11-26
 
 For Stowage 0.49.0 or later with `restore`: only an export (`export: true`) makes an install made

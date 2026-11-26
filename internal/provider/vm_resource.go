@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework-validators/setvalidator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
@@ -61,6 +62,18 @@ func vmAttributes() map[string]schema.Attribute {
 			"mode":    schema.StringAttribute{Optional: true, MarkdownDescription: "`dhcp`, `static` or `none` (the link up, no address); left out, `none`.", Validators: []validator.String{stringvalidator.OneOf("dhcp", "static", "none")}},
 			"address": schema.StringAttribute{Optional: true, MarkdownDescription: "With `mode = \"static\"`: the IPv4 address with its prefix, e.g. `192.0.2.20/24`."},
 		}},
+	}
+	vm["ssh_allow"] = schema.SetAttribute{
+		Optional:    true,
+		ElementType: types.StringType,
+		MarkdownDescription: "The sources SSH accepts on the VM, each a CIDR with its prefix written masked (`192.0.2.0/24`, `2001:db8::/32`, `0.0.0.0/0` for every IPv4 source): set over whatever set them before — `stowage_vm_seed`'s `ssh_allow`, which is the first boot's alone. " +
+			"A change is made in place: the apply reads the VM's (`sudo -n <short>-stow ssh-allow --json` over SSH) and, when they differ, runs `sudo -n <short>-stow ssh-allow set <sources, sorted> --json`, which applies them at once and undoes them unless confirmed within the VM's window (90 s), then `sudo -n <short>-stow ssh-allow confirm --json` over a new SSH connection: that the VM lets it in proves the new sources hold the address OpenTofu runs from. " +
+			"A confirm the VM does not let in fails the apply, and the window undoes the change by itself; a confirm that fails otherwise is followed by `ssh-allow revert --json`. A change already awaiting confirmation on the VM fails the apply, naming `ssh-allow confirm` and `revert`. " +
+			"Applied after the apply's other steps, once the VM is back from any reboot; at create, after the install, and a failure there is a warning: the install is recorded, and the next plan shows an update that applies the sources again. " +
+			"A refresh reads the VM's sources into state, so a change made on the VM shows in the plan (a change awaiting confirmation there is read as its sources, with a warning; a rule file that does not read as SSH's sources leaves state as it is, with a warning). " +
+			"Left out, the provider never reads nor changes them. Each source is refused at plan unless it is a CIDR equal to its masked form (`192.0.2.9/24` is refused, naming `192.0.2.0/24`), an IPv4 network written IPv4-mapped is refused, naming its IPv4 form (`::ffff:203.0.113.0/120` → `203.0.113.0/24`), and an empty set is refused. " +
+			"Changing the sources from an address the old ones refuse cannot reach the VM: add the new address beside the old, apply, then take the old out (the VM guide). Needs an OS built by Stowage " + installer.SSHAllowMinStowage + " or later (`<short>-stow ssh-allow`).",
+		Validators: []validator.Set{setvalidator.SizeAtLeast(1), setvalidator.ValueStringsAre(maskedCIDR{})},
 	}
 	vm["seed_boot_id"] = schema.StringAttribute{
 		Computed:            true,
@@ -125,6 +138,10 @@ func planVM(ctx context.Context, plan, state *installModel, resp *resource.Modif
 	if pending := pendingRoles(ctx, resp.Private); len(pending) > 0 {
 		resp.Diagnostics.AddAttributeWarning(path.Root("vm").AtName("interfaces"), "NICs not attached yet",
 			fmt.Sprintf("The create recorded interfaces %s, and attaching them failed: this apply attaches them (`network attach`), then reboots the VM.", strings.Join(pending, ", ")))
+	}
+	if !plan.VM.SSHAllow.IsNull() && sshAllowPending(ctx, resp.Private) {
+		resp.Diagnostics.AddAttributeWarning(sshAllowPath, "SSH's sources not set yet",
+			"The create recorded ssh_allow and did not set it on the VM (its warning said why): this apply sets it (`ssh-allow set`, then `ssh-allow confirm` over a new SSH connection).")
 	}
 	if imported(state) && len(attach) > 0 {
 		resp.Diagnostics.AddAttributeWarning(path.Root("vm").AtName("interfaces"), "The first apply reads the VM's NICs",
@@ -587,6 +604,11 @@ func (r *installResource) createVM(ctx context.Context, req resource.CreateReque
 	r.vmFill(&m, nil)
 	applyVMStatus(&m, st, false)
 	r.createBackup(ctx, &m, resp)
+	if !m.VM.SSHAllow.IsNull() {
+		// Set last, after the NICs' reboot: pending until then, so a create that stops before
+		// it leaves the next plan an update that sets them.
+		setSSHAllowPending(ctx, resp.Private, true, &resp.Diagnostics)
+	}
 	if attach := attachments(m.VM.Interfaces, types.MapNull(interfaceType)); len(attach) > 0 {
 		// The install is made: recorded as planned, its interfaces marked pending in private
 		// state until they are attached, so an attach that fails leaves a state consistent with
@@ -620,6 +642,7 @@ func (r *installResource) createVM(ctx context.Context, req resource.CreateReque
 			resp.Diagnostics.AddWarning("The VM came back unhealthy from attaching its NICs", consoleHint(sick, m.VM.Platform).Error()+".")
 		}
 	}
+	r.createSSHAllow(ctx, &m, resp)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }
 
@@ -1267,6 +1290,7 @@ func (r *installResource) readVM(ctx context.Context, m *installModel, resp *res
 	retireSeed(m, st)
 	r.readBack(m, st.Values)
 	r.readBackup(ctx, m, &resp.Diagnostics)
+	readSSHAllow(ctx, v, m, &resp.Diagnostics)
 	resp.Diagnostics.Append(dropUnrecorded(ctx, m, &st.Status)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, m)...)
 }
@@ -1794,7 +1818,7 @@ func (r *installResource) importVM(ctx context.Context, id string, resp *resourc
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("vm"), &vmModel{
 		Host: types.StringValue(host), Port: types.Int64Null(), User: null, PrivateKeyFile: null, KnownHostsLine: null,
 		Version: null, Channel: null, ShortName: types.StringValue(short), HostKeyLine: null, SeedBootID: null,
-		Platform: null, Interfaces: types.MapNull(interfaceType)})...)
+		Platform: null, Interfaces: types.MapNull(interfaceType), SSHAllow: types.SetNull(types.StringType)})...)
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), id)...)
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("short_name"), short)...)
 	for a, v := range map[string]bool{"deletion_protection": true, "delete_data": false, "allow_rollback": false} {

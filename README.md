@@ -121,7 +121,7 @@ Generated from the schema, the templates and the examples (`make docs`) into [do
 | [Provider](docs/index.md) | the pull account, `registry`, `registry_ca`, `public_keys`, the `kubernetes` block |
 | [`stowage_docker_install`](docs/resources/docker_install.md) | an install on a Docker host: every argument and attribute, the plan-time errors, its import ID |
 | [`stowage_kubernetes_install`](docs/resources/kubernetes_install.md) | a helm release on a cluster |
-| [`stowage_vm_install`](docs/resources/vm_install.md) | the install on a Kairos VM: its keys, `interfaces`, `platform` |
+| [`stowage_vm_install`](docs/resources/vm_install.md) | the install on a Kairos VM: its keys, `interfaces`, `platform`, SSH's sources (`ssh_allow`) |
 | [`stowage_vm_seed`](docs/resources/vm_seed.md) | a Kairos VM's first-boot material, generated once: `ctl_path`, `size`, `firewall` |
 | [`stowage_kit`](docs/resources/kit.md) and the [ephemeral `stowage_kit`](docs/ephemeral-resources/kit.md) | a handoff kit issued by an install (`kit create --json`), kept in the provider's process and handed to `kit_wo` in the same apply: never in a file of the root, state or plan |
 | [`stowage_kit_take`](docs/resources/kit_take.md) | a kit taken by an install that exists (its re-run's `--kit`) |
@@ -150,6 +150,7 @@ destination. What runs where:
 | release | `upgrade` / `rollback` | `k8s upgrade` / `k8s rollback` | `upgrade --version V`, its reboot followed / `rollback` |
 | secret rotated (`secret_rotations`, a number bumped) | `secrets rotate KEY`: one pass (`replace: true`) or three (`rotation: true`) | `k8s secrets rotate KEY`, three passes (`rotation: true`) | `secrets rotate KEY`, as on Docker |
 | machine made again (`backup`, `restore`, after `secrets_wo`) | `backup config … --json`, read back by `backup config --json`; `restore OBJECT --yes` once, in the create | — | as on Docker, over SSH |
+| SSH's sources (`ssh_allow`) | — | — | `ssh-allow set … --json`, then `ssh-allow confirm --json` over a new SSH connection; read back by `ssh-allow --json` |
 | delete | `uninstall [--data]` | `k8s uninstall [--data]` | forgets it (the VM is its own resource's) |
 
 Secrets (`secret_inputs_wo`, `given_wo`, `secrets_wo`, `registry_login_wo`, `kit_code_wo`, `backup_rclone_config_wo`, `restore_identity_wo`) are write-only: on standard input, never on

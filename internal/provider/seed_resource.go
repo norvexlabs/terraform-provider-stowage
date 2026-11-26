@@ -177,7 +177,7 @@ func (r *seedResource) Schema(ctx context.Context, _ resource.SchemaRequest, res
 			"address6":     str("With `ipv6`: a static IPv6 address with its prefix (`--address6`)."),
 			"gateway6":     str("With `address6`: the IPv6 gateway (`--gateway6`)."),
 			"tune_profile": str("The VM's tuning profile (`--tune-profile`): `default` or `network`.", stringvalidator.OneOf("default", "network")),
-			"ssh_allow":    list("The sources SSH accepts, CIDR (`--ssh-allow`); left out, every source (a cloud's default: the public address of the machine running OpenTofu)."),
+			"ssh_allow":    list("The sources SSH accepts at the VM's first boot, CIDR (`--ssh-allow`); left out, every source (a cloud's default: the public address of the machine running OpenTofu). The first boot's list alone: `stowage_vm_install`'s `ssh_allow` changes it afterwards, in place (an OS built by Stowage 0.50.0 or later)."),
 			"timezone":     str("The VM's IANA time zone (`--timezone`); left out, UTC."),
 			"add_hosts":    smap("Host records, name → IP (`--add-host NAME=IP`)."),
 			"interfaces":   smap("NICs the release names, role → spec (`--interface ROLE=SPEC`)."),

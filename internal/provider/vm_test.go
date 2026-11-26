@@ -104,6 +104,8 @@ func vmOp(argv []string) string {
 		return "network-read"
 	case len(argv) > 4 && argv[0] == "sudo" && argv[3] == "kit":
 		return "kit-" + argv[4]
+	case len(argv) > 4 && argv[0] == "sudo" && argv[3] == "ssh-allow" && argv[4] != "--json":
+		return "ssh-allow-" + argv[4]
 	case len(argv) > 3 && argv[0] == "sudo" && contains(argv, "--dry-run"):
 		return "dry-" + argv[3]
 	case len(argv) > 3 && argv[0] == "sudo":

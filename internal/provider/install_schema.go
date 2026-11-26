@@ -92,6 +92,7 @@ type vmModel struct {
 	SeedBootID     types.String `tfsdk:"seed_boot_id"`
 	Platform       types.String `tfsdk:"platform"`
 	Interfaces     types.Map    `tfsdk:"interfaces"`
+	SSHAllow       types.Set    `tfsdk:"ssh_allow"`
 }
 
 func sshAttributes(hostDesc string) map[string]schema.Attribute {

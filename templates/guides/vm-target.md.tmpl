@@ -89,7 +89,7 @@ argument.
      nothing is pending. A reboot the health gate found unhealthy is not a failed attach: the
      NICs are recorded attached, nothing pending, and the verdict is a warning (`The VM came back
      unhealthy from attaching its NICs`); no apply attaches them again.
-- **Read**: `status --json --values` (the values read back: a login the VM no longer holds — `pull_login` false — takes `registry_login_wo_version` out of state, and in the `acme` and `dns-cloudflare` modes `acme_ca` and `acme_ca_root`, its digest, are read, so the next plan gives what changed again); one that finds no `<short>-stow` on the VM (a release that renamed its installer) names the route to take the install over, as an update's read does: the VM's own key in `known_hosts_line` (state's `host_key_line`; with `seed_boot_id` set, reboot the VM first, which retires its one-time key; else the key checked on its console), then `tofu state rm` and `tofu import` under the new name. It counts as missing when the run fails (any exit but ssh's 255: shells give a missing command 127, tcsh 1) and the VM's shell does not find `<short>-stow` either (`sh -c 'command -v <short>-stow'`, whatever the shell's language): a program the installer runs missing is not it. A check that itself fails is said (`could not be checked`). The first boot's wait stops at once on it too. No release installed and no first install running or failed removes
+- **Read**: with `ssh_allow` set, `sudo -n <short>-stow ssh-allow --json` too ([SSH's sources](#sshs-sources)). `status --json --values` (the values read back: a login the VM no longer holds — `pull_login` false — takes `registry_login_wo_version` out of state, and in the `acme` and `dns-cloudflare` modes `acme_ca` and `acme_ca_root`, its digest, are read, so the next plan gives what changed again); one that finds no `<short>-stow` on the VM (a release that renamed its installer) names the route to take the install over, as an update's read does: the VM's own key in `known_hosts_line` (state's `host_key_line`; with `seed_boot_id` set, reboot the VM first, which retires its one-time key; else the key checked on its console), then `tofu state rm` and `tofu import` under the new name. It counts as missing when the run fails (any exit but ssh's 255: shells give a missing command 127, tcsh 1) and the VM's shell does not find `<short>-stow` either (`sh -c 'command -v <short>-stow'`, whatever the shell's language): a program the installer runs missing is not it. A check that itself fails is said (`could not be checked`). The first boot's wait stops at once on it too. No release installed and no first install running or failed removes
   the resource from state (the next apply installs again). The release the VM runs replaces
   `version` in state, so a VM whose health gate fell back shows its real release and the next
   plan proposes the upgrade again; `inputs` are dropped as on Docker. An imported state (no
@@ -246,6 +246,10 @@ argument.
      The steps before run first and are saved. With nothing to rotate, `secret_rotations` set, an
      update after which the ways kept are not the running release's (it changed the release, or
      none were kept) reads its `describe` for those ways alone; a read that fails is a warning.
+  8. **SSH's sources**, when `ssh_allow` changes (or a create could not set it): `ssh-allow --json`,
+     `ssh-allow set … --json`, then `ssh-allow confirm --json` over a new SSH connection, after
+     every step before and any reboot ([SSH's sources](#sshs-sources)). Until they are set, every
+     state the steps before save holds the sources state had.
   `registry_login_wo_version` changed: `sudo -n <short>-stow registry-login FILE`, before the
   re-run (the login given again; refused with a release change's rollback, `a rollback goes
   alone`). `acme_ca` and `acme_ca_root` changed go to the re-run (`--acme-ca URL|none`,
@@ -290,6 +294,28 @@ argument.
   given`), and the warning on addressing. A rollback of an imported install (`version` set to `previous.version`) is refused (`a
   rollback of an imported install`: apply first with the version it runs).
 - **Delete**: refused while `deletion_protection`; else the resource is forgotten, and nothing changes on the VM. The destroy's plan, before it is approved, asks — with `platform` and the VM's own key known — the VM's installer whether the registry still holds a disk set a VM of its release boots there: `sudo -n <short>-stow vm seed --json --platform P --ssh-key FILE [--registry <state's registry>]` (FILE the VM's own public key, on standard input; the output, a throwaway seed, discarded; two minutes at most, its SSH connection bounded to 10 seconds: `ConnectTimeout=10`). A VM that does not answer within them (stopped, gone) is not checked, a plan warning saying so (`Whether this VM can be made again was not checked`), a refusal is a warning naming its reason (`No disk set to make this VM again`: until the release publishes one, a VM destroyed is not made again), a failure another (`Whether this VM can be made again is not known`); none stops the destroy, whose apply forgets the install, asking nothing, and the VM's own resource's destroy follows.
+
+## SSH's sources
+
+`stowage_vm_seed`'s `ssh_allow` writes the sources SSH accepts at the VM's first boot only; from
+then on `stowage_vm_install`'s `ssh_allow` changes them in place (an OS built by Stowage 0.50.0 or
+later): the last step of a create or an update, after any reboot,
+`sudo -n <short>-stow ssh-allow --json`, then, when the sources differ,
+`sudo -n <short>-stow ssh-allow set <sources, sorted> --json` and
+`sudo -n <short>-stow ssh-allow confirm --json` over a new SSH connection, which the VM lets in only
+when the new sources hold the address OpenTofu runs from: a change the VM does not confirm in its
+window (90 s) is undone by the VM itself. Every step and diagnostic:
+[changing SSH's sources](../resources/vm_install.md#changing-sshs-sources).
+
+To change the address OpenTofu runs from:
+
+1. Add the new address beside the old sources in `ssh_allow`, widen the platform's firewall (the
+   security group built from the seed's `firewall.ssh_sources`) the same way in the same apply,
+   and apply from the old address.
+2. Take the old sources out of both, and apply from the new address.
+
+A single apply from an address the old sources already refuse cannot reach the VM: its recovery is
+the platform's console (`sudo <short>-stow ssh-allow set …` there).
 
 ## A machine made again
 

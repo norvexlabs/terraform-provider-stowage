@@ -72,7 +72,7 @@ variable "installer" {
 - `interfaces` (Map of String) NICs the release names, role → spec (`--interface ROLE=SPEC`).
 - `ipv6` (Boolean) Turn IPv6 on (`--ipv6`).
 - `network` (String) `dhcp` (the default) or `static` (`--network`).
-- `ssh_allow` (List of String) The sources SSH accepts, CIDR (`--ssh-allow`); left out, every source (a cloud's default: the public address of the machine running OpenTofu).
+- `ssh_allow` (List of String) The sources SSH accepts at the VM's first boot, CIDR (`--ssh-allow`); left out, every source (a cloud's default: the public address of the machine running OpenTofu). The first boot's list alone: `stowage_vm_install`'s `ssh_allow` changes it afterwards, in place (an OS built by Stowage 0.50.0 or later).
 - `ssh_public_key` (String) The administrator's SSH public key (`--ssh-key`, given as a file), e.g. `file("~/.ssh/id_ed25519.pub")`; left out, the installer's default key of the machine running OpenTofu.
 - `timeouts` (Block, Optional) (see [below for nested schema](#nestedblock--timeouts))
 - `timezone` (String) The VM's IANA time zone (`--timezone`); left out, UTC.

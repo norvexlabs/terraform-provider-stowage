@@ -398,6 +398,9 @@ func (r *installResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 	case backupDue:
 		// The backup settings or the restore a create could not finish: an update runs them.
 		unknowns = []string{"status"}
+	case plan.VM != nil && !plan.VM.SSHAllow.IsNull() && sshAllowPending(ctx, resp.Private):
+		// SSH's sources a create recorded and could not set: an update sets them.
+		unknowns = []string{"status"}
 	}
 	if imported(&state) {
 		// The first apply records the provider's registry, and the registry CA the install keeps
@@ -1137,6 +1140,11 @@ func (r *installResource) Update(ctx context.Context, req resource.UpdateRequest
 	want := plan.SecretRotations
 	plan.SecretRotations = keptRotations(want, state.SecretRotations)
 	forgetPending(ctx, resp.Private, want, state.SecretRotations, &resp.Diagnostics)
+	// SSH's sources are the update's last step: the steps before it record state's.
+	sshWant, sshDue := sshAllowDue(ctx, req.Private, &plan, &state)
+	if plan.VM != nil && plan.VM.SSHAllow.IsNull() {
+		setSSHAllowPending(ctx, resp.Private, false, &resp.Diagnostics) // not managed any more
+	}
 	// The response starts as the prior state (the framework's): an error before a step saves
 	// keeps state's numbers.
 	if r.updateTarget(ctx, req, resp, &plan, &state); resp.Diagnostics.HasError() {
@@ -1154,6 +1162,9 @@ func (r *installResource) Update(ctx context.Context, req resource.UpdateRequest
 		resp.Diagnostics.Append(resp.State.Set(ctx, m)...)
 		return !resp.Diagnostics.HasError()
 	}, &resp.Diagnostics)
+	if sshDue && !resp.Diagnostics.HasError() {
+		r.updateSSHAllow(ctx, resp, sshWant)
+	}
 }
 
 // updateTarget applies a plan's changes but its rotations (rotateSecrets) to the target.
