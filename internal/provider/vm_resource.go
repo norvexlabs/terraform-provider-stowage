@@ -506,7 +506,7 @@ func (r *installResource) createVM(ctx context.Context, req resource.CreateReque
 	// An install on the VM before this create's (an earlier apply's) that awaits its data took a
 	// secrets export: it is not given again, as the installer refuses it once taken. One that does
 	// not await it holds its own data: refused here, naming the way on.
-	if exported.ValueString() != "" {
+	if strings.TrimSpace(exported.ValueString()) != "" {
 		st, err := v.Status(ctx)
 		if err != nil {
 			addInstallerError(&resp.Diagnostics, "Reading the VM", err)
@@ -534,6 +534,12 @@ func (r *installResource) createVM(ctx context.Context, req resource.CreateReque
 			exported = types.StringNull()
 			resp.Diagnostics.AddAttributeWarning(path.Root("secrets_wo"), "The VM's install took the secrets export",
 				"An earlier apply's install took it (status --json made_again, or restore_awaited): the export is not given again (the installer refuses it once taken), and the install is run again with the configuration's settings, without it.")
+		case st != nil && st.Installed != nil && isSeededFile(exported.ValueString()):
+			// A new install's secrets file makes a plain install, which says nothing of it: whose
+			// install this is, the VM does not tell.
+			resp.Diagnostics.AddAttributeError(path.Root("secrets_wo"), "The VM holds an install of its own",
+				"The VM is installed, and secrets_wo is a new install's secrets file (no `export: true`), which the installer refuses on an install that exists. If an earlier apply's install took it, remove secrets_wo to take that install as it is (it holds those secrets); else make the VM again from a seed with await_secrets.")
+			return
 		case st != nil && st.Installed != nil:
 			resp.Diagnostics.AddAttributeError(path.Root("secrets_wo"), "The VM holds an install of its own",
 				"The VM is installed and its status says no secrets export made it (no made_again, nor restore_awaited): its seed did not await secrets — or, with an installer before Stowage 0.48.0, which says no made_again, an earlier apply's install took it and awaits nothing. Remove secrets_wo, restore and restore_identity_wo to take this install as it is (an install made from the export that way has none of its data loaded: "+restoreByHand(&m, restoreOf(ctx, m.Restore, &resp.Diagnostics), byHandMadeAgain)+" loads it, replacing the data the install holds now), or make the VM again from a seed with await_secrets.")

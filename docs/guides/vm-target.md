@@ -331,14 +331,18 @@ A lost VM is made again in one apply from its `secrets export` and a backup:
   restore <restore.object> --unrecorded --yes --identity -` over SSH, the identity on standard
   input — `--unrecorded`, as an install made again holds no records of the old machine's backups;
   without `restore`, OBJECT the cut restore's, the first line of
-  `/usr/local/<name>/.stowage-volumes-split`); any other install (its seed did not await secrets — or, with an installer
+  `/usr/local/<name>/.stowage-volumes-split`); an installed VM given a new install's secrets file
+  (no `export: true`) is refused (`The VM holds an install of its own`: if an earlier apply's
+  install took it, remove `secrets_wo`); any other install (its seed did not await secrets — or, with an installer
   before Stowage 0.48.0, which says no `made_again`, an earlier apply's that awaits nothing) is
   refused before anything runs (`The VM holds an install of its own`), naming the way on (remove
   `secrets_wo`, `restore` and `restore_identity_wo`; an install made from the export that way has
   none of its data loaded, and the restore by hand it names loads it). Refused at validate:
   `restore_identity_wo` without `restore`, an `object` that could read as a flag (a leading `-`)
   or holds a blank; at plan, a `restore` in a create without `secrets_wo` (`restore without
-  secrets_wo`), with an empty one, or without `restore_identity_wo`. The old install's records of
+  secrets_wo`), with one that reads as a secrets file without `export: true` (`secrets_wo is no
+  secrets export`: a new install's, or an export an installer built with Stowage 0.48.0 or earlier
+  wrote: add the line `export: true` for an installer built with 0.49.0 or later), with an empty one, or without `restore_identity_wo`. The old install's records of
   its backups' digests went with it: a backup it took needs `unrecorded = true`. The create's
   timeout (`timeouts.create`) bounds the install and the restore together: raise it for a large
   backup.

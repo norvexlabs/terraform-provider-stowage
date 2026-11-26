@@ -29,6 +29,12 @@ finished item is deleted, not ticked.
    `interfaces` (`network attach`, the reboot followed), needs a release naming a secondary role
    (`host.interfaces`); the acceptance project declares none.
 
+2. **Departure: the plan reads `secrets_wo`'s `export: true`** (with `restore`, and on an
+   installed VM's create): the installer tells an export from a new install's secrets file only
+   once the install ran. It goes once the installer says it before the install — e.g. `install
+   --secrets - --dry-run --json` answering whether the file makes the install made again — and
+   the provider reads that instead. Raised with Stowage (its TODO).
+
 ## Should
 
 1. **Published modules per platform**: `terraform-<target>-stowage-vm`, one repository per platform

@@ -27,11 +27,14 @@ func (h *harness) restoreValue(object string) tftypes.Value {
 	return fill(h.typ.AttributeTypes["restore"].(tftypes.Object), map[string]tftypes.Value{"object": str(object)})
 }
 
+// exportFile is a decrypted secrets export, as the installer's `secrets export` writes it.
+var exportFile = "project: notes\nexport: true\nsecrets:\n  SESSION_SECRET: export-" + secretVal + "\n"
+
 // madeAgain is a Docker configuration of a machine made again: secrets, backup settings to a
 // destination, a restore.
 func (h *harness) madeAgain(extra map[string]tftypes.Value) tftypes.Value {
 	vals := map[string]tftypes.Value{
-		"secrets_wo":                      str("export-" + secretVal),
+		"secrets_wo":                      str(exportFile),
 		"backup":                          h.backupValue(map[string]tftypes.Value{"destination": str("dav:backups"), "recipients": strList("age1ops")}),
 		"backup_rclone_config_wo":         str("[dav]\npass = rclone-" + secretVal + "\n"),
 		"backup_rclone_config_wo_version": num(1),
@@ -286,7 +289,7 @@ func TestMachineMadeAgainOnVM(t *testing.T) {
 	f.set("backup", reply{stdout: strings.Replace(backupSettingsJSON, `"destination":"dav:backups"`, `"keep_local":2`, 1)})
 	f.set("restore", reply{})
 	config := h.vmConfig("1.1.0", map[string]tftypes.Value{
-		"secrets_wo":          str("export-" + secretVal),
+		"secrets_wo":          str(exportFile),
 		"backup":              h.backupValue(map[string]tftypes.Value{"keep_local": num(2), "recipients": strList("age1ops")}),
 		"restore":             h.restoreValue("notes-full-x.pgdump.age"),
 		"restore_identity_wo": str("AGE-SECRET-KEY-" + secretVal),
@@ -446,7 +449,7 @@ func TestVMCreateAgainAfterItsInstall(t *testing.T) {
 		f.set("backup", reply{stdout: backupSettingsJSON})
 		f.set("restore", reply{})
 		config := h.vmConfig("1.1.0", map[string]tftypes.Value{
-			"secrets_wo":          str("export-" + secretVal),
+			"secrets_wo":          str(exportFile),
 			"backup":              h.backupValue(map[string]tftypes.Value{"destination": str("dav:backups"), "recipients": strList("age1ops")}),
 			"restore":             h.restoreValue("notes-full-x.pgdump.age"),
 			"restore_identity_wo": str("AGE-SECRET-KEY-" + secretVal),
@@ -463,6 +466,20 @@ func TestVMCreateAgainAfterItsInstall(t *testing.T) {
 		case !awaiting && (given || len(f.callsOf("install")) != 0 || len(f.callsOf("restore")) != 0 || !strings.Contains(errorsOf(a.Diagnostics), "The VM holds an install of its own")):
 			t.Fatalf("not awaiting: given %v, restores %d, %s", given, len(f.callsOf("restore")), text)
 		}
+	}
+}
+
+// A VM create applied again on an installed VM given a new install's secrets file (no export:
+// true): a plain install says nothing of the file, so the create is refused before anything runs,
+// naming the way on for both cases.
+func TestVMCreateOnAnInstalledVMGivenASeededFile(t *testing.T) {
+	t.Parallel()
+	h, f := newVMHarness(t)
+	config := h.vmConfig("1.1.0", map[string]tftypes.Value{"secrets_wo": str("project: notes\nsecrets:\n  SESSION_SECRET: seeded-" + secretVal + "\n")})
+	a := h.apply(nil, h.plan(nil, config).PlannedState, config)
+	d := errorsOf(a.Diagnostics)
+	if len(f.callsOf("install")) != 0 || !strings.Contains(d, "secrets_wo is a new install's secrets file") || !strings.Contains(d, "remove secrets_wo to take that install as it is") || strings.Contains(d, secretVal) {
+		t.Fatalf("installs %d: %s", len(f.callsOf("install")), d)
 	}
 }
 
@@ -487,6 +504,39 @@ func TestBackupRefusalsAtPlan(t *testing.T) {
 	h := newHarness(t, nil)
 	if d := errorsOf(h.plan(nil, h.madeAgain(map[string]tftypes.Value{"secrets_wo": str("")})).Diagnostics); !strings.Contains(d, "secrets_wo is empty") {
 		t.Errorf("an empty export: %q", d)
+	}
+	// Blank, refused whatever a restore; unknown at plan, refused with a restore.
+	if d := errorsOf(h.plan(nil, h.madeAgain(map[string]tftypes.Value{"secrets_wo": str(" \n"), "restore": tftypes.NewValue(h.typ.AttributeTypes["restore"], nil), "restore_identity_wo": tftypes.NewValue(tftypes.String, nil)})).Diagnostics); !strings.Contains(d, "secrets_wo is empty") {
+		t.Errorf("a blank file without a restore: %q", d)
+	}
+	if d := errorsOf(h.plan(nil, h.madeAgain(map[string]tftypes.Value{"secrets_wo": tftypes.NewValue(tftypes.String, tftypes.UnknownValue)})).Diagnostics); !strings.Contains(d, "secrets_wo is not known at plan") {
+		t.Errorf("unknown with a restore: %q", d)
+	}
+	// Without a restore, the file is the installer's to judge: nothing refused at plan.
+	for _, file := range []string{"project: notes\nsecrets: {}\nprovision:\n  ADMIN_KEY: x\n", "project: notes\nsecrets: {}\n"} {
+		d := errorsOf(h.plan(nil, h.madeAgain(map[string]tftypes.Value{"secrets_wo": str(file), "restore": tftypes.NewValue(h.typ.AttributeTypes["restore"], nil), "restore_identity_wo": tftypes.NewValue(tftypes.String, nil)})).Diagnostics)
+		if d != "" {
+			t.Errorf("no restore, %q: %q", file, d)
+		}
+	}
+	if d := errorsOf(h.plan(nil, h.madeAgain(map[string]tftypes.Value{"secrets_wo": str(" \n")})).Diagnostics); !strings.Contains(d, "secrets_wo is empty") || strings.Contains(d, "no secrets export") {
+		t.Errorf("a blank export: %q", d)
+	}
+	for _, file := range []string{"just-text", "~", "- a\n"} {
+		if d := errorsOf(h.plan(nil, h.madeAgain(map[string]tftypes.Value{"secrets_wo": str(file)})).Diagnostics); d != "" {
+			t.Errorf("not a mapping %q: %q", file, d)
+		}
+	}
+	// A seeded secrets file (no export: true) with a restore; the export itself plans clean.
+	for file, want := range map[string]bool{
+		"project: notes\nsecrets:\n  SESSION_SECRET: x\n":               true,
+		"project: notes\nexport: false\nsecrets: {}\n":                  true,
+		"project: notes\nexport: true\nsecrets:\n  SESSION_SECRET: x\n": false,
+	} {
+		d := errorsOf(h.plan(nil, h.madeAgain(map[string]tftypes.Value{"secrets_wo": str(file)})).Diagnostics)
+		if strings.Contains(d, "secrets_wo is no secrets export") != want || strings.Contains(d, "SESSION_SECRET") {
+			t.Errorf("%q: %q", file, d)
+		}
 	}
 	if d := errorsOf(h.validate(h.madeAgain(map[string]tftypes.Value{"backup_rclone_config_wo_version": tftypes.NewValue(tftypes.Number, nil)}))); !strings.Contains(d, "backup_rclone_config_wo_version is required") {
 		t.Errorf("the rclone config without its version: %q", d)
@@ -535,7 +585,7 @@ func TestRestoreGate(t *testing.T) {
 	t.Parallel()
 	vmConfig := func(h *harness) tftypes.Value {
 		return h.vmConfig("1.1.0", map[string]tftypes.Value{
-			"secrets_wo":          str("export-" + secretVal),
+			"secrets_wo":          str(exportFile),
 			"backup":              h.backupValue(map[string]tftypes.Value{"keep_local": num(2), "recipients": strList("age1ops")}),
 			"restore":             h.restoreValue("notes-full-x.pgdump.age"),
 			"restore_identity_wo": str("AGE-SECRET-KEY-" + secretVal),
@@ -621,7 +671,7 @@ func TestVMBootThatFailedTakesTheExport(t *testing.T) {
 	f.set("backup", reply{stdout: backupSettingsJSON})
 	f.set("restore", reply{})
 	config := h.vmConfig("1.1.0", map[string]tftypes.Value{
-		"secrets_wo":          str("export-" + secretVal),
+		"secrets_wo":          str(exportFile),
 		"backup":              h.backupValue(map[string]tftypes.Value{"destination": str("dav:backups"), "recipients": strList("age1ops")}),
 		"restore":             h.restoreValue("notes-full-x.pgdump.age"),
 		"restore_identity_wo": str("AGE-SECRET-KEY-" + secretVal),
@@ -629,7 +679,7 @@ func TestVMBootThatFailedTakesTheExport(t *testing.T) {
 	a := h.apply(nil, h.plan(nil, config).PlannedState, config)
 	given := false
 	for _, in := range f.callsOf("install") {
-		given = given || in.stdin != nil && untarAll(t, in.stdin)["secrets"] == "export-"+secretVal
+		given = given || in.stdin != nil && untarAll(t, in.stdin)["secrets"] == exportFile
 	}
 	if errorsOf(a.Diagnostics) != "" || !given || len(f.callsOf("restore")) != 1 {
 		t.Fatalf("given %v, restores %d: %s", given, len(f.callsOf("restore")), diagText(a.Diagnostics))
@@ -672,7 +722,7 @@ func TestVMCreateAgainAfterAFailedInstall(t *testing.T) {
 	} {
 		h, f := newVMHarness(t)
 		f.then("status", reply{stdout: awaitingSecrets()}, reply{stdout: vmStatusJSON("1.1.0", "boot-1", c.extra)})
-		config := h.vmConfig("1.1.0", map[string]tftypes.Value{"secrets_wo": str("export-" + secretVal)})
+		config := h.vmConfig("1.1.0", map[string]tftypes.Value{"secrets_wo": str(exportFile)})
 		a := h.apply(nil, h.plan(nil, config).PlannedState, config)
 		for _, in := range f.callsOf("install") {
 			if in.stdin != nil && untarAll(t, in.stdin)["secrets"] != "" {
@@ -698,7 +748,7 @@ func TestVMCreateRefusalsNameTheWayOn(t *testing.T) {
 	h, f := newVMHarness(t)
 	f.then("status", reply{stdout: awaitingSecrets()}, reply{stdout: vmStatusJSON("1.1.0", "boot-1", `,"made_again":true,"restore_awaited":true,"volumes_split":true`)})
 	config := h.vmConfig("1.1.0", map[string]tftypes.Value{
-		"secrets_wo": str("export-" + secretVal), "restore": h.restoreValue("b1"), "restore_identity_wo": str("AGE-SECRET-KEY-1"),
+		"secrets_wo": str(exportFile), "restore": h.restoreValue("b1"), "restore_identity_wo": str("AGE-SECRET-KEY-1"),
 		"backup": h.backupValue(map[string]tftypes.Value{"keep_local": num(2), "recipients": strList("age1ops")}),
 	})
 	if got := errorsOf(h.apply(nil, h.plan(nil, config).PlannedState, config).Diagnostics); !strings.Contains(got, "`sudo notes-stow restore b1 --unrecorded --yes --identity -`") {
@@ -749,11 +799,11 @@ func TestVMFailedBeforeItsEnvTakesTheExportAgain(t *testing.T) {
 		h, f := newVMHarness(t)
 		unwritten := strings.Replace(vmStatusJSON("1.1.0", "boot-1", extra), `"installed":{"version":"1.1.0","revision":1}`, `"installed":null`, 1)
 		f.then("status", reply{stdout: awaitingSecrets()}, reply{stdout: unwritten})
-		config := h.vmConfig("1.1.0", map[string]tftypes.Value{"secrets_wo": str("export-" + secretVal)})
+		config := h.vmConfig("1.1.0", map[string]tftypes.Value{"secrets_wo": str(exportFile)})
 		a := h.apply(nil, h.plan(nil, config).PlannedState, config)
 		given := false
 		for _, in := range f.callsOf("install") {
-			given = given || in.stdin != nil && untarAll(t, in.stdin)["secrets"] == "export-"+secretVal
+			given = given || in.stdin != nil && untarAll(t, in.stdin)["secrets"] == exportFile
 		}
 		if !given || errorsOf(a.Diagnostics) != "" || strings.Contains(diagText(a.Diagnostics), "The VM's install took the secrets export") {
 			t.Fatalf("%q: given %v: %s", extra, given, diagText(a.Diagnostics))

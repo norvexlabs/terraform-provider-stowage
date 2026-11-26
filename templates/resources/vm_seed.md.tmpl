@@ -70,7 +70,7 @@ registry cannot be read. Exit 3 without that object breaks the machine interface
 | `timezone`, `device` | optional | `--timezone`; `--device` (`metal`). |
 | `add_hosts`, `interfaces` | optional maps | `--add-host NAME=IP`, `--interface ROLE=SPEC`. |
 | `tls` | optional | `--tls`: `acme`, `dns-cloudflare`, `internal` or `byo`. With `byo` the VM's first install waits for the certificate, its key and CA (`await_tls`), which `stowage_vm_install`'s `given_wo` gives over SSH (its `tls` section); the seed carries none. |
-| `await_secrets` | optional bool | `--await-secrets`: the VM's first install waits for a decrypted `secrets export` (a machine made again), which `stowage_vm_install`'s `secrets_wo` gives over SSH. With `tls = "byo"` it is refused at plan (`await_secrets with tls byo`: the first install waits for one of them). |
+| `await_secrets` | optional bool | `--await-secrets`: the VM's first install waits for a decrypted `secrets export` (a machine made again) or a new install's secrets file, which `stowage_vm_install`'s `secrets_wo` gives over SSH. With `tls = "byo"` it is refused at plan (`await_secrets with tls byo`: the first install waits for one of them). |
 | `disk_dir` | optional | `--disk-dir`: an existing directory, an absolute, clean path (else refused at plan), on the machine running OpenTofu the `platform`'s disk is written into, decompressed (a file of that name already holding it is kept), for a hypervisor resource importing a local file (`disk_file`). The file is the caller's: destroying the seed leaves it. |
 | `domains` | optional map | `--domains route=host,…`. |
 | `http_port`, `https_port` | optional | `--http-port`, `--https-port` (1–65535). |

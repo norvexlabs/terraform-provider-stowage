@@ -134,7 +134,11 @@ Generated from the schema, the templates and the examples (`make docs`) into [do
 The provider reads only the installer's machine interface — `describe --json`, `status --json`,
 the verbs' `--json` result and exit status (0 done, 3 refused with a reason and a fix, any other
 failed) — and decides nothing the installer does not decide: [the machine interface, as
-read](docs/guides/machine-interface.md). What runs where:
+read](docs/guides/machine-interface.md). One departure: with `restore`, the plan reads
+`secrets_wo`'s `export: true` (a `secrets export`, which a restore follows, or a new install's
+secrets file, which makes a plain install), as the installer says it only once the install ran
+and the backup settings, set before the restore, would then already point at the old
+destination. What runs where:
 
 | | Docker | Kubernetes | VM |
 |---|---|---|---|

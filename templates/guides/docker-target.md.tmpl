@@ -214,7 +214,9 @@ A lost host's install is made again in one apply from its `secrets export` and a
   (`Not restored: the install does not await its data`). An install already in the directory is run again without `secrets_wo` (its re-run), and restored only while it awaits its data. Refused at validate:
   `restore_identity_wo` without `restore`, an `object` that could read as a flag (a leading `-`)
   or holds a blank; at plan, a `restore` in a create without `secrets_wo` (`restore without
-  secrets_wo`), with an empty one, or without `restore_identity_wo`. The old install's records of
+  secrets_wo`), with one that reads as a secrets file without `export: true` (`secrets_wo is no
+  secrets export`: a new install's, or an export an installer built with Stowage 0.48.0 or earlier
+  wrote: add the line `export: true` for an installer built with 0.49.0 or later), with an empty one, or without `restore_identity_wo`. The old install's records of
   its backups' digests went with it: a backup it took needs `unrecorded = true`. The create's
   timeout (`timeouts.create`) bounds the install and the restore together: raise it for a large
   backup.

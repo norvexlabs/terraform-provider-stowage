@@ -3,6 +3,24 @@
 The provider's releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.8.0]
+
+For Stowage 0.49.0 or later with `restore`: only an export (`export: true`) makes an install made
+again; a secrets file without it seeds a plain install.
+
+### Changed
+
+- **BREAKING**: `restore` needs a release whose installer is built with Stowage 0.49.0 or later.
+  A create with `restore` whose `secrets_wo` reads as a secrets file without `export: true` is
+  refused at plan (`secrets_wo is no secrets export`): a new install's secrets make a plain
+  install, which awaits no data, and its backup settings, set before the restore, would send its
+  backups to the old destination. An export an installer built with Stowage 0.48.0 or earlier
+  wrote lacks the mark: add the line `export: true` to the decrypted file.
+- `secrets_wo` also takes a new install's secrets file (no `export: true`), as the installer does
+  from Stowage 0.49.0. A VM create on an installed VM given such a file is refused (`The VM holds
+  an install of its own`), naming the way on: remove `secrets_wo` if an earlier apply's install
+  took it.
+
 ## [0.7.0] - 2026-11-26
 
 For Stowage 0.48.0 or later with `restore` (from 0.48.0 every install made by `--secrets` awaits its

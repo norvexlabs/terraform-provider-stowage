@@ -22,6 +22,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
+	"go.yaml.in/yaml/v3"
 
 	"github.com/norvexlabs/terraform-provider-stowage/internal/installer"
 )
@@ -265,15 +266,26 @@ func validateBackup(ctx context.Context, m *installModel, diags *diag.Diagnostic
 }
 
 // planBackupCreate refuses, at a create's plan, a restore not made from a secrets export or given
-// no identity: a restore loads into the install that create makes, and only one made with
-// --secrets is sure to be new.
+// no identity: a restore loads into the install that create makes, and only one made again from
+// an export (export: true, an installer built with Stowage 0.49.0 or later) awaits it. It runs
+// after the backup settings are set: a plain install would send its backups to the old
+// destination, the restore dropped.
 func planBackupCreate(m *installModel, diags *diag.Diagnostics) {
+	if known(m.SecretsWO) && strings.TrimSpace(m.SecretsWO.ValueString()) == "" {
+		diags.AddAttributeError(path.Root("secrets_wo"), "secrets_wo is empty",
+			"secrets_wo is a decrypted `secrets export`, or a new install's secrets file: give it, or remove secrets_wo (an empty file is an export that failed).")
+	}
 	if m.Restore.IsNull() {
 		return
 	}
-	if known(m.SecretsWO) && m.SecretsWO.ValueString() == "" {
-		diags.AddAttributeError(path.Root("secrets_wo"), "secrets_wo is empty",
-			"A restore loads into an install made from a `secrets export`: give the decrypted export (an empty file is an export that failed).")
+	if !m.SecretsWO.IsNull() && !known(m.SecretsWO) {
+		diags.AddAttributeError(path.Root("secrets_wo"), "secrets_wo is not known at plan",
+			"With restore, the plan reads secrets_wo to tell a `secrets export` (export: true), which a restore follows, from a new install's secrets file, whose backups the restore's settings would send to the old destination: give a value known at plan (not one from a resource made in the same apply).")
+	}
+	isSeeded := known(m.SecretsWO) && isSeededFile(m.SecretsWO.ValueString())
+	if isSeeded {
+		diags.AddAttributeError(path.Root("secrets_wo"), "secrets_wo is no secrets export",
+			"restore needs a release whose installer is built with Stowage 0.49.0 or later, and an install made again from a `secrets export`, which says `export: true`. A secrets file without it seeds a new install, which awaits no data: give the export, or remove restore and restore_identity_wo. An export an installer built with Stowage 0.48.0 or earlier wrote lacks the mark: add the line `export: true` to the decrypted file.")
 	}
 	if m.SecretsWO.IsNull() {
 		diags.AddAttributeError(path.Root("restore"), "restore without secrets_wo",
@@ -283,6 +295,34 @@ func planBackupCreate(m *installModel, diags *diag.Diagnostics) {
 		diags.AddAttributeError(path.Root("restore_identity_wo"), "restore_identity_wo is not given",
 			"The restore needs the age identity that decrypts restore.object: give restore_identity_wo.")
 	}
+}
+
+// isSeededFile reports whether secrets reads as a new install's secrets file: a mapping without
+// the `export: true` a `secrets export` writes.
+func isSeededFile(secrets string) bool {
+	f, ok := secretsFileOf(secrets)
+	return ok && !f.Export
+}
+
+// secretsFile is what the provider reads of a decrypted secrets file: whether `secrets export`
+// wrote it (export: true). The rest is the installer's to judge.
+type secretsFile struct {
+	Export bool `yaml:"export"`
+}
+
+// secretsFileOf reads secrets as a secrets file: ok only when it is one YAML mapping that decodes
+// so. Anything else (empty, blank, a scalar, a list, YAML that does not parse) is left to the
+// installer, which says why it refuses it.
+func secretsFileOf(secrets string) (secretsFile, bool) {
+	var n yaml.Node
+	if err := yaml.Unmarshal([]byte(secrets), &n); err != nil || n.Kind != yaml.DocumentNode || len(n.Content) != 1 || n.Content[0].Kind != yaml.MappingNode {
+		return secretsFile{}, false
+	}
+	var f secretsFile
+	if err := n.Content[0].Decode(&f); err != nil {
+		return secretsFile{}, false
+	}
+	return f, true
 }
 
 // planBackupUpdate warns of a restore changed once taken, refuses a pending restore given no
